@@ -1,0 +1,58 @@
+# Rust
+/target
+**/target/
+**/*.rs.bk
+# Cargo.lock is committed on purpose: this workspace builds binaries, so the
+# resolved dependency set is part of the build. Leaving it out let a transitive
+# release decide whether CI compiled, which is how a sqlx 0.7.4 / newer-rustc
+# incompatibility first surfaced as a red build instead of a reproducible one.
+
+# Node / Frontend
+node_modules/
+.nuxt/
+.output/
+dist/
+.pnpm-store/
+*.log
+.DS_Store
+
+# Env
+.env
+.env.local
+.env.*.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Build
+*.so
+*.dylib
+*.dll
+
+# Docker
+.dockerignore
+
+# Proto generated (if not committed)
+# crates/lagran-proto/src/generated/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Test coverage
+coverage/
+*.profraw
+
+# Local data
+data/
+*.db
+*.sqlite
+
+# docs
+docs/todo-bug.md
+docs/security*
+docs/reviews
+deploy/.env

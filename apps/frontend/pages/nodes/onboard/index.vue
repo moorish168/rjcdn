@@ -1,0 +1,2488 @@
+<template>
+  <div class="page">
+    <div class="page-head">
+      <div>
+        <div class="page-title">添加边缘节点</div>
+        <div class="page-desc">
+          按节点硬件与业务画像推导容量参数，自动生成 edge.env；注册、安装与上线验证在同一个向导里完成
+        </div>
+      </div>
+      <div class="page-actions">
+        <NuxtLink to="/nodes" class="btn btn-default">
+          <AppIcon name="chevron-left" :size="15" />
+          返回节点列表
+        </NuxtLink>
+      </div>
+    </div>
+
+    <div v-if="!auth.isAdmin" class="alert alert-warning">
+      <AppIcon name="alert" :size="16" class="icon" />
+      <span>只有管理员可以添加边缘节点。当前账号可以查看节点列表，但不能注册新节点。</span>
+    </div>
+
+    <template v-else>
+      <div class="wizard-progress">
+        <div class="wizard-progress-head">
+          <div>
+            <div class="wizard-progress-kicker">接入流程</div>
+            <div class="wizard-progress-title">{{ steps[step] }}</div>
+          </div>
+          <div class="wizard-progress-meta">
+            <span class="wizard-progress-summary">
+              {{ form.name || '未命名节点' }} · 磁盘缓存 {{ hw.diskGb || 0 }} GiB ·
+              {{ NODE_ROLE_LABEL[hw.role] }}
+            </span>
+            <span class="wizard-progress-count">{{ step + 1 }}<span>/{{ steps.length }}</span></span>
+          </div>
+        </div>
+        <div class="wizard-progress-track">
+          <span :style="{ width: `${progressPercent}%` }" />
+        </div>
+        <div class="wizard-steps-top">
+          <div
+            v-for="(s, i) in steps"
+            :key="s"
+            class="top-step"
+            :class="{ active: step === i, done: step > i }"
+          >
+            <span class="top-step-index">{{ step > i ? '✓' : i + 1 }}</span>
+            <span class="top-step-text">
+              <span class="top-step-title">{{ s }}</span>
+              <span class="top-step-hint">{{ STEP_HINTS[i] }}</span>
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <section class="wizard-main">
+          <div v-if="nodeLocked" class="alert alert-info">
+            <AppIcon name="info" :size="16" class="icon" />
+            <span>
+              节点 <b>{{ created?.node?.name }}</b> 已在控制台注册，身份（名称 / 区域 / 公网 IP）已锁定；
+              硬件与网络参数仍可调整，保存后只会重新生成 edge.env，不会重复注册。需要改名请删除该节点后重新接入。
+            </span>
+          </div>
+
+          <div v-if="reusedFrom.length" class="alert alert-info">
+            <AppIcon name="info" :size="16" class="icon" />
+            <span>
+              已从节点 <b>{{ reusedFrom.join('、') }}</b> 复用共享 Redis / CHALLENGE_SECRET / WAF_RULEPACK_SECRET，
+              避免多节点配置不一致。请确认新节点与它在同一区域网络，并按需覆盖。
+            </span>
+          </div>
+
+          <div class="card wizard-card">
+            <div class="card-body wizard-body">
+              <div class="step-eyebrow">
+                <span class="step-eyebrow-index">STEP {{ stepLabel }}</span>
+                <span class="step-eyebrow-label">{{ steps[step] }}</span>
+              </div>
+          <!-- 步骤 1：节点身份 -->
+          <div v-if="step === 0" class="form-col">
+            <div class="wizard-hero">
+              <div class="wizard-icon">
+                <AppIcon name="node" :size="24" />
+              </div>
+              <div>
+                <div class="wizard-title">这个节点叫什么、放在哪里？</div>
+                <div class="wizard-desc">
+                  名称是节点在控制台与心跳中的唯一标识，必须与边缘端的 NODE_ID 完全一致。
+                  节点会连回当前控制面；回调地址由公网 IP 自动生成。
+                </div>
+              </div>
+            </div>
+            <div class="section-head">
+              <span class="section-title">基础信息</span>
+              <span class="section-sub">名称、区域与公网地址</span>
+            </div>
+            <div class="form-grid">
+              <div class="field span-2">
+                <label class="field-label">节点名称 <span class="req">*</span></label>
+                <input v-model="form.name" class="input mono" placeholder="edge-hk-01" :disabled="nodeLocked"
+                  @keyup.enter="next" />
+                <span class="field-hint">
+                  仅允许字母、数字、点、下划线与连字符，最长 64 字符；它会原样写入 edge.env 的 NODE_ID。
+                </span>
+              </div>
+              <div class="field">
+                <label class="field-label">区域标签</label>
+                <input v-model="form.region" class="input multi" placeholder="cn-hongkong" :disabled="nodeLocked" />
+                <span class="field-hint">只用字母 / 数字 / . / _ / -，用于展示与排障分组。</span>
+              </div>
+              <div class="field">
+                <label class="field-label">公网 IP <span class="req">*</span></label>
+                <input v-model="form.public_ip" class="input multi" placeholder="203.0.113.21" :disabled="nodeLocked" />
+                <span class="field-hint">智能解析 返回这个地址，必须是对访客可达的 IP。</span>
+              </div>
+            </div>
+
+            <div class="derived-box">
+              <div class="derived-title">自动写入 edge.env</div>
+              <div class="derived-row">
+                <span class="derived-key">CONTROL_URL（连回本控制面）</span>
+                <span class="mono derived-val">{{ previewControlUrl || '由控制面地址自动填写' }}</span>
+              </div>
+              <div class="derived-row">
+                <span class="derived-key">AGENT_URL（控制面回调本节点）</span>
+                <span class="mono derived-val">{{ effectiveAgentUrl || '填写公网 IP 后自动生成' }}</span>
+              </div>
+              <div class="derived-row">
+                <span class="derived-key">EDGE_ADMIN_LISTEN</span>
+                <span class="mono derived-val">{{ infra.adminListen || '—' }}</span>
+              </div>
+              <span class="field-hint">
+                Agent 端口默认 8081，请在节点防火墙只放行控制面来源，不要对访客开放。
+              </span>
+            </div>
+
+            <details class="optional-block">
+              <summary>高级：同机或自定义 Agent 回调</summary>
+              <div class="form-col" style="margin-top: 12px">
+                <label class="check">
+                  <input
+                    type="checkbox"
+                    :checked="infra.deployment === 'same-host'"
+                    @change="onSameHostToggle(($event.target as HTMLInputElement).checked)"
+                  />
+                  节点与控制面同机（Agent 走 127.0.0.1）
+                </label>
+                <label class="check">
+                  <input
+                    type="checkbox"
+                    :checked="infra.deployment === 'custom'"
+                    @change="onCustomAgentToggle(($event.target as HTMLInputElement).checked)"
+                  />
+                  自定义 Agent 监听与回调地址
+                </label>
+                <div v-if="infra.deployment === 'custom'" class="form-grid">
+                  <div class="field">
+                    <label class="field-label">EDGE_ADMIN_LISTEN</label>
+                    <input v-model="infra.adminListen" class="input mono" placeholder="10.0.0.21:8081" />
+                    <span class="field-hint">Edge 以 SocketAddr 解析，必须是 IP:端口。</span>
+                  </div>
+                  <div class="field">
+                    <label class="field-label">AGENT_URL</label>
+                    <input v-model="infra.agentUrl" class="input mono" placeholder="http://10.0.0.21:8081" />
+                    <span class="field-hint">控制面可达的本节点 节点地址。</span>
+                  </div>
+                </div>
+              </div>
+            </details>
+
+            <div v-if="identityWarnings.length" class="alert alert-warning">
+              <AppIcon name="alert" :size="16" class="icon" />
+              <div class="alert-list">
+                <span v-for="w in identityWarnings" :key="w">{{ w }}</span>
+              </div>
+            </div>
+
+            <div class="field">
+              <label class="field-label">DNS 调度线路</label>
+              <span class="field-hint">
+                与添加 A 记录相同：按访客来源选默认 / 洲国家 / 运营商 / 自定义线路。上线后自动写入 CDN 主域 A/AAAA 并挂此线路；选「默认」则全部兜底。
+              </span>
+              <DnsLineSourcePicker
+                v-model:countries="dnsLineCountries"
+                v-model:line-id="dnsLineId"
+                :lines="dnsLines"
+              />
+            </div>
+
+            <p v-if="stepError" class="text-danger step-error">{{ stepError }}</p>
+          </div>
+
+          <!-- 步骤 2：缓存与角色 -->
+          <div v-else-if="step === 1" class="form-col">
+            <div class="wizard-hero">
+              <div class="wizard-icon">
+                <AppIcon name="zap" :size="24" />
+              </div>
+              <div>
+                <div class="wizard-title">角色与缓存上限</div>
+                <div class="wizard-desc">
+                  对齐 GoEdge：节点侧主要设缓存容量上限；线程与超时用合理默认值，不必再填 CPU。
+                </div>
+              </div>
+            </div>
+
+            <div class="section-head">
+              <span class="section-title">节点角色</span>
+              <span class="section-sub">边缘对外加速，L2 做区域汇聚</span>
+            </div>
+            <div class="form-grid">
+              <div class="field span-2">
+                <label class="field-label">角色</label>
+                <select class="select" :value="hw.role" @change="setRole(($event.target as HTMLSelectElement).value)">
+                  <option v-for="(label, value) in NODE_ROLE_LABEL" :key="value" :value="value">
+                    {{ label }}
+                  </option>
+                </select>
+                <span class="role-note">{{ NODE_ROLE_DESC[hw.role] }}</span>
+              </div>
+            </div>
+
+            <div class="section-head">
+              <span class="section-title">缓存上限</span>
+              <span class="section-sub">对应 GoEdge「节点设置 → 缓存」的容量限制</span>
+            </div>
+            <div class="form-grid">
+              <div class="field">
+                <label class="field-label">缓存磁盘上限（GiB）</label>
+                <input v-model.number="hw.diskGb" class="input" type="number" min="0" max="100000" />
+                <span class="field-hint">0 表示只用内存缓存；达到上限后自动淘汰旧内容。</span>
+              </div>
+              <div class="field">
+                <label class="field-label">内存缓存上限（GiB）</label>
+                <input v-model.number="memCacheGiB" class="input" type="number" min="0" max="256" step="0.5" />
+                <span class="field-hint">热数据 L1；留空或 0 时按默认约 1 GiB。</span>
+              </div>
+            </div>
+
+            <div class="toggle-list">
+              <label class="check">
+                <input v-model="infra.httpsEnabled" type="checkbox" />
+                启用 HTTPS 监听（证书由控制面同步）
+              </label>
+            </div>
+
+            <div v-if="hw.role === 'shield'" class="alert alert-info">
+              <AppIcon name="shield" :size="16" class="icon" />
+              <span>
+                L2 汇聚层会写入 EDGE_SHIELD_DISABLED=true，避免回源环；磁盘建议至少 50 GiB。
+              </span>
+            </div>
+
+            <details class="optional-block">
+              <summary>高级：硬件与 Redis（可选）</summary>
+              <div class="form-grid" style="margin-top: 12px">
+                <div class="field">
+                  <label class="field-label">CPU 核数</label>
+                  <input v-model.number="hw.cpuCores" class="input" type="number" min="1" max="128" />
+                </div>
+                <div class="field">
+                  <label class="field-label">机器内存（GiB）</label>
+                  <input v-model.number="hw.memoryGb" class="input" type="number" min="1" max="512" />
+                </div>
+                <div class="field">
+                  <label class="field-label">磁盘类型</label>
+                  <select class="select" :value="hw.diskType"
+                    @change="setDiskType(($event.target as HTMLSelectElement).value)">
+                    <option value="nvme">NVMe SSD</option>
+                    <option value="sata-ssd">SATA SSD</option>
+                    <option value="hdd">机械盘 HDD</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label class="field-label">出口带宽（Mbps）</label>
+                  <input v-model.number="hw.bandwidthMbps" class="input" type="number" min="0" max="100000" />
+                </div>
+                <div class="field">
+                  <label class="field-label">业务类型</label>
+                  <select class="select" :value="hw.workload"
+                    @change="setWorkload(($event.target as HTMLSelectElement).value)">
+                    <option value="web">网页 / 小文件</option>
+                    <option value="mixed">混合业务</option>
+                    <option value="video">视频 / 大文件点播</option>
+                  </select>
+                </div>
+                <div class="field span-2">
+                  <label class="check">
+                    <input v-model="hw.sharedRedis" type="checkbox" />
+                    使用共享 Redis
+                  </label>
+                </div>
+                <div v-if="hw.sharedRedis" class="field span-2">
+                  <label class="field-label">REDIS_URL</label>
+                  <input v-model="infra.redisUrl" class="input mono" placeholder="redis://127.0.0.1:6379" />
+                </div>
+              </div>
+            </details>
+
+            <p v-if="stepError" class="text-danger step-error">{{ stepError }}</p>
+          </div>
+
+          <!-- 步骤 3：生成配置 -->
+          <div v-else-if="step === 2" class="form-col">
+            <div class="wizard-hero">
+              <div class="wizard-icon">
+                <AppIcon name="logs" :size="24" />
+              </div>
+              <div>
+                <div class="wizard-title">把配置和安装命令带到节点上</div>
+                <div class="wizard-desc">
+                  令牌只在注册时展示一次；edge.env 已按 {{ hardwareSummary }} 生成完毕。
+                </div>
+              </div>
+            </div>
+
+            <div class="result-banner">
+              <span class="result-check"><AppIcon name="check" :size="18" /></span>
+              <div>
+                <div class="result-title">节点已注册，配置已同步</div>
+                <div class="result-desc">
+                  {{ created?.node?.name }} · {{ created?.node?.id?.slice(0, 8) }}
+                </div>
+              </div>
+            </div>
+
+            <div class="alert alert-warning">
+              <AppIcon name="alert" :size="16" class="icon" />
+              <span>
+                令牌等同该节点的身份凭证，请通过安全通道传递；删除节点会立即吊销它。
+                edge.env 内含令牌，落盘后权限必须是 600。
+              </span>
+            </div>
+
+            <div v-if="created?.waf_rulepack_configured === false" class="alert alert-warning">
+              <AppIcon name="alert" :size="16" class="icon" />
+              <span>
+                控制面没有配置 WAF_RULEPACK_SECRET：签名 WAF 规则包无法下发，Edge 会拒绝验签。
+                请先在控制面 /etc/lagran/control.env 配置，再重新生成节点配置。
+              </span>
+            </div>
+
+            <div class="derived-box">
+              <div class="derived-row">
+                <span class="derived-key">CONTROL_URL（控制面）</span>
+                <span class="mono derived-val">{{ controlUrl || '未解析，请设置 CONTROL_PUBLIC_URL' }}</span>
+              </div>
+              <div class="derived-row">
+                <span class="derived-key">管理面 · 回调地址</span>
+                <span class="mono derived-val">
+                  {{ effectiveAdminHostPort }} · {{ effectiveAgentUrl || '未设置' }}
+                </span>
+              </div>
+            </div>
+
+            <div class="section-head">
+              <span class="section-title">节点凭证</span>
+              <span class="section-sub">只展示一次，请先保存</span>
+            </div>
+            <div class="field">
+              <div class="field-label">节点令牌</div>
+              <div class="copy-row">
+                <input class="input mono" :type="tokenVisible ? 'text' : 'password'" :value="created?.token || ''"
+                  readonly />
+                <button class="btn btn-default" type="button" @click="tokenVisible = !tokenVisible">
+                  <AppIcon :name="tokenVisible ? 'eye-off' : 'eye'" :size="15" />
+                  {{ tokenVisible ? '隐藏' : '显示' }}
+                </button>
+                <button class="btn btn-default" type="button" @click="copy(created?.token || '', '令牌')">
+                  <AppIcon name="copy" :size="15" />
+                  复制
+                </button>
+              </div>
+            </div>
+
+            <div class="section-head">
+              <span class="section-title">一键安装</span>
+              <span class="section-sub">拉取配置、安装服务并重启</span>
+            </div>
+            <div class="field">
+              <div class="field-label">一键安装命令（拉取配置 + 安装 + 重启）</div>
+              <div v-if="!installRepo" class="alert alert-warning" style="margin-bottom: 12px">
+                <AppIcon name="alert" :size="16" class="icon" />
+                <span>尚未配置升级仓库。请先在「系统设置 → 品牌与升级源」填写 owner/repo（安装脚本需要仓库地址）。</span>
+              </div>
+              <div v-else class="command-box">
+                <pre class="mono">{{ oneClickInstallScript }}</pre>
+                <button class="btn btn-default btn-sm copy-float" type="button"
+                  @click="copy(oneClickInstallScript, '一键安装命令')">
+                  <AppIcon name="copy" :size="14" />
+                  复制
+                </button>
+              </div>
+              <div class="flex-between">
+                <span class="field-hint" style="max-width: 70%">
+                  命令会用节点令牌从控制面的 <span class="mono">/api/v1/edge/config</span> 拉取本节点配置到
+                  <span class="mono">/etc/lagran/edge.env</span>，再执行 install.sh edge 并重启。
+                  节点必须能访问 {{ controlUrl || '控制面地址' }}；令牌等同密码，请通过安全通道执行。                </span>
+                <button class="btn btn-default btn-sm" type="button" @click="downloadEnv">
+                  下载 edge.env
+                </button>
+              </div>
+            </div>
+
+            <div v-if="controlUrlLooksLoopback" class="alert alert-warning">
+              <AppIcon name="alert" :size="16" class="icon" />
+              <span>
+                控制面地址是回环地址 {{ controlUrl }}：如果 Edge 不在控制面同机，心跳会失败。
+                请在控制面设置 CONTROL_PUBLIC_URL 后重新打开向导。
+              </span>
+            </div>
+
+            <div v-if="controlUrlIsInsecure" class="alert alert-warning">
+              <AppIcon name="alert" :size="16" class="icon" />
+              <span>
+                控制面地址使用 HTTP：节点令牌和配置文件会以明文经过网络。
+                生产环境请为 {{ controlUrl }} 配置 HTTPS（或通过内网/TLS 反向代理）后再执行安装命令。
+              </span>
+            </div>
+
+            <p v-if="stepError" class="text-danger step-error">{{ stepError }}</p>
+          </div>
+
+          <!-- 步骤 4：上线验证 -->
+          <div v-else class="form-col">
+            <div class="wizard-hero">
+              <div class="wizard-icon">
+                <AppIcon name="activity" :size="24" />
+              </div>
+              <div>
+                <div class="wizard-title">等待节点首次心跳</div>
+                <div class="wizard-desc">
+                  控制台每 3 秒查询一次；节点启动后约 15 秒应变为「在线」，60 秒无心跳会记为离线。
+                </div>
+              </div>
+            </div>
+
+            <div class="status-panel" :class="liveTone">
+              <div class="status-main">
+                <span class="status-pulse" :class="{ live: isLive }" />
+                <StatusTag :tone="liveStatusObject.tone" dot>
+                  {{ liveStatusObject.label }}
+                </StatusTag>
+                <span class="mono status-name">{{ form.name }}</span>
+              </div>
+              <div class="status-meta">
+                <span>{{ form.public_ip || '未填公网 IP' }}</span>
+                <span v-if="liveNode?.version">版本 {{ liveNode.version }}</span>
+                <span v-if="liveNode?.last_heartbeat">最后心跳 {{ fromNow(liveNode.last_heartbeat) }}</span>
+                <span v-else>尚未收到心跳</span>
+              </div>
+              <div class="live-steps">
+                <span class="live-step done">注册</span>
+                <span class="live-step" :class="{ done: Boolean(liveNode) }">启动</span>
+                <span class="live-step" :class="{ done: isLive }">在线</span>
+              </div>
+            </div>
+
+            <div class="field">
+              <div class="field-label">节点侧自检</div>
+              <div class="command-box sub">
+                <pre class="mono">{{ verificationSteps }}</pre>
+                <button class="btn btn-default btn-sm copy-float" type="button"
+                  @click="copy(verificationSteps, '自检命令')">
+                  <AppIcon name="copy" :size="14" />
+                  复制
+                </button>
+              </div>
+            </div>
+
+            <div class="tips">
+              <div class="tip-row">
+                <span class="tip-index">1</span>
+                <span v-if="isLive">
+                  节点已上线，可以开始为域名配置解析；接下来可在节点列表查看资源曲线。
+                </span>
+                <span v-else>
+                  若长时间停留「待接入」：检查 AGENT_TOKEN 与 NODE_ID 是否与 edge.env 一致、
+                  节点到 {{ controlUrl }} 的网络是否可达，以及 journalctl -u lagran-edge 的启动日志。
+                </span>
+              </div>
+              <div class="tip-row">
+                <span class="tip-index">2</span>
+                <span>
+                  修改配置后需要重启服务；本向导生成的 edge.env 可随时在节点详情里通过
+                  「edge.env 配置文件」重新获取。
+                </span>
+              </div>
+            </div>
+
+            <div class="flex-between">
+              <span class="text-muted" style="font-size: 12px">
+                {{ polling ? '正在检测…' : '检测已暂停' }}
+              </span>
+              <button class="btn btn-default btn-sm" type="button" @click="pollOnce">
+                <AppIcon name="refresh" :size="14" />
+                立即检测
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="wizard-foot">
+          <button v-if="step > 0" class="btn btn-default" type="button" @click="prev">
+            <AppIcon name="chevron-left" :size="15" />
+            上一步
+          </button>
+          <span class="spacer" />
+          <span class="text-muted foot-hint">{{ footHint }}</span>
+          <button v-if="step === 0" class="btn btn-primary" type="button" @click="next">
+            下一步
+            <AppIcon name="chevron-right" :size="15" />
+          </button>
+          <button v-else-if="step === 1" class="btn btn-primary" type="button" :disabled="creating" @click="next">
+            {{ creating ? '注册中…' : (nodeLocked ? '保存并生成配置' : '注册节点并生成配置') }}
+            <AppIcon v-if="!creating" name="chevron-right" :size="15" />
+          </button>
+          <template v-else-if="step === 2">
+            <button class="btn btn-default" type="button" @click="restart">
+              换一台机器重来
+            </button>
+            <NuxtLink
+              v-if="created?.node?.id"
+              class="btn btn-default"
+              :to="`/nodes/remote?node=${encodeURIComponent(created.node.id)}`"
+            >
+              远程安装
+            </NuxtLink>
+            <button class="btn btn-primary" type="button" @click="next">
+              去验证上线
+              <AppIcon name="chevron-right" :size="15" />
+            </button>
+          </template>
+          <template v-else>
+            <NuxtLink to="/nodes" class="btn btn-primary">
+              返回节点列表
+            </NuxtLink>
+          </template>
+        </div>
+      </div>
+      </section>
+    </template>
+  </div>
+</template>
+<script setup lang="ts">
+import {
+  CACHE_BACKEND_LABEL,
+  EDGE_PROFILE_DEFAULTS,
+  NODE_ROLE_DESC,
+  NODE_ROLE_LABEL,
+  SIZING_GROUP_LABEL,
+  formatItemInput,
+  generateSecret,
+  hostForUrl,
+  humanBytes,
+  isValidHttpUrl,
+  isValidListen,
+  isValidSocketAddr,
+  isItemEditable,
+  itemRuleHint,
+  normalizeItemValue,
+  parseEdgeProfile,
+  recommendEdgeConfig,
+  renderEdgeEnvFile,
+  resolveDeployment,
+  serializeEdgeProfile,
+  splitListen,
+  summarizeHardware,
+  type EdgeCacheBackend,
+  type EdgeDeploymentMode,
+  type EdgeDiskType,
+  type EdgeHardware,
+  type EdgeNodeRole,
+  type EdgeSizingItem,
+  type EdgeSizingOverrides,
+  type SizingGroup,
+  type EdgeWorkload,
+} from '~/utils/edgeSizing'
+import { copyText } from '~/utils/clipboard'
+import { friendlyErrorMessage } from '~/utils/friendlyError'
+import type { GeoRegionDto } from '~/composables/useDnsConsole'
+import { resolveDnsLineId } from '~/composables/ensureDnsLine'
+
+const api = useApi()
+const auth = useAuthStore()
+const toast = useToast()
+const { ask } = useConfirm()
+const geo = useGeoCatalog()
+
+const steps = ['节点身份', '缓存与角色', '生成配置', '上线验证']
+
+const STEP_HINTS = [
+  '命名、公网地址与 DNS 线路',
+  '角色与缓存上限（对齐 GoEdge）',
+  '节点令牌与一键安装',
+  '等待首次心跳',
+]
+
+interface CreatedNode {
+  node: any
+  token: string
+  /** Server-resolved control-plane base URL; see apps/control/src/api/node.rs. */
+  control_url?: string
+  /** False when the control plane has no WAF signing key configured. */
+  waf_rulepack_configured?: boolean
+}
+
+const step = ref(0)
+const stepLabel = computed(() => String(step.value + 1).padStart(2, '0'))
+const progressPercent = computed(() => Math.round(((step.value + 1) / steps.length) * 100))
+const stepError = ref('')
+const creating = ref(false)
+const created = ref<CreatedNode | null>(null)
+const tokenVisible = ref(false)
+const reusedFrom = ref<string[]>([])
+
+const form = ref({
+  name: '',
+  region: '',
+  public_ip: '',
+  country: 'CN',
+  province: '',
+  city: '',
+  isp: '',
+  weight: 100,
+})
+
+/** Same picker model as DNS A-record「解析请求来源」. */
+const dnsLines = ref<GeoRegionDto[]>([])
+const dnsLineCountries = ref<string[]>([])
+const dnsLineId = ref('')
+
+async function loadDnsLines() {
+  try {
+    void geo.load()
+    dnsLines.value = (await api.get<GeoRegionDto[]>('/api/v1/geo-regions')) || []
+  } catch {
+    dnsLines.value = []
+  }
+}
+
+const hw = ref<EdgeHardware>({ ...EDGE_PROFILE_DEFAULTS.hardware, diskGb: 100, cpuCores: 4, memoryGb: 8, workload: 'mixed' })
+
+const infra = ref({ ...EDGE_PROFILE_DEFAULTS.infra })
+
+const GIB = 1024 * 1024 * 1024
+
+// `largeCacheGiB` is still used internally by the table's large-cache toggle;
+// numeric table edits live in `itemValues`.
+const overrides = ref<EdgeSizingOverrides>({
+  itemValues: {},
+  largeCacheGiB: undefined,
+})
+
+/** GoEdge-style memory cache cap (GiB). 0 → planner default (~1 GiB). */
+const memCacheGiB = ref(1)
+
+function applyCacheLimits() {
+  const disk = Math.max(0, Number(hw.value.diskGb) || 0)
+  hw.value.diskGb = disk
+  const mem = Math.max(0, Number(memCacheGiB.value) || 0)
+  // Keep machine memory estimate above the L1 cache budget.
+  if (!hw.value.memoryGb || hw.value.memoryGb < Math.max(2, mem * 2)) {
+    hw.value.memoryGb = Math.max(4, Math.ceil(mem * 4) || 4)
+  }
+  const itemValues = { ...(overrides.value.itemValues ?? {}) }
+  if (mem > 0) {
+    itemValues.CACHE_MAX_BYTES = Math.round(mem * GIB)
+  } else {
+    delete itemValues.CACHE_MAX_BYTES
+  }
+  overrides.value = {
+    ...overrides.value,
+    itemValues,
+    largeCacheGiB: disk > 0 ? disk : 0,
+  }
+  if (!hw.value.cpuCores) hw.value.cpuCores = 4
+  if (!hw.value.workload) hw.value.workload = 'mixed'
+}
+
+function optionalNumber(value: unknown): number | undefined {
+  // `v-model.number` hands back '' when the operator clears the box, and 0 is a
+  // meaningful override (it disables the large cache), so only undefined/''/NaN
+  // fall back to the recommendation.
+  if (value === undefined || value === null || value === '') return undefined
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : undefined
+}
+
+const cleanOverrides = computed<EdgeSizingOverrides>(() => ({
+  itemValues: { ...(overrides.value.itemValues ?? {}) },
+  largeCacheGiB: optionalNumber(overrides.value.largeCacheGiB),
+}))
+
+const editingKey = ref('')
+const editingValue = ref('')
+const editError = ref('')
+const editInput = ref<HTMLInputElement | null>(null)
+
+function setEditInput(el: unknown) {
+  editInput.value = (el as HTMLInputElement) || null
+}
+
+function canEditItem(key: string): boolean {
+  return isItemEditable(key)
+}
+
+function startEdit(item: EdgeSizingItem) {
+  if (!isItemEditable(item.key)) return
+  editingKey.value = item.key
+  editingValue.value = formatItemInput(item.key, item.value)
+  editError.value = ''
+  const pageX = window.scrollX
+  const pageY = window.scrollY
+  nextTick(() => {
+    const input = editInput.value
+    if (!input) return
+    const wrap = input.closest('.plan-table-wrap') as HTMLElement | null
+    const wrapLeft = wrap?.scrollLeft ?? 0
+    const wrapTop = wrap?.scrollTop ?? 0
+    // preventScroll keeps the table/page from jumping when the input mounts;
+    // the value is selected without select()'s implicit scroll. The explicit
+    // restore is a fallback for webviews that ignore preventScroll.
+    input.focus({ preventScroll: true })
+    input.setSelectionRange(0, input.value.length)
+    window.scrollTo(pageX, pageY)
+    if (wrap) {
+      wrap.scrollLeft = wrapLeft
+      wrap.scrollTop = wrapTop
+    }
+  })
+}
+
+function cancelEdit() {
+  editingKey.value = ''
+  editingValue.value = ''
+  editError.value = ''
+}
+
+/** Sensible large-cache size when the operator switches the tier on. */
+function recommendedLargeCacheGiB(): number {
+  const current = plan.value.metrics
+  if (current.largeCacheEnabled && current.largeCacheBytes > 0) {
+    return Math.max(1, Math.round(current.largeCacheBytes / GIB))
+  }
+  const usable = Math.max(0, Number(hw.value.diskGb) || 0) * 0.85
+  return Math.floor(usable * 0.8)
+}
+
+function commitEdit(item: EdgeSizingItem) {
+  if (editingKey.value !== item.key) return
+  const key = item.key
+
+  if (key === 'LARGE_CACHE_ENABLED') {
+    const normalized = normalizeItemValue(key, editingValue.value)
+    if (normalized === null) {
+      editError.value = itemRuleHint(key)
+      toast.error(editError.value)
+      return
+    }
+    if (normalized === 'true') {
+      const gb = recommendedLargeCacheGiB()
+      if (gb <= 0) {
+        editError.value = '未填写磁盘容量，无法启用大对象缓存'
+        toast.error(editError.value)
+        return
+      }
+      overrides.value.largeCacheGiB = gb
+    } else {
+      overrides.value.largeCacheGiB = 0
+    }
+    cancelEdit()
+    return
+  }
+
+  const normalized = normalizeItemValue(key, editingValue.value)
+  if (normalized === null) {
+    editError.value = itemRuleHint(key)
+    toast.error(editError.value)
+    return
+  }
+  overrides.value.itemValues = {
+    ...(overrides.value.itemValues ?? {}),
+    [key]: normalized,
+  }
+  cancelEdit()
+}
+
+/** Parse an http(s) URL into host/port without throwing. */
+function parseHttpUrl(value: string): { host: string; port: string } | null {
+  try {
+    const url = new URL(value)
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return null
+    return {
+      host: url.hostname.replace(/^\[/, '').replace(/\]$/, ''),
+      port: url.port || (url.protocol === 'https:' ? '443' : '80'),
+    }
+  } catch {
+    return null
+  }
+}
+
+function isLoopbackAddress(host: string): boolean {
+  const value = host.trim().replace(/^\[/, '').replace(/\]$/, '').toLowerCase()
+  return value === 'localhost' || value === '::1' || value.startsWith('127.')
+}
+
+/**
+ * `AGENT_URL` is derived, not typed, for the two guided deployment modes.
+ * The edge parses `EDGE_ADMIN_LISTEN` as a SocketAddr and the control plane
+ * calls `AGENT_URL`; if they disagree, heartbeats succeed while purge/cert/ACME
+ * silently fail. Keeping them in one function removes that failure mode.
+ */
+const effectiveAgentUrl = computed(() => {
+  if (infra.value.deployment !== 'custom') {
+    return resolveDeployment(infra.value.deployment, form.value.public_ip.trim()).agentUrl
+  }
+  return infra.value.agentUrl.trim()
+})
+
+const effectiveAdminHostPort = computed(() => infra.value.adminListen || '127.0.0.1:8081')
+
+/** Console origin is only a fallback; the API returns the authoritative value. */
+const fallbackControlUrl = computed(() => {
+  const base = (api.base as string || '').trim().replace(/\/+$/, '')
+  if (base) return base
+  if (import.meta.client && window.location?.origin) return window.location.origin
+  return ''
+})
+
+const controlUrl = computed(() => created.value?.control_url || fallbackControlUrl.value)
+/** Shown before registration; same source the API will stamp into edge.env. */
+const previewControlUrl = computed(() => fallbackControlUrl.value)
+
+const controlUrlLooksLoopback = computed(() => {
+  const host = parseHttpUrl(controlUrl.value)?.host
+  return Boolean(host && isLoopbackAddress(host))
+})
+
+const controlUrlIsInsecure = computed(() => {
+  const raw = controlUrl.value.trim()
+  const host = parseHttpUrl(raw)?.host
+  return /^http:\/\//i.test(raw) && Boolean(host && !isLoopbackAddress(host))
+})
+
+function applyDeployment() {
+  const derived = resolveDeployment(infra.value.deployment, form.value.public_ip.trim())
+  if (!derived.adminListen) return
+  infra.value.adminListen = derived.adminListen
+  infra.value.agentUrl = derived.agentUrl
+}
+
+function onSameHostToggle(checked: boolean) {
+  infra.value.deployment = checked ? 'same-host' : 'remote'
+  applyDeployment()
+}
+
+function onCustomAgentToggle(checked: boolean) {
+  if (checked) {
+    infra.value.deployment = 'custom'
+    if (!infra.value.adminListen.trim()) {
+      infra.value.adminListen = `0.0.0.0:8081`
+    }
+    if (!infra.value.agentUrl.trim() && form.value.public_ip.trim()) {
+      infra.value.agentUrl = `http://${form.value.public_ip.trim()}:8081`
+    }
+  } else {
+    infra.value.deployment = 'remote'
+    applyDeployment()
+  }
+}
+
+watch(
+  () => form.value.public_ip,
+  () => {
+    if (infra.value.deployment !== 'custom') applyDeployment()
+  },
+)
+
+/** Cross-field problems that do not block the wizard but will bite later. */
+const identityWarnings = computed(() => {
+  const warnings: string[] = []
+  const admin = splitListen(infra.value.adminListen)
+  const agent = parseHttpUrl(effectiveAgentUrl.value)
+
+  if (infra.value.deployment === 'same-host') {
+    warnings.push('同机模式：控制面与节点必须在同一台机器，AGENT_URL 才使用 127.0.0.1。')
+  }
+  if (admin && agent) {
+    if (agent.port !== admin.port) {
+      warnings.push(
+        `AGENT_URL 端口 ${agent.port} 与 EDGE_ADMIN_LISTEN 端口 ${admin.port} 不一致，purge / 证书 / ACME 会失败。`,
+      )
+    }
+    if (isLoopbackAddress(admin.host) && !isLoopbackAddress(agent.host)) {
+      warnings.push('Agent 只监听回环，但 AGENT_URL 不是回环：控制面无法回调。')
+    }
+    if (!isLoopbackAddress(admin.host) && isLoopbackAddress(agent.host)) {
+      warnings.push('AGENT_URL 指向回环，但 Agent 监听非回环：跨机控制面无法回调。')
+    }
+  }
+  if (admin) {
+    if (admin.port === '80' || admin.port === '443') {
+      warnings.push('Agent 不要使用 80/443：那是数据面端口。')
+    }
+    const httpPort = splitListen(infra.value.httpListen)?.port
+    if (httpPort && httpPort === admin.port) {
+      warnings.push('Agent 端口与 HTTP 数据面端口相同，Edge 会拒绝启动。')
+    }
+    const httpsPort = splitListen(infra.value.httpsListen)?.port
+    if (infra.value.httpsEnabled && httpsPort && httpsPort === admin.port) {
+      warnings.push('Agent 端口与 HTTPS 数据面端口相同，Edge 会拒绝启动。')
+    }
+  }
+  return warnings
+})
+
+/** Sizing-adjacent warnings, shown on the hardware step. */
+const infraWarnings = computed(() => {
+  const warnings: string[] = []
+  const redisEndpoint = infra.value.redisUrl.trim()
+  const cacheEndpoint = infra.value.cacheRedisUrl.trim()
+
+  // Source of truth (apps/edge/src/main.rs): CC counters and the distributed
+  // rate limiter need only REDIS_URL; the flight lock and L2 cache need
+  // CACHE_BACKEND=redis plus an endpoint (CACHE_REDIS_URL, else REDIS_URL).
+  if (infra.value.cacheBackend === 'redis' && !redisEndpoint && !cacheEndpoint) {
+    warnings.push(
+      'CACHE_BACKEND=redis 但 REDIS_URL 与 CACHE_REDIS_URL 都为空：Edge 会回退到本地缓存，合并锁也不会启用。',
+    )
+  }
+  if (infra.value.cacheBackend !== 'redis' && redisEndpoint) {
+    warnings.push(
+      `已填写 REDIS_URL 但 CACHE_BACKEND=${infra.value.cacheBackend}：CC 计数与分布式限流仍会跨节点共享，` +
+      '而合并锁与 L2 缓存需要 CACHE_BACKEND=redis 才启用。',
+    )
+  }
+  if (infra.value.cacheBackend !== 'redis' && cacheEndpoint && !redisEndpoint) {
+    warnings.push(
+      '已填写 CACHE_REDIS_URL，但 CACHE_BACKEND 不是 redis：该地址不会生效，CC 计数也不会跨节点共享。',
+    )
+  }
+  if (redisEndpoint && !hw.value.sharedRedis) {
+    warnings.push(
+      '已填写 REDIS_URL：CC 计数与分布式限流会用该 Redis 跨节点共享（区域实例即可）；' +
+      '勾选「使用共享 Redis」只会额外输出 Redis 超时调优参数。',
+    )
+  }
+  for (const url of [infra.value.redisUrl, infra.value.cacheRedisUrl]) {
+    const value = url.trim()
+    if (value && !/^rediss?:\/\//i.test(value)) {
+      warnings.push(`Redis 地址必须以 redis:// 或 rediss:// 开头：${value}`)
+    }
+  }
+  if (!infra.value.challengeSecret.trim()) {
+    warnings.push(
+      'CHALLENGE_SECRET 为空：每个节点会用各自的 AGENT_TOKEN 派生，跨节点安全验证可能失败；多节点请填写相同值或点击「生成」。',
+    )
+  }
+  if (!infra.value.wafRulepackSecret.trim()) {
+    warnings.push(
+      'WAF_RULEPACK_SECRET 为空：使用控制面签名规则包时必须填写，且要与 /etc/lagran/control.env 完全一致；不用签名规则包时可忽略。',
+    )
+  }
+  if (infra.value.httpsEnabled && !form.value.public_ip.trim()) {
+    warnings.push('启用 HTTPS 但未填公网 IP：DNS 无法调度，443 也可能没有匹配证书。')
+  }
+  return warnings
+})
+
+const nodeLocked = computed(() => created.value !== null)
+
+const plan = computed(() =>
+  recommendEdgeConfig(hw.value, {
+    ...cleanOverrides.value,
+    // `CACHE_BACKEND` comes from the runtime section, not the hardware form, so
+    // it is merged in here to keep a single source of truth for the plan.
+    cacheBackend: infra.value.cacheBackend,
+    // Without an endpoint `redis` can only fall back locally; the planner
+    // downgrades it and flags the result instead of emitting a broken config.
+    redisConfigured: Boolean(infra.value.redisUrl.trim() || infra.value.cacheRedisUrl.trim()),
+  }),
+)
+const hardwareSummary = computed(() => summarizeHardware(hw.value))
+
+const planGroups = computed(() => {
+  const groups: { key: SizingGroup; label: string; items: EdgeSizingItem[] }[] = []
+  for (const item of plan.value.items) {
+    let group = groups.find((entry) => entry.key === item.group)
+    if (!group) {
+      group = { key: item.group, label: SIZING_GROUP_LABEL[item.group], items: [] }
+      groups.push(group)
+    }
+    group.items.push(item)
+  }
+  return groups
+})
+
+const hasOverrides = computed(() => {
+  const values = overrides.value.itemValues ?? {}
+  return Object.keys(values).length > 0 || overrides.value.largeCacheGiB !== undefined
+})
+
+function resetOverrides() {
+  cancelEdit()
+  overrides.value = { itemValues: {}, largeCacheGiB: undefined }
+}
+
+const envText = computed(() => {
+  if (!created.value) return ''
+  return renderEdgeEnvFile({
+    nodeId: form.value.name.trim(),
+    region: form.value.region.trim(),
+    publicIp: form.value.public_ip.trim(),
+    agentUrl: effectiveAgentUrl.value,
+    token: created.value.token,
+    controlUrl: controlUrl.value,
+    httpListen: infra.value.httpListen,
+    adminListen: infra.value.adminListen,
+    httpsEnabled: infra.value.httpsEnabled,
+    httpsListen: infra.value.httpsListen,
+    redisUrl: infra.value.redisUrl,
+    cacheRedisUrl: infra.value.cacheRedisUrl,
+    challengeSecret: infra.value.challengeSecret,
+    wafRulepackSecret: infra.value.wafRulepackSecret,
+    hardware: hw.value,
+    plan: plan.value,
+  })
+})
+
+/** Installer repository from console settings (system branding / update_repo). */
+const installRepo = ref('')
+
+async function loadInstallRepo() {
+  try {
+    const cfg = await api.get<{ update_repo?: string; effective_update_repo?: string }>(
+      '/api/v1/system/branding',
+    )
+    // The effective repo falls back to control.env's LAGRAN_UPDATE_REPO, which
+    // install.sh always sets; the console field alone is empty on new installs.
+    installRepo.value = (cfg?.effective_update_repo || cfg?.update_repo || '').trim()
+  } catch {
+    installRepo.value = ''
+  }
+}
+
+/** Quote a value for a POSIX shell single-quoted context. */
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`
+}
+
+/** Control-plane endpoint the node uses to fetch its rendered edge.env. */
+const edgeConfigUrl = computed(() => {
+  const base = controlUrl.value.trim().replace(/\/+$/, '')
+  const name = form.value.name.trim()
+  if (!base || !name) return ''
+  return `${base}/api/v1/edge/config?edge=${encodeURIComponent(name)}`
+})
+
+/**
+ * The edge.env is already on disk when this runs, so `install.sh edge` keeps
+ * it and never reaches the branch that needs AGENT_TOKEN/NODE_ID. The node
+ * token therefore appears only once, in the config-fetch header.
+ */
+const installCommand = computed(() => {
+  const repo = installRepo.value
+  if (!repo) return ''
+  return (
+    `curl -fsSL https://raw.githubusercontent.com/${repo}/main/install.sh ` +
+    `| sudo env LAGRAN_REPO=${repo} bash -s -- edge`
+  )
+})
+
+/**
+ * One single-line copy-paste command for a fresh node.
+ *
+ * The config is fetched first (so install.sh keeps it) and written as root with
+ * `umask 077`, so the token-bearing file is never briefly world-readable. The
+ * fetch is a direct curl (not a pipe), so an HTTP error stops the && chain
+ * instead of feeding an empty file to `install`.
+ */
+const oneClickInstallScript = computed(() => {
+  if (!created.value || !edgeConfigUrl.value || !installCommand.value) return ''
+  const authHeader = shellQuote(`X-Lagran-Agent-Token: ${created.value.token}`)
+  return (
+    'sudo install -d -m 0750 /etc/lagran' +
+    ` && sudo sh -c 'umask 077; exec curl -fsSL -H "$1" -o "$2" "$3"' _ ${authHeader} /etc/lagran/edge.env ${shellQuote(edgeConfigUrl.value)}` +
+    ' && sudo chmod 600 /etc/lagran/edge.env' +
+    ` && ${installCommand.value}` +
+    ' && sudo systemctl restart lagran-edge'
+  )
+})
+
+const healthUrl = computed(() => {
+  const admin = splitListen(infra.value.adminListen)
+  if (!admin) return 'http://127.0.0.1:8081/__lagran/health'
+  const host = admin.host === '0.0.0.0' || admin.host === '::' ? '127.0.0.1' : admin.host
+  return `http://${hostForUrl(host)}:${admin.port}/__lagran/health`
+})
+
+const verificationSteps = computed(
+  () => `# 本机健康检查（管理面）
+curl -fsS ${healthUrl.value}
+
+# 服务状态与启动摘要
+sudo systemctl status lagran-edge --no-pager -l
+sudo journalctl -u lagran-edge -n 50 --no-pager`,
+)
+
+/** `<select>` yields a plain string; narrow it back to the union it belongs to. */
+function setDiskType(value: string) {
+  hw.value.diskType = value as EdgeDiskType
+}
+
+function setWorkload(value: string) {
+  hw.value.workload = value as EdgeWorkload
+}
+
+function setRole(value: string) {
+  hw.value.role = value as EdgeNodeRole
+}
+
+function setCacheBackend(value: string) {
+  infra.value.cacheBackend = value as EdgeCacheBackend
+}
+
+function randomizeChallengeSecret() {
+  infra.value.challengeSecret = generateSecret(32)
+}
+
+/**
+ * Reuse the shared settings already stored on an existing node.
+ *
+ * `CHALLENGE_SECRET` and `WAF_RULEPACK_SECRET` must be identical on every edge,
+ * and the profile column is the only place the console knows them. Copying
+ * them here means the second and later nodes do not need a manual copy/paste.
+ */
+async function loadSharedDefaults() {
+  if (!auth.isAdmin) return
+  try {
+    const nodes = (await api.get<any[]>('/api/v1/nodes')) || []
+    const names = new Set<string>()
+    for (const node of nodes) {
+      const profile = parseEdgeProfile(node?.edge_profile)
+      if (!profile) continue
+      if (!infra.value.challengeSecret && profile.infra.challengeSecret) {
+        infra.value.challengeSecret = profile.infra.challengeSecret
+        names.add(node.name)
+      }
+      if (!infra.value.wafRulepackSecret && profile.infra.wafRulepackSecret) {
+        infra.value.wafRulepackSecret = profile.infra.wafRulepackSecret
+        names.add(node.name)
+      }
+      if (!infra.value.redisUrl && profile.infra.redisUrl) {
+        infra.value.redisUrl = profile.infra.redisUrl
+        hw.value.sharedRedis = true
+        names.add(node.name)
+      }
+      if (!infra.value.cacheRedisUrl && profile.infra.cacheRedisUrl) {
+        infra.value.cacheRedisUrl = profile.infra.cacheRedisUrl
+        names.add(node.name)
+      }
+    }
+    reusedFrom.value = [...names]
+  } catch {
+    // An empty registry or a transient failure is not fatal; the operator can
+    // still fill the fields manually.
+  }
+}
+
+onMounted(async () => {
+  if (infra.value.deployment !== 'custom') applyDeployment()
+  await Promise.all([loadSharedDefaults(), loadInstallRepo(), loadDnsLines()])
+  // A fresh deployment has no stored value to reuse. Generate one now: the
+  // profile persists it and every later node reuses it, so a fleet stays
+  // consistent without the operator inventing a secret.
+  if (auth.isAdmin && !infra.value.challengeSecret.trim()) {
+    infra.value.challengeSecret = generateSecret(32)
+  }
+})
+
+/** Mirrors `validate_agent_url`: plain http(s) origin, no shell metacharacters. */
+function validAgentUrl(value: string): boolean {
+  return isValidHttpUrl(value, false)
+}
+
+function validIp(value: string): boolean {
+  if (!value) return false
+  // Deliberately permissive: IPv4, IPv6 and hostnames are all acceptable here,
+  // and 智能解析 does the real resolution.
+  return /^[A-Za-z0-9.:_-]{1,64}$/.test(value)
+}
+
+function validateStep(index: number): string {
+  if (index === 0) {
+    const name = form.value.name.trim()
+    if (!name) return '请填写节点名称'
+    if (!/^[A-Za-z0-9._-]{1,64}$/.test(name)) {
+      return '节点名称只能包含字母、数字、点、下划线与连字符（最长 64 个字符）'
+    }
+    if (!/^[A-Za-z0-9._-]{0,64}$/.test(form.value.region.trim())) {
+      return '区域标签只能包含字母、数字、点、下划线与连字符'
+    }
+    if (!validIp(form.value.public_ip.trim())) {
+      return '请填写该节点对访客可达的公网 IP'
+    }
+
+    const admin = infra.value.adminListen.trim()
+    if (!isValidSocketAddr(admin)) {
+      return '管理面监听必须是 IP:端口（Edge 用 SocketAddr 解析，不能写主机名），例如 0.0.0.0:8081'
+    }
+    const adminParts = splitListen(admin)
+    if (!adminParts) return '管理面监听格式无效'
+    if (adminParts.port === '80' || adminParts.port === '443') {
+      return '管理面不能使用 80/443，请换一个管理端口（例如 8081）'
+    }
+    const httpPort = splitListen(infra.value.httpListen)?.port
+    if (httpPort && httpPort === adminParts.port) {
+      return '管理面端口不能与 HTTP 数据面端口相同'
+    }
+    const httpsPort = splitListen(infra.value.httpsListen)?.port
+    if (infra.value.httpsEnabled && httpsPort && httpsPort === adminParts.port) {
+      return '管理面端口不能与 HTTPS 数据面端口相同'
+    }
+
+    const agentUrl = effectiveAgentUrl.value
+    if (!agentUrl) {
+      return '请填写公网 IP 以生成 AGENT_URL，或在高级选项中自定义回调地址'
+    }
+    if (!validAgentUrl(agentUrl)) {
+      return 'AGENT_URL 必须是 http(s)://主机[:端口]，不能带路径或特殊字符'
+    }
+    const agent = parseHttpUrl(agentUrl)
+    if (!agent) return 'AGENT_URL 格式无效'
+    if (agent.port !== adminParts.port) {
+      return `AGENT_URL 端口（${agent.port}）必须与 EDGE_ADMIN_LISTEN 端口（${adminParts.port}）一致`
+    }
+    if (agent.host === '0.0.0.0' || agent.host === '::') {
+      return 'AGENT_URL 不能使用 0.0.0.0 / ::，控制面无法回调'
+    }
+    if (isLoopbackAddress(adminParts.host) && !isLoopbackAddress(agent.host)) {
+      return '管理面只监听回环地址，但 AGENT_URL 使用非回环地址：控制面无法回调'
+    }
+    if (!isLoopbackAddress(adminParts.host) && isLoopbackAddress(agent.host)) {
+      return 'AGENT_URL 指向回环地址，跨机控制面无法回调'
+    }
+    return ''
+  }
+
+  if (index === 1) {
+    if (Number(hw.value.diskGb) < 0 || Number(hw.value.diskGb) > 100_000) {
+      return '缓存磁盘上限需在 0–100000 GiB 之间'
+    }
+    if (Number(memCacheGiB.value) < 0 || Number(memCacheGiB.value) > 256) {
+      return '内存缓存上限需在 0–256 GiB 之间'
+    }
+    if (!Number(hw.value.cpuCores) || hw.value.cpuCores < 1 || hw.value.cpuCores > 128) {
+      return '高级：CPU 核数需在 1–128 之间'
+    }
+    if (!Number(hw.value.memoryGb) || hw.value.memoryGb < 1 || hw.value.memoryGb > 512) {
+      return '高级：内存需在 1–512 GiB 之间'
+    }
+    if (Number(hw.value.bandwidthMbps) < 0 || Number(hw.value.bandwidthMbps) > 100_000) {
+      return '高级：出口带宽需在 0–100000 Mbps 之间'
+    }
+    if (!isValidListen(infra.value.httpListen)) {
+      return 'EDGE_LISTEN 格式应为 IP/主机:端口，例如 0.0.0.0:80'
+    }
+    if (infra.value.httpsEnabled && !isValidListen(infra.value.httpsListen)) {
+      return 'HTTPS 监听地址格式应为 IP/主机:端口，例如 0.0.0.0:443'
+    }
+    if (
+      infra.value.httpsEnabled &&
+      splitListen(infra.value.httpsListen)?.port === splitListen(infra.value.httpListen)?.port
+    ) {
+      return 'HTTPS 与 HTTP 监听端口不能相同'
+    }
+    const adminPort = splitListen(infra.value.adminListen)?.port
+    if (splitListen(infra.value.httpListen)?.port === adminPort) {
+      return 'HTTP 数据面端口不能与管理面端口相同'
+    }
+    if (infra.value.httpsEnabled && splitListen(infra.value.httpsListen)?.port === adminPort) {
+      return 'HTTPS 数据面端口不能与管理面端口相同'
+    }
+    for (const value of [infra.value.redisUrl, infra.value.cacheRedisUrl]) {
+      if (value.trim() && !/^rediss?:\/\//i.test(value.trim())) {
+        return 'Redis 地址必须以 redis:// 或 rediss:// 开头'
+      }
+      if (/\s/.test(value)) return 'Redis 地址不能包含空白字符'
+    }
+    // The env file is unquoted (quoting would change the value), so a secret
+    // containing whitespace, a quote or '#' would be parsed differently by
+    // systemd/dotenvy than the operator expects.
+    for (const [name, value] of [
+      ['CHALLENGE_SECRET', infra.value.challengeSecret.trim()],
+      ['WAF_RULEPACK_SECRET', infra.value.wafRulepackSecret.trim()],
+    ] as const) {
+      if (value && /[\s#'"]/.test(value)) {
+        return `${name} 不能包含空白、引号或 #（EnvironmentFile 按字面解析）`
+      }
+    }
+    if (
+      infra.value.cacheBackend === 'redis' &&
+      !infra.value.redisUrl.trim() &&
+      !infra.value.cacheRedisUrl.trim()
+    ) {
+      return 'CACHE_BACKEND=redis 需要填写 REDIS_URL 或 CACHE_REDIS_URL；没有 Redis 请改回「按硬件自动」'
+    }
+    return ''
+  }
+
+  return ''
+}
+
+async function next() {
+  stepError.value = ''
+  // A blur normally commits the current cell, but an invalid value keeps the
+  // editor open; do not silently advance with the old value.
+  const message = validateStep(step.value)
+  if (message) {
+    stepError.value = message
+    return
+  }
+  if (step.value === 1) {
+    applyCacheLimits()
+    const ok = await ensureNode()
+    if (!ok) return
+  }
+  if (step.value === 2) {
+    startPolling()
+  }
+  step.value = Math.min(step.value + 1, steps.length - 1)
+}
+
+function prev() {
+  stepError.value = ''
+  // Leaving the capacity step abandons an invalid in-place edit instead of
+  // leaving a stale editor behind.
+  step.value = Math.max(step.value - 1, 0)
+}
+
+/**
+ * Payload stored on the node so the detail drawer can rebuild the same file.
+ *
+ * Every value that changes the rendered `edge.env` must be here, otherwise the
+ * drawer silently disagrees with the wizard.
+ */
+function currentProfile() {
+  return {
+    hardware: { ...hw.value },
+    infra: {
+      deployment: infra.value.deployment,
+      httpListen: infra.value.httpListen.trim(),
+      httpsEnabled: infra.value.httpsEnabled,
+      httpsListen: infra.value.httpsListen.trim(),
+      adminListen: infra.value.adminListen.trim(),
+      agentUrl: effectiveAgentUrl.value,
+      redisUrl: infra.value.redisUrl.trim(),
+      cacheRedisUrl: infra.value.cacheRedisUrl.trim(),
+      cacheBackend: infra.value.cacheBackend,
+      // Shared secrets are part of the profile so the drawer renders the same
+      // CHALLENGE_SECRET / WAF_RULEPACK_SECRET the wizard produced.
+      challengeSecret: infra.value.challengeSecret.trim(),
+      wafRulepackSecret: infra.value.wafRulepackSecret.trim(),
+    },
+    sizing: cleanOverrides.value,
+    env: envText.value,
+  }
+}
+
+/** Register the node exactly once; later visits only re-sync the profile. */
+async function ensureNode(): Promise<boolean> {
+  if (created.value) {
+    const synced = await syncProfile()
+    if (!synced) stepError.value = '同步节点配置失败；请稍后重试“下一步”。'
+    return synced
+  }
+  creating.value = true
+  try {
+    let regionId = ''
+    try {
+      regionId = await resolveDnsLineId(api, {
+        lineId: dnsLineId.value,
+        countries: dnsLineCountries.value,
+        note: '由边缘节点接入自动创建',
+      })
+      if (regionId) await loadDnsLines()
+    } catch (e: any) {
+      const message = friendlyErrorMessage(e?.data?.error, '解析 DNS 线路失败')
+      stepError.value = message
+      toast.error(message)
+      return false
+    }
+    // Keep legacy country field roughly aligned when a single country was picked.
+    if (dnsLineCountries.value.length === 1) {
+      form.value.country = dnsLineCountries.value[0]
+    }
+    const res = await api.post<CreatedNode>('/api/v1/nodes', {
+      name: form.value.name.trim(),
+      region: form.value.region.trim(),
+      // The control plane stores this as the callback URL it will call. Sending
+      // the derived value keeps the database, AGENT_URL and EDGE_ADMIN_LISTEN
+      // in agreement from the first heartbeat.
+      agent_url: effectiveAgentUrl.value,
+      public_ip: form.value.public_ip.trim(),
+      country: form.value.country.trim().toUpperCase() || 'CN',
+      province: form.value.province.trim(),
+      city: form.value.city.trim(),
+      isp: form.value.isp.trim(),
+      weight: Math.round(Number(form.value.weight) || 100),
+      max_bandwidth_mbps: Math.round(Number(hw.value.bandwidthMbps) || 0),
+      region_id: regionId || '',
+      edge_profile: serializeEdgeProfile(currentProfile()),
+    })
+    created.value = res
+    // The one-click command fetches this stored file by node token. Refuse to
+    // advance if the sync failed, otherwise the API would answer 409.
+    const synced = await syncProfile()
+    if (!synced) {
+      stepError.value = '节点已注册，但配置同步到控制面失败；请重试“下一步”或重新打开向导。'
+      return false
+    }
+    toast.success('节点已注册，配置已生成并同步到控制面')
+    return true
+  } catch (e: any) {
+    const message = friendlyErrorMessage(e?.data?.error, '注册节点失败，请稍后重试')
+    stepError.value = message
+    toast.error(message)
+    return false
+  } finally {
+    creating.value = false
+  }
+}
+
+/**
+ * Push the current hardware/network profile to the node.
+ *
+ * Only the profile and the derived callback URL are sent: identity fields stay
+ * untouched, so a node that is already serving traffic cannot be renamed or
+ * re-pointed by a late "next" click.
+ */
+async function syncProfile(): Promise<boolean> {
+  const id = created.value?.node?.id
+  if (!id) return false
+  try {
+    let regionId = ''
+    try {
+      regionId = await resolveDnsLineId(api, {
+        lineId: dnsLineId.value,
+        countries: dnsLineCountries.value,
+        note: '由边缘节点接入自动创建',
+      })
+    } catch (e: any) {
+      toast.error(friendlyErrorMessage(e?.data?.error, '解析 DNS 线路失败'))
+      return false
+    }
+    await api.put(`/api/v1/nodes/${id}`, {
+      agent_url: effectiveAgentUrl.value,
+      max_bandwidth_mbps: Math.round(Number(hw.value.bandwidthMbps) || 0),
+      region_id: regionId || '',
+      edge_profile: serializeEdgeProfile(currentProfile()),
+    })
+    return true
+  } catch (e: any) {
+    toast.error(friendlyErrorMessage(e?.data?.error, '同步节点配置失败，请重试'))
+    return false
+  }
+}
+
+async function restart() {
+  cancelEdit()
+  const ok = await ask({
+    title: '换一台机器重来',
+    message: created.value
+      ? `已注册的节点 ${created.value.node.name} 仍会留在控制台，需要你稍后在节点列表里删除。确认重新开始？`
+      : '确认清空当前填写的内容？',
+    confirmText: '重新开始',
+    danger: Boolean(created.value),
+  })
+  if (!ok) return
+  stopPolling()
+  created.value = null
+  tokenVisible.value = false
+  stepError.value = ''
+  liveNode.value = null
+  // Hand-tuned numbers belong to the node we just abandoned; the next machine
+  // should start from its own recommendation. Shared secrets stay: they must
+  // remain identical across the fleet.
+  overrides.value = {
+    itemValues: {},
+    largeCacheGiB: undefined,
+  }
+  const keep = {
+    challengeSecret: infra.value.challengeSecret,
+    wafRulepackSecret: infra.value.wafRulepackSecret,
+    redisUrl: infra.value.redisUrl,
+    cacheRedisUrl: infra.value.cacheRedisUrl,
+  }
+  hw.value = {
+    ...EDGE_PROFILE_DEFAULTS.hardware,
+    diskGb: 100,
+    cpuCores: 4,
+    memoryGb: 8,
+    workload: 'mixed',
+  }
+  memCacheGiB.value = 1
+  infra.value = { ...EDGE_PROFILE_DEFAULTS.infra, ...keep }
+  form.value = {
+    name: '',
+    region: '',
+    public_ip: '',
+    country: 'CN',
+    province: '',
+    city: '',
+    isp: '',
+    weight: 100,
+  }
+  dnsLineCountries.value = []
+  dnsLineId.value = ''
+  applyDeployment()
+  step.value = 0
+}
+
+function copy(text: string, label: string) {
+  if (!text) return
+  copyText(text).then((ok) => {
+    if (ok) toast.success(`${label}已复制`)
+    else toast.error('复制失败，请手动选择文本')
+  })
+}
+
+function downloadEnv() {
+  if (!import.meta.client || !envText.value) return
+  const blob = new Blob([envText.value], { type: 'text/plain;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `edge-${form.value.name.trim() || 'node'}.env`
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
+/** Bytes are easier to read than "8388608" in the plan table. */
+function displayValue(item: { key: string; value: string }) {
+  if (!/_BYTES$/.test(item.key)) return item.value
+  const bytes = Number(item.value)
+  if (!Number.isFinite(bytes)) return item.value
+  return `${item.value}  (${humanBytes(bytes)})`
+}
+// ------------------------------------------------------------ 上线轮询
+const liveNode = ref<any>(null)
+const polling = ref(false)
+let pollTimer: ReturnType<typeof setInterval> | null = null
+
+/** Whether the control plane shows this node as reachable right now. */
+const isLive = computed(() => (liveNode.value?.status || '') === 'online')
+
+// StatusTag only accepts a fixed set of tones, so the map is typed with the
+// same union instead of a loose `string`.
+type LiveTone = 'success' | 'warning' | 'danger' | 'neutral'
+
+const liveStatusObject = computed<{ label: string; tone: LiveTone }>(() => {
+  const status = liveNode.value?.status || created.value?.node?.status || 'pending'
+  const map: Record<string, { label: string; tone: LiveTone }> = {
+    online: { label: '在线', tone: 'success' },
+    pending: { label: '待接入', tone: 'warning' },
+    offline: { label: '离线', tone: 'danger' },
+    disabled: { label: '已停用', tone: 'neutral' },
+  }
+  return map[status] || { label: status, tone: 'neutral' }
+})
+
+const liveTone = computed(() => {
+  const tone = liveStatusObject.value.tone
+  return tone === 'success' ? 'is-ok' : tone === 'danger' ? 'is-bad' : ''
+})
+
+/** Read the node list and pick out this node; the API has no per-node poll. */
+async function pollOnce() {
+  const id = created.value?.node?.id
+  if (!id) return
+  try {
+    const nodes = (await api.get<any[]>('/api/v1/nodes')) || []
+    const found = nodes.find((n) => n.id === id)
+    if (found) liveNode.value = found
+    if (found?.status === 'online') stopPolling()
+  } catch {
+    // A transient failure just means we try again on the next tick.
+  }
+}
+
+function startPolling() {
+  if (!created.value) return
+  polling.value = true
+  void pollOnce()
+  if (pollTimer) return
+  pollTimer = setInterval(() => {
+    void pollOnce()
+  }, 3000)
+}
+
+function stopPolling() {
+  polling.value = false
+  if (pollTimer) {
+    clearInterval(pollTimer)
+    pollTimer = null
+  }
+}
+
+onUnmounted(stopPolling)
+
+// --------------------------------------------------------------- 提示文案
+const footHint = computed(() => {
+  if (step.value === 0) return '名称与公网 IP 注册后不可修改'
+  if (step.value === 1) {
+    return nodeLocked.value
+      ? '节点已注册，可改缓存上限后重新生成'
+      : `磁盘缓存 ${hw.value.diskGb || 0} GiB · 内存缓存 ${memCacheGiB.value || 0} GiB`
+  }
+  if (step.value === 2) return '令牌只展示一次，请先复制或下载配置'
+  return liveStatusObject.value.label === '在线' ? '节点已上线' : '节点启动后约 15 秒上线'
+})
+</script>
+
+
+<style scoped>
+/* ------------------------------------------------------------- wizard shell */
+/* ------------------------------------------------------- wizard progress */
+.wizard-progress {
+  padding: 16px 18px;
+  margin-bottom: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--card);
+  box-shadow: var(--shadow-sm);
+}
+
+.wizard-progress-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.wizard-progress-kicker {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  color: var(--text-3);
+}
+
+.wizard-progress-title {
+  margin-top: 4px;
+  font-size: 16px;
+  font-weight: 650;
+  color: var(--text);
+}
+
+.wizard-progress-meta {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex: none;
+}
+
+.wizard-progress-summary {
+  max-width: 420px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+
+.wizard-progress-count {
+  font-size: 22px;
+  font-weight: 700;
+  line-height: 1;
+  color: var(--brand);
+  font-variant-numeric: tabular-nums;
+}
+
+.wizard-progress-count span {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-3);
+}
+
+.wizard-progress-track {
+  height: 4px;
+  margin: 12px 0 14px;
+  border-radius: 999px;
+  background: var(--bg);
+  overflow: hidden;
+}
+
+.wizard-progress-track span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--brand), #52a8ff);
+  transition: width 0.25s ease;
+}
+
+.wizard-steps-top {
+  display: flex;
+  gap: 8px;
+}
+
+.top-step {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 9px 10px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  color: var(--text-3);
+}
+
+.top-step.active {
+  border-color: color-mix(in srgb, var(--brand) 22%, var(--border));
+  background: var(--brand-bg);
+  color: var(--brand);
+}
+
+.top-step.done {
+  color: var(--text-2);
+}
+
+.top-step-index {
+  width: 22px;
+  height: 22px;
+  border: 1px solid var(--border-strong);
+  border-radius: 50%;
+  background: var(--card);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.top-step.active .top-step-index {
+  border-color: var(--brand);
+  background: var(--brand);
+  color: #fff;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--brand) 16%, transparent);
+}
+
+.top-step.done .top-step-index {
+  border-color: var(--success-border);
+  background: var(--success-bg);
+  color: var(--success);
+}
+
+.top-step-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.top-step-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+.top-step-hint {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-3);
+}
+
+.wizard-main {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+
+.wizard-card {
+  overflow: visible;
+}
+
+.wizard-body {
+  padding: 22px 24px 24px;
+}
+
+.step-eyebrow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 14px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+
+.step-eyebrow-index {
+  padding: 3px 7px;
+  border-radius: 5px;
+  background: var(--brand-bg);
+  color: var(--brand);
+  font-weight: 700;
+}
+
+.step-eyebrow-label {
+  color: var(--text-3);
+}
+
+.wizard-card .form-grid {
+  gap: 16px 18px;
+}
+
+.wizard-card .field-label {
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+.wizard-card .field-hint {
+  line-height: 1.55;
+}
+
+/* ------------------------------------------------------------- step */
+.wizard-hero {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  margin-bottom: 18px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--divider);
+}
+
+.wizard-icon {
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--brand) 18%, var(--card)),
+    var(--brand-bg)
+  );
+  color: var(--brand);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--brand) 14%, transparent);
+}
+
+.wizard-title {
+  font-size: 19px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  color: var(--text);
+}
+
+.wizard-desc {
+  margin-top: 5px;
+  max-width: 760px;
+  font-size: 13px;
+  line-height: 1.65;
+  color: var(--text-3);
+}
+
+.section-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin: 4px 0 12px;
+}
+
+.section-title {
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--text-2);
+}
+
+.section-sub {
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+
+/* ----------------------------------------------------------- result */
+.result-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 16px;
+  border: 1px solid var(--success-border);
+  border-radius: var(--radius-lg);
+  background: var(--success-bg);
+}
+
+.result-check {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  background: var(--success);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  box-shadow: 0 5px 12px color-mix(in srgb, var(--success) 28%, transparent);
+}
+
+.result-title {
+  font-size: 14px;
+  font-weight: 650;
+  color: var(--text);
+}
+
+.result-desc {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--text-3);
+  word-break: break-all;
+}
+
+/* ------------------------------------------------------------- footer */
+.wizard-foot {
+  position: sticky;
+  bottom: 0;
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 13px 24px;
+  border-top: 1px solid var(--divider);
+  border-radius: 0 0 var(--radius-lg) var(--radius-lg);
+  background: color-mix(in srgb, var(--card) 88%, transparent);
+  backdrop-filter: blur(10px);
+}
+
+.foot-hint {
+  font-size: 12px;
+}
+
+.step-error {
+  font-size: 13px;
+  margin: 0;
+}
+
+/* Optional groups collapse so the main path stays short. */
+.optional-block {
+  padding: 11px 13px;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--bg) 65%, transparent);
+}
+
+.optional-block summary {
+  cursor: pointer;
+  font-size: 12.5px;
+  color: var(--text-2);
+  user-select: none;
+}
+
+.optional-block[open] summary {
+  margin-bottom: 12px;
+}
+
+.toggle-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 24px;
+}
+
+/* ---------------------------------------------------- derived callback pair */
+.derived-box {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+}
+
+.derived-title {
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+
+.derived-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12.5px;
+}
+
+.derived-key {
+  color: var(--text-3);
+}
+
+.derived-val {
+  text-align: right;
+  word-break: break-all;
+}
+
+.role-note {
+  display: block;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-3);
+}
+
+.secret-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.secret-row .input {
+  flex: 1;
+  min-width: 160px;
+}
+
+/* ---------------------------------------------------------- plan summary */
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.metric-card {
+  position: relative;
+  padding: 13px 14px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--brand) 6%, var(--card)),
+    var(--card) 65%
+  );
+  overflow: hidden;
+  transition: box-shadow 0.15s ease, transform 0.15s ease;
+}
+
+.metric-card::before {
+  content: '';
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 3px;
+  background: var(--brand);
+  opacity: 0.75;
+}
+
+.metric-card:hover {
+  box-shadow: 0 8px 20px rgba(15, 23, 42, 0.07);
+  transform: translateY(-1px);
+}
+
+.metric-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.metric-icon {
+  width: 24px;
+  height: 24px;
+  border-radius: 7px;
+  background: var(--brand-bg);
+  color: var(--brand);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+}
+
+.metric-label {
+  font-size: 11px;
+  color: var(--text-3);
+  letter-spacing: 0.02em;
+}
+
+.metric-value {
+  margin-top: 8px;
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.2;
+}
+
+.metric-sub {
+  margin-top: 3px;
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.alert-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* ---------------------------------------------------- capacity table */
+.plan-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+}
+
+.plan-toolbar-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-3);
+  min-width: 0;
+}
+
+.plan-table-wrap {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  max-height: 560px;
+  overflow: auto;
+  overflow-anchor: none;
+  background: var(--card);
+  scrollbar-width: thin;
+}
+
+.plan-table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+}
+
+.plan-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  padding: 8px 12px;
+  background: color-mix(in srgb, var(--bg) 82%, var(--card));
+  border-bottom: 1px solid var(--border);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  color: var(--text-3);
+  text-align: left;
+}
+
+.plan-table td {
+  padding: 8px 12px;
+  vertical-align: top;
+  border-bottom: 1px solid var(--divider);
+}
+
+.plan-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.plan-table tbody tr:not(.plan-group-row):hover td {
+  background: color-mix(in srgb, var(--brand) 3%, transparent);
+}
+
+.plan-group-row td {
+  padding: 6px 12px;
+  background: color-mix(in srgb, var(--brand) 5%, var(--bg));
+  border-bottom: 1px solid var(--border);
+  color: var(--text-2);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.plan-key {
+  font-size: 12px;
+  color: var(--text);
+}
+
+.plan-value {
+  font-size: 12px;
+  color: var(--brand);
+}
+
+.plan-value-cell {
+  position: relative;
+  min-width: 130px;
+  user-select: none;
+}
+
+.plan-value-text {
+  display: inline-block;
+  max-width: 100%;
+  word-break: break-all;
+}
+
+.plan-value-text.is-editing {
+  visibility: hidden;
+}
+
+.plan-editable {
+  cursor: text;
+}
+
+.plan-editable:hover {
+  background: color-mix(in srgb, var(--brand) 4%, transparent);
+}
+
+.plan-edit-input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  padding: 0 10px;
+  font-size: 12px;
+  border-radius: 4px;
+  background: var(--card);
+  box-shadow: inset 0 0 0 1px var(--brand);
+  user-select: text;
+}
+
+.plan-edit-input.is-invalid {
+  box-shadow: inset 0 0 0 1px var(--danger);
+}
+
+.plan-reason {
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.tag-manual {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--warning-bg);
+  border: 1px solid var(--warning-border);
+  color: var(--warning);
+  font-size: 10px;
+  vertical-align: middle;
+}
+
+/* --------------------------------------------------------- generated output */
+.copy-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.copy-row .input {
+  flex: 1;
+  min-width: 180px;
+}
+
+.command-box {
+  position: relative;
+  background: #0f172a;
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  max-height: 420px;
+  overflow: auto;
+}
+
+.command-box pre {
+  margin: 0;
+  color: #d6e8ff;
+  font-size: 12.5px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.command-box.sub {
+  max-height: 220px;
+}
+
+.copy-float {
+  position: sticky;
+  top: 0;
+  float: right;
+  background: rgba(255, 255, 255, 0.12);
+  border-color: rgba(255, 255, 255, 0.2);
+  color: #fff;
+}
+
+.copy-float:hover {
+  color: #fff;
+  border-color: #fff;
+}
+
+.tips {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.tip-row {
+  display: flex;
+  gap: 8px;
+  font-size: 12.5px;
+  color: var(--text-2);
+  line-height: 1.6;
+}
+
+.tip-index {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--brand-bg);
+  color: var(--brand);
+  font-size: 11px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  margin-top: 1px;
+}
+
+/* ---------------------------------------------------------- live status */
+.status-panel {
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+}
+
+.status-panel.is-ok {
+  border-color: var(--success-border);
+  background: var(--success-bg);
+}
+
+.status-panel.is-bad {
+  border-color: var(--danger-border);
+  background: var(--danger-bg);
+}
+
+.status-main {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.status-name {
+  font-size: 13px;
+  color: var(--text);
+}
+
+.status-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+.status-pulse {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--text-3);
+  flex: none;
+}
+
+.status-pulse.live {
+  background: var(--success);
+  animation: status-pulse 1.8s ease-out infinite;
+}
+
+@keyframes status-pulse {
+  0% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--success) 45%, transparent);
+  }
+  70% {
+    box-shadow: 0 0 0 8px transparent;
+  }
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+  }
+}
+
+.live-steps {
+  display: flex;
+  gap: 6px;
+  margin-top: 12px;
+}
+
+.live-step {
+  flex: 1;
+  padding: 5px 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text-3);
+  font-size: 11px;
+  text-align: center;
+}
+
+.live-step.done {
+  border-color: var(--success-border);
+  background: var(--success-bg);
+  color: var(--success);
+}
+
+.text-multi {
+  min-width: 0;
+}
+
+@media (max-width: 1024px) {
+  .wizard-progress-summary {
+    display: none;
+  }
+
+  .wizard-steps-top {
+    overflow-x: auto;
+    padding-bottom: 2px;
+  }
+
+  .top-step {
+    flex: 0 0 190px;
+  }
+}
+
+@media (max-width: 720px) {
+  .wizard-progress {
+    padding: 14px;
+  }
+
+  .top-step {
+    flex-basis: 160px;
+  }
+
+  .top-step-hint {
+    display: none;
+  }
+
+  .wizard-body {
+    padding: 16px;
+  }
+
+  .wizard-foot {
+    flex-wrap: wrap;
+    padding: 12px 16px;
+  }
+
+  .wizard-card .form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .wizard-card .form-grid .span-2 {
+    grid-column: auto;
+  }
+
+  .section-head {
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .metric-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .plan-toolbar {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+}
+</style>

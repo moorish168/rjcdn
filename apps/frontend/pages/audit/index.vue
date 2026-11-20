@@ -1,0 +1,278 @@
+<template>
+  <div class="page">
+    <div class="page-head">
+      <div>
+        <div class="page-title">操作审计</div>
+        <div class="page-desc">记录控制面的关键操作，便于追溯变更（仅管理员可见）</div>
+      </div>
+      <div class="page-actions">
+        <button class="btn btn-default" type="button" :disabled="loading" @click="load">
+          <AppIcon name="refresh" :size="15" />
+          刷新
+        </button>
+      </div>
+    </div>
+
+    <div v-if="!auth.isAdmin" class="alert alert-warning mb-16">
+      <AppIcon name="alert" :size="16" class="icon" />
+      <span>当前账号没有审计日志权限，仅管理员可查看。</span>
+    </div>
+
+    <div class="card">
+      <div class="filter-bar">
+        <input v-model="keyword" class="input" placeholder="搜索操作者、资源或动作" style="min-width: 260px" />
+        <select v-model.number="fetchLimit" class="select" @change="load">
+          <option :value="100">最近 100 条</option>
+          <option :value="200">最近 200 条</option>
+          <option :value="500">最近 500 条</option>
+        </select>
+        <span class="spacer" />
+        <span class="text-muted" style="font-size: 13px">{{ filtered.length }} 条记录</span>
+      </div>
+
+      <div v-if="filtered.length" class="table-wrap">
+        <table class="table table-fixed audit-table">
+          <colgroup>
+            <col style="width: var(--col-time)" />
+            <col style="width: var(--col-actor)" />
+            <col style="width: var(--col-action)" />
+            <col style="width: var(--col-resource)" />
+            <col />
+          </colgroup>
+          <thead>
+            <tr>
+              <th style="min-width: 160px">时间</th>
+              <th>操作者</th>
+              <th>动作</th>
+              <th>资源</th>
+              <th>详情</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="a in paged" :key="a.id">
+              <td class="time-cell text-muted nowrap">{{ formatDateTime(a.created_at) }}</td>
+              <td>
+                <span class="cell-ellipsis" :title="a.actor || '—'">{{ a.actor || '—' }}</span>
+              </td>
+              <td>
+                <StatusTag :tone="actionTone(a.action)">{{ a.action }}</StatusTag>
+              </td>
+              <td class="resource-cell cell-main">
+                <span class="cell-ellipsis" :title="a.resource || '—'">{{ a.resource || '—' }}</span>
+              </td>
+              <td class="detail-cell text-muted">
+                <span class="cell-ellipsis" :title="a.detail || '—'">{{ a.detail || '—' }}</span>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div v-else-if="loading" class="card-body">
+        <div class="skeleton" style="height: 34px; width: 100%" />
+      </div>
+
+      <EmptyState v-else icon="audit" :title="logs.length ? '没有匹配的记录' : '暂无审计记录'"
+        :text="logs.length ? '试试其他关键词。' : '域名启停、规则变更、缓存刷新等操作会自动记录在这里。'" />
+
+      <div v-if="filtered.length > pageSize || filtered.length > 10" class="table-footer">
+        <AppPagination
+          v-model:page="page"
+          v-model:page-size="pageSize"
+          :total="filtered.length"
+          :page-size="pageSize"
+          :page-sizes="[10, 20, 50, 100]"
+        />
+      </div>
+    </div>
+  </div>
+</template>
+
+<script setup lang="ts">
+const api = useApi()
+const auth = useAuthStore()
+const toast = useToast()
+
+const logs = ref<any[]>([])
+const keyword = ref('')
+const loading = ref(false)
+const page = ref(1)
+const pageSize = ref(20)
+const fetchLimit = ref(200)
+
+const filtered = computed(() => {
+  const q = keyword.value.trim().toLowerCase()
+  if (!q) return logs.value
+  return logs.value.filter((a) =>
+    [a.actor, a.action, a.resource, a.detail]
+      .map((v) => String(v || '').toLowerCase())
+      .some((v) => v.includes(q)),
+  )
+})
+
+const paged = computed(() => {
+  const start = (page.value - 1) * pageSize.value
+  return filtered.value.slice(start, start + pageSize.value)
+})
+
+watch(keyword, () => {
+  page.value = 1
+})
+
+function actionTone(action: string) {
+  if (!action) return 'neutral'
+  if (action.includes('delete') || action.includes('remove')) return 'danger'
+  if (action.includes('create') || action.includes('add')) return 'success'
+  if (action.includes('status') || action.includes('purge')) return 'warning'
+  return 'info'
+}
+
+async function load() {
+  if (!auth.isAdmin) {
+    logs.value = []
+    return
+  }
+  loading.value = true
+  page.value = 1
+  try {
+    logs.value = (await api.get<any[]>(`/api/v1/audit?limit=${fetchLimit.value}`)) || []
+  } catch (e: any) {
+    logs.value = []
+    toast.error(e?.data?.error || e?.message || '加载审计记录失败')
+  } finally {
+    loading.value = false
+  }
+}
+
+onMounted(load)
+</script>
+
+<style scoped>
+.audit-table {
+  --col-time: 164px;
+  --col-actor: 160px;
+  --col-action: 164px;
+  --col-resource: 220px;
+  min-width: 900px;
+}
+
+
+@media (min-width: 1920px) {
+  .audit-table {
+    --col-time: 180px;
+    --col-actor: 180px;
+    --col-action: 190px;
+    --col-resource: 300px;
+  }
+}
+
+@media (min-width: 2560px) {
+  .audit-table {
+    --col-time: 250px;
+    --col-actor: 250px;
+    --col-action: 240px;
+    --col-resource: 400px;
+  }
+
+  .audit-table th,
+  .audit-table td {
+    padding-left: 18px;
+    padding-right: 18px;
+  }
+
+  .audit-table .cell-ellipsis {
+    font-size: 14.5px;
+  }
+}
+
+@media (min-width: 3200px) {
+  .audit-table {
+    --col-time: 250px;
+    --col-actor: 250px;
+    --col-action: 300px;
+    --col-resource: 500px;
+  }
+}
+
+.audit-table th,
+.audit-table td {
+  overflow: hidden;
+}
+
+.audit-table td .cell-ellipsis {
+  color: var(--text-2);
+}
+
+/* ---------------------------------------------------------------
+   List typography
+   --------------------------------------------------------------- */
+
+.audit-table {
+  font-size: 13px;
+}
+
+.audit-table th {
+  padding: 10px 14px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.055em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+
+.audit-table td {
+  padding: 11px 14px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.audit-table td .cell-ellipsis {
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.audit-table .time-cell {
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-3);
+}
+
+.audit-table .resource-cell .cell-ellipsis {
+  font-weight: 500;
+  color: var(--text-2);
+}
+
+.audit-table .detail-cell .cell-ellipsis {
+  font-size: 12.5px;
+  color: var(--text-3);
+}
+
+@media (min-width: 2560px) {
+  .audit-table {
+    font-size: 14px;
+  }
+
+  .audit-table th {
+    font-size: 11.5px;
+    letter-spacing: 0.06em;
+  }
+
+  .audit-table th,
+  .audit-table td {
+    padding: 12px 18px;
+  }
+
+  .audit-table td,
+  .audit-table td .cell-ellipsis {
+    font-size: 14px;
+  }
+
+  .audit-table .time-cell {
+    font-size: 13px;
+  }
+
+  .audit-table .detail-cell .cell-ellipsis {
+    font-size: 13px;
+  }
+}
+</style>

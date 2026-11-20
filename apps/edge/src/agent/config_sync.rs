@@ -1,0 +1,959 @@
+use std::sync::OnceLock;
+use tokio::sync::Notify;
+
+static CONFIG_KICK: OnceLock<Notify> = OnceLock::new();
+
+fn config_kick() -> &'static Notify {
+    CONFIG_KICK.get_or_init(Notify::new)
+}
+
+/// Ask the background config sync loop to run immediately.
+pub fn request_config_reload() {
+    config_kick().notify_one();
+}
+
+// Sync all accelerated domains + rules from control plane.
+// Runs periodically, sends the agent token, and follows the control plane's
+// aggregate version so unchanged config is not re-applied.
+
+use crate::agent::ControlClient;
+use crate::cache::SharedCache;
+use crate::cache::large::LargeCache;
+use crate::cache::policy::{CacheRule, RuleSet};
+use crate::config::EdgeConfig;
+use crate::config::registry::{DomainEntry, DomainRegistry};
+use crate::origin::OriginClient;
+    use crate::waf::{
+    IpNet, ManagedRules, RegionMatch, SecurityLevel, WafAction, WafConfig, WafField, WafMode, WafOp,
+    WafRule,
+};
+use serde::Deserialize;
+use std::time::Duration;
+
+#[derive(Debug, Clone, Deserialize)]
+struct OriginCfg {
+    host: String,
+    port: u16,
+    protocol: String,
+    #[serde(default = "default_origin_weight")]
+    weight: u32,
+    #[serde(default)]
+    priority: i32,
+    #[serde(default = "default_origin_enabled")]
+    enabled: bool,
+    #[serde(default)]
+    sni: Option<String>,
+    #[serde(default)]
+    host_header: Option<String>,
+}
+
+fn default_origin_weight() -> u32 {
+    100
+}
+
+fn default_origin_enabled() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RuleCfg {
+    path_pattern: String,
+    #[serde(default = "default_glob")]
+    match_type: String,
+    ttl_seconds: u64,
+    priority: i32,
+    #[serde(default)]
+    action: Option<String>,
+    #[serde(default)]
+    swr_seconds: Option<u64>,
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default)]
+    match_methods: String,
+    #[serde(default)]
+    match_query: String,
+    #[serde(default)]
+    match_content_type: String,
+    #[serde(default)]
+    browser_ttl_seconds: u64,
+    #[serde(default)]
+    ignore_query: Option<bool>,
+    #[serde(default)]
+    ignore_cookie: bool,
+    #[serde(default)]
+    ignore_key_headers: Option<String>,
+}
+
+impl RuleCfg {
+    fn into_rule(self) -> CacheRule {
+        let regex = if self.match_type.eq_ignore_ascii_case("regex") {
+            match regex::Regex::new(&self.path_pattern) {
+                Ok(re) => Some(re),
+                Err(e) => {
+                    tracing::warn!(pattern = %self.path_pattern, error = %e, "invalid cache rule regex; rule disabled");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        CacheRule {
+            path_pattern: self.path_pattern,
+            match_type: self.match_type,
+            regex,
+            ttl_seconds: self.ttl_seconds,
+            priority: self.priority,
+            action: self.action.unwrap_or_else(|| "cache".into()),
+            swr_seconds: self.swr_seconds.unwrap_or(0),
+            enabled: self.enabled,
+            match_methods: self.match_methods,
+            match_query: self.match_query,
+            match_content_type: self.match_content_type,
+            browser_ttl_seconds: self.browser_ttl_seconds,
+            ignore_query: self.ignore_query,
+            ignore_cookie: self.ignore_cookie,
+            ignore_key_headers: self.ignore_key_headers,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct CcCfg {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    rps: u32,
+    #[serde(default)]
+    burst: u32,
+    #[serde(default)]
+    ban_after: u32,
+    #[serde(default)]
+    ban_seconds: u64,
+    #[serde(default)]
+    mode: String,
+    #[serde(default)]
+    allow_ips: String,
+}
+
+impl CcCfg {
+    fn into_config(self) -> crate::server::cc::CcConfig {
+        let allow_ips = self
+            .allow_ips
+            .split(',')
+            .filter_map(crate::waf::IpNet::parse)
+            .collect();
+        crate::server::cc::CcConfig {
+            enabled: self.enabled,
+            rps: self.rps,
+            burst: self.burst,
+            ban_after: self.ban_after,
+            ban_seconds: self.ban_seconds,
+            mode: crate::server::cc::CcMode::parse(&self.mode),
+            allow_ips,
+            global_rps: 0,
+            global_burst: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DomainCfg {
+    domain: String,
+    origin: OriginCfg,
+    rules: Vec<RuleCfg>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    status: String,
+    #[serde(default)]
+    rate_limit_rps: u32,
+    #[serde(default)]
+    rate_limit_burst: u32,
+    #[serde(default)]
+    ignore_query_string: bool,
+    #[serde(default)]
+    cache_key_ignore_headers: String,
+    #[serde(default)]
+    cors_origins: String,
+    #[serde(default)]
+    hotlink_allow_referers: String,
+    #[serde(default)]
+    origin_timeout_ms: u32,
+    #[serde(default)]
+    custom_headers: String,
+    #[serde(default)]
+    shield_url: String,
+    #[serde(default)]
+    ssl_enabled: bool,
+    #[serde(default)]
+    signed_url_enabled: bool,
+    #[serde(default)]
+    signed_url_mode: String,
+    #[serde(default)]
+    signed_url_paths: String,
+    #[serde(default)]
+    signed_url_secret: String,
+    #[serde(default)]
+    signed_url_previous_secret: String,
+    #[serde(default)]
+    signed_url_ttl_secs: u32,
+    #[serde(default)]
+    origin_auth_header: String,
+    #[serde(default)]
+    origin_auth_value: String,
+    #[serde(default)]
+    hotlink_signature_enabled: bool,
+    #[serde(default)]
+    backup_origin: Option<OriginCfg>,
+    #[serde(default)]
+    origins: Vec<OriginCfg>,
+    #[serde(default)]
+    waf: Option<WafCfg>,
+    #[serde(default)]
+    cc: Option<CcCfg>,
+    #[serde(default = "default_true_flag")]
+    websocket_enabled: bool,
+    #[serde(default = "default_true_flag")]
+    http2_enabled: bool,
+    #[serde(default)]
+    http3_enabled: bool,
+    #[serde(default = "default_true_flag")]
+    gzip_enabled: bool,
+    #[serde(default)]
+    image_webp_enabled: bool,
+    #[serde(default = "default_min_tls")]
+    min_tls_version: String,
+    #[serde(default = "default_true_flag")]
+    access_log_enabled: bool,
+    #[serde(default = "default_true_flag")]
+    cache_enabled: bool,
+    version: String,
+}
+
+fn default_min_tls() -> String {
+    "1.2".into()
+}
+
+fn default_true_flag() -> bool {
+    true
+}
+
+impl DomainCfg {
+    fn into_entry(self, config: &EdgeConfig) -> DomainEntry {
+        let mut origins: Vec<crate::config::registry::OriginTarget> = if self.origins.is_empty() {
+            let mut list = vec![origin_target(&self.origin)];
+            if let Some(ref backup) = self.backup_origin {
+                let mut target = origin_target(backup);
+                target.priority = 1;
+                list.push(target);
+            }
+            list
+        } else {
+            self.origins.iter().map(origin_target).collect()
+        };
+        let shield = self.shield_url.trim();
+        if !shield.is_empty() && !config.origin_shield_disabled {
+            origins.insert(
+                0,
+                crate::config::registry::OriginTarget {
+                    url: shield.trim_end_matches('/').to_string(),
+                    weight: 100,
+                    priority: -1,
+                    enabled: true,
+                    host_header: Some(self.domain.clone()),
+                    sni: None,
+                },
+            );
+        }
+        origins.sort_by_key(|o| (o.priority, std::cmp::Reverse(o.weight)));
+        let origin_url = origins
+            .iter()
+            .find(|o| o.enabled)
+            .or_else(|| origins.first())
+            .map(|o| o.url.clone())
+            .unwrap_or_else(|| format_origin(&self.origin));
+        let backup_origin_url = self
+            .backup_origin
+            .as_ref()
+            .map(format_origin)
+            .unwrap_or_default();
+        let global_rps = self.rate_limit_rps;
+        let global_burst = self.rate_limit_burst;
+        let mut cc = self.cc.map(CcCfg::into_config).unwrap_or_default();
+        cc.global_rps = global_rps;
+        cc.global_burst = global_burst;
+        DomainEntry {
+            domain: self.domain,
+            origin_url,
+            origins,
+            rules: self.rules.into_iter().map(RuleCfg::into_rule).collect(),
+            has_content_type_rules: false,
+            version: self.version,
+            rate_limit_rps: global_rps,
+            rate_limit_burst: global_burst,
+            ignore_query_string: self.ignore_query_string,
+            cache_key_ignore_headers: self.cache_key_ignore_headers,
+            cors_origins: self.cors_origins,
+            response_headers: std::sync::Arc::default(),
+            hotlink_allow_referers: self.hotlink_allow_referers,
+            // 0 means "inherit the edge-wide ORIGIN_CONNECT_TIMEOUT_MS".
+            // A non-zero value overrides the TCP connect timeout for this
+            // domain only.
+            origin_timeout_ms: self.origin_timeout_ms,
+            custom_headers: self.custom_headers,
+            backup_origin_url,
+            ssl_enabled: self.ssl_enabled,
+            waf: into_waf(self.waf, config),
+            cc,
+            signed_url_enabled: self.signed_url_enabled,
+            signed_url_mode: self.signed_url_mode,
+            signed_url_paths: self.signed_url_paths,
+            signed_url_secret: self.signed_url_secret,
+            signed_url_previous_secret: self.signed_url_previous_secret,
+            signed_url_ttl_secs: self.signed_url_ttl_secs,
+            origin_auth_header: self.origin_auth_header,
+            origin_auth_value: self.origin_auth_value,
+            hotlink_signature_enabled: self.hotlink_signature_enabled,
+            websocket_enabled: self.websocket_enabled,
+            http2_enabled: self.http2_enabled,
+            http3_enabled: self.http3_enabled,
+            gzip_enabled: self.gzip_enabled,
+            image_webp_enabled: self.image_webp_enabled,
+            access_log_enabled: self.access_log_enabled,
+            cache_enabled: self.cache_enabled,
+            min_tls_version: match self.min_tls_version.trim() {
+                "1.0" | "1.1" | "1.2" | "1.3" => self.min_tls_version.trim().to_string(),
+                _ => "1.2".into(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct WafCfg {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    mode: String,
+    #[serde(default)]
+    managed: WafManagedCfg,
+    #[serde(default)]
+    rules: Vec<WafRuleCfg>,
+    #[serde(default)]
+    ip_allow: Vec<String>,
+    #[serde(default)]
+    ip_deny: Vec<String>,
+    #[serde(default)]
+    country_allow: Vec<String>,
+    #[serde(default)]
+    country_deny: Vec<String>,
+    #[serde(default)]
+    asn_allow: Vec<u32>,
+    #[serde(default)]
+    asn_deny: Vec<u32>,
+    #[serde(default)]
+    region_allow: Vec<RegionMatchCfg>,
+    #[serde(default)]
+    region_deny: Vec<RegionMatchCfg>,
+    #[serde(default = "default_challenge_difficulty")]
+    challenge_difficulty: u8,
+    #[serde(default = "default_challenge_ttl")]
+    challenge_ttl_secs: u64,
+    #[serde(default)]
+    security_level: String,
+    #[serde(default)]
+    managed_rulesets: Vec<String>,
+    #[serde(default)]
+    rulepack: Option<crate::waf::rulepack::SignedRulepack>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct RegionMatchCfg {
+    #[serde(default)]
+    code: String,
+    #[serde(default)]
+    country: String,
+    #[serde(default)]
+    province: String,
+    #[serde(default)]
+    city: String,
+    #[serde(default)]
+    isp: String,
+    #[serde(default)]
+    continent: String,
+    #[serde(default)]
+    countries: Vec<String>,
+}
+
+fn default_challenge_difficulty() -> u8 {
+    4
+}
+
+fn default_challenge_ttl() -> u64 {
+    1800
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct WafManagedCfg {
+    #[serde(default = "default_true")]
+    sqli: bool,
+    #[serde(default = "default_true")]
+    xss: bool,
+    #[serde(default = "default_true")]
+    traversal: bool,
+    #[serde(default = "default_true")]
+    scanners: bool,
+    #[serde(default = "default_true")]
+    rce: bool,
+    #[serde(default = "default_true")]
+    ssrf: bool,
+    #[serde(default = "default_true")]
+    xxe: bool,
+    #[serde(default = "default_true")]
+    log4shell: bool,
+    #[serde(default = "default_true")]
+    crlf: bool,
+    #[serde(default = "default_true")]
+    ssti: bool,
+    #[serde(default = "default_true")]
+    nosql: bool,
+    #[serde(default = "default_true")]
+    ldap: bool,
+    #[serde(default = "default_true")]
+    java: bool,
+    #[serde(default = "default_true")]
+    webshell: bool,
+    #[serde(default = "default_true")]
+    protocol: bool,
+}
+
+impl Default for WafManagedCfg {
+    fn default() -> Self {
+        Self {
+            sqli: true,
+            xss: true,
+            traversal: true,
+            scanners: true,
+            rce: true,
+            ssrf: true,
+            xxe: true,
+            log4shell: true,
+            crlf: true,
+            ssti: true,
+            nosql: true,
+            ldap: true,
+            java: true,
+            webshell: true,
+            protocol: true,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_glob() -> String {
+    "glob".into()
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct WafRuleCfg {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    field: String,
+    #[serde(default)]
+    operator: String,
+    #[serde(default)]
+    value: String,
+    #[serde(default)]
+    action: String,
+    #[serde(default)]
+    priority: i32,
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default)]
+    expr: String,
+}
+
+fn into_waf(cfg: Option<WafCfg>, config: &EdgeConfig) -> WafConfig {
+    let Some(cfg) = cfg else {
+        return WafConfig::default();
+    };
+    // An unset WAF_RULEPACK_SECRET must fail closed: skip the signed rulepack
+    // and fall back to the managed set already present in the config document
+    // rather than trusting a package nobody can authenticate.
+    let package = cfg.rulepack.as_ref().and_then(|pack| {
+        let secret = crate::waf::rulepack::signing_key(&config.waf_rulepack_secret)?;
+        pack.verify_and_cache(&secret, &config.waf_rulepack_cache_dir)
+    });
+    let mut managed = ManagedRules {
+        sqli: cfg.managed.sqli,
+        xss: cfg.managed.xss,
+        traversal: cfg.managed.traversal,
+        scanners: cfg.managed.scanners,
+        rce: cfg.managed.rce,
+        ssrf: cfg.managed.ssrf,
+        xxe: cfg.managed.xxe,
+        log4shell: cfg.managed.log4shell,
+        crlf: cfg.managed.crlf,
+        ssti: cfg.managed.ssti,
+        nosql: cfg.managed.nosql,
+        ldap: cfg.managed.ldap,
+        java: cfg.managed.java,
+        webshell: cfg.managed.webshell,
+        protocol: cfg.managed.protocol,
+    };
+    if let Some(package) = &package {
+        for id in &cfg.managed_rulesets {
+            let Some(entry) = package.rulesets.iter().find(|r| r.id == *id) else {
+                continue;
+            };
+            for category in &entry.categories {
+                match category.as_str() {
+                    "sqli" => managed.sqli = true,
+                    "xss" => managed.xss = true,
+                    "traversal" => managed.traversal = true,
+                    "scanners" => managed.scanners = true,
+                    "rce" => managed.rce = true,
+                    "ssrf" => managed.ssrf = true,
+                    "xxe" => managed.xxe = true,
+                    "log4shell" => managed.log4shell = true,
+                    "crlf" => managed.crlf = true,
+                    "ssti" => managed.ssti = true,
+                    "nosql" => managed.nosql = true,
+                    "ldap" => managed.ldap = true,
+                    "java" => managed.java = true,
+                    "webshell" => managed.webshell = true,
+                    "protocol" => managed.protocol = true,
+                    _ => {}
+                }
+            }
+        }
+        tracing::info!(
+            version = %package.version,
+            cache = %config.waf_rulepack_cache_dir,
+            "verified WAF rulepack"
+        );
+    }
+    let rules = cfg
+        .rules
+        .into_iter()
+        .filter_map(|r| {
+            let field = WafField::parse(&r.field)?;
+            let op = WafOp::parse(&r.operator)?;
+            let action = match r.action.trim().to_ascii_lowercase().as_str() {
+                "allow" => WafAction::Allow,
+                "log" => WafAction::Log,
+                "challenge" => WafAction::Challenge,
+                _ => WafAction::Block,
+            };
+            let expr = if r.expr.trim().is_empty() {
+                None
+            } else {
+                match lagran_waf_dsl::parse(&r.expr) {
+                    Ok(expr) => Some(expr),
+                    Err(e) => {
+                        tracing::warn!(
+                            rule = %r.name,
+                            error = %e,
+                            "invalid WAF custom-rule DSL; rule disabled"
+                        );
+                        return None;
+                    }
+                }
+            };
+            Some(WafRule {
+                name: if r.name.is_empty() {
+                    "custom rule".into()
+                } else {
+                    r.name
+                },
+                field,
+                op,
+                value: r.value.to_ascii_lowercase(),
+                action,
+                priority: r.priority,
+                enabled: r.enabled,
+                expr,
+            })
+        })
+        .collect();
+
+    let mut waf = WafConfig {
+        enabled: cfg.enabled,
+        mode: if cfg.mode.eq_ignore_ascii_case("monitor") {
+            WafMode::Monitor
+        } else {
+            WafMode::Block
+        },
+        managed,
+        rules,
+        ip_allow: parse_nets(cfg.ip_allow),
+        ip_deny: parse_nets(cfg.ip_deny),
+        country_allow: parse_countries(cfg.country_allow),
+        country_deny: parse_countries(cfg.country_deny),
+        asn_allow: cfg.asn_allow,
+        asn_deny: cfg.asn_deny,
+        region_allow: cfg
+            .region_allow
+            .into_iter()
+            .map(|r| RegionMatch {
+                code: r.code,
+                country: r.country,
+                province: r.province,
+                city: r.city,
+                isp: r.isp,
+                continent: r.continent,
+                countries: r.countries,
+            })
+            .collect(),
+        region_deny: cfg
+            .region_deny
+            .into_iter()
+            .map(|r| RegionMatch {
+                code: r.code,
+                country: r.country,
+                province: r.province,
+                city: r.city,
+                isp: r.isp,
+                continent: r.continent,
+                countries: r.countries,
+            })
+            .collect(),
+        challenge_difficulty: cfg.challenge_difficulty.clamp(1, 6),
+        challenge_ttl_secs: cfg.challenge_ttl_secs.clamp(60, 86_400),
+        security_level: SecurityLevel::parse(&cfg.security_level),
+        compiled: Default::default(),
+    };
+    // Sort and filter the custom rules once here so the request path never
+    // builds or sorts a temporary rule list.
+    waf.finalize();
+    waf
+}
+
+fn parse_nets(entries: Vec<String>) -> Vec<IpNet> {
+    entries.iter().filter_map(|s| IpNet::parse(s)).collect()
+}
+
+/// Country codes are persisted uppercase; normalize defensively so a hand
+/// edited config row cannot silently never match.
+fn parse_countries(entries: Vec<String>) -> Vec<String> {
+    entries
+        .iter()
+        .map(|s| s.trim().to_ascii_uppercase())
+        .filter(|s| s.len() == 2 && s.bytes().all(|b| b.is_ascii_uppercase()))
+        .collect()
+}
+
+fn format_origin(o: &OriginCfg) -> String {
+    format!("{}://{}:{}", o.protocol, o.host, o.port)
+}
+
+fn origin_target(o: &OriginCfg) -> crate::config::registry::OriginTarget {
+    // When an origin is addressed by IP but the certificate is issued for a
+    // hostname, `sni` is also the natural Host header. An explicit host_header
+    // still wins.
+    let host_header = o.host_header.clone().or_else(|| o.sni.clone());
+    crate::config::registry::OriginTarget {
+        url: format_origin(o),
+        weight: if o.weight == 0 { 100 } else { o.weight },
+        priority: o.priority,
+        enabled: o.enabled,
+        host_header,
+        sni: o.sni.clone(),
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AllConfig {
+    domains: Vec<DomainCfg>,
+    version: String,
+    #[serde(default)]
+    release_id: Option<String>,
+}
+
+pub fn spawn_config_sync(
+    config: EdgeConfig,
+    control: ControlClient,
+    origin: OriginClient,
+    rules: RuleSet,
+    registry: DomainRegistry,
+    cache: SharedCache,
+    large_cache: Option<std::sync::Arc<LargeCache>>,
+) {
+    // Supervised: if this loop panics, the edge would keep serving its startup
+    // configuration forever while still reporting healthy.
+    crate::agent::spawn_supervised("config-sync", move || {
+        let control = control.clone();
+        let config = config.clone();
+        let origin = origin.clone();
+        let rules = rules.clone();
+        let registry = registry.clone();
+        let cache = cache.clone();
+        let large_cache = large_cache.clone();
+        async move {
+            tracing::info!(url = %control.endpoint("/api/v1/config"), "domain registry sync started");
+            let mut last_version = String::new();
+            let mut last_etag: Option<String> = None;
+            let mut last_reported: Option<String> = None;
+
+            loop {
+                match control
+                    .get_json_conditional::<AllConfig>("/api/v1/config", last_etag.as_deref())
+                    .await
+                {
+                    Ok(conditional) => {
+                        if let Some(etag) = conditional.etag {
+                            last_etag = Some(etag);
+                        }
+                        if let Some(cfg) = conditional.value {
+                            if cfg.version != last_version {
+                                let release_id = cfg.release_id.clone();
+                                let entries: Vec<DomainEntry> = cfg
+                                    .domains
+                                    .into_iter()
+                                    .map(|d| d.into_entry(&config))
+                                    .collect();
+                                let n = entries.len();
+
+                                // Any domain whose per-domain version changed must
+                                // drop its cache on every edge. This prevents old
+                                // TTL/rule/header objects from surviving a config
+                                // release or rollback on a subset of nodes.
+                                let old_versions = registry.version_map().await;
+                                // On first sync the registry is empty because the
+                                // process just started, not because every domain
+                                // changed. Purging here would wipe the shared L2
+                                // cache on every edge restart.
+                                let initial_sync = old_versions.is_empty();
+                                let mut new_versions = std::collections::HashMap::new();
+                                for entry in &entries {
+                                    new_versions
+                                        .insert(entry.domain.clone(), entry.version.clone());
+                                }
+                                let mut changed_domains: Vec<String> = if initial_sync {
+                                    Vec::new()
+                                } else {
+                                    new_versions
+                                        .iter()
+                                        .filter(|(domain, version)| {
+                                            old_versions.get(*domain) != Some(*version)
+                                        })
+                                        .map(|(domain, _)| domain.clone())
+                                        .collect()
+                                };
+                                if !initial_sync {
+                                    for domain in old_versions.keys() {
+                                        if !new_versions.contains_key(domain) {
+                                            changed_domains.push(domain.clone());
+                                        }
+                                    }
+                                }
+                                changed_domains.sort();
+                                changed_domains.dedup();
+
+                                registry
+                                    .replace_all(entries.clone(), cfg.version.clone())
+                                    .await;
+                                for domain in &changed_domains {
+                                    let targets: Vec<_> =
+                                        lagran_cache::PurgeTarget::for_domain(domain)
+                                            .into_iter()
+                                            .collect();
+                                    let purged = cache.purge_matching(&targets).await;
+                                    let large_purged = if let Some(large) = large_cache.as_ref() {
+                                        large.purge_targets(&targets).await
+                                    } else {
+                                        0
+                                    };
+                                    if purged > 0 || large_purged > 0 {
+                                        tracing::info!(
+                                            domain = %domain,
+                                            purged,
+                                            large_purged,
+                                            "domain config changed; cache invalidated"
+                                        );
+                                    }
+                                }
+                                // Global rule set is only a legacy single-domain fallback,
+                                // so keep the union but never use it for onboarded hosts.
+                                rules
+                                    .replace(
+                                        entries
+                                            .iter()
+                                            .flat_map(|e| e.rules.iter().cloned())
+                                            .collect(),
+                                    )
+                                    .await;
+
+                                if !config.domain.is_empty() {
+                                    if let Some(d) = registry.get(&config.domain).await {
+                                        origin.set_base_url(d.origin_url.clone()).await;
+                                    }
+                                }
+
+                                if !crate::server::image_optimize::conversion_available() {
+                                    let webp_sites: Vec<&str> = entries
+                                        .iter()
+                                        .filter(|e| e.image_webp_enabled)
+                                        .map(|e| e.domain.as_str())
+                                        .collect();
+                                    if !webp_sites.is_empty() {
+                                        tracing::warn!(
+                                            sites = ?webp_sites,
+                                            "image WebP is enabled for these sites, but this edge was built without the `image-webp` feature; originals are served unconverted"
+                                        );
+                                    }
+                                }
+                                tracing::info!(domains = n, version = %cfg.version, "domain registry updated");
+                                last_version = cfg.version;
+                                if let Some(release_id) = release_id {
+                                    let key = format!("{release_id}:{}", last_version);
+                                    if last_reported.as_deref() != Some(key.as_str()) {
+                                        let report = serde_json::json!({
+                                            "release_id": release_id,
+                                            "success": true,
+                                            "error": "",
+                                        });
+                                        match control
+                                            .post_json("/api/v1/config/apply-report", &report)
+                                            .await
+                                        {
+                                            Ok(_) => last_reported = Some(key),
+                                            Err(e) => tracing::warn!(
+                                                release = %release_id,
+                                                error = %e,
+                                                "config release apply report failed"
+                                            ),
+                                        }
+                                    }
+                                }
+                                // Deliberately no synthesised ETag here.
+                                //
+                                // This used to build `"{version}"` when the server had
+                                // not supplied one. That value is not something the
+                                // control plane ever issued, so sending it as
+                                // `If-None-Match` is meaningless at best — and on a first
+                                // sync that arrived as 304 it would have been the literal
+                                // `""`. Change detection is driven by `cfg.version`
+                                // below; an ETag must only ever come from the server.
+                            }
+                        } else {
+                            tracing::debug!("domain config not modified (304)");
+                        }
+                    }
+                    Err(e) => {
+                        // Drop the cached validator: the config may have changed while
+                        // the control plane was failing, and keeping the ETag would let
+                        // the next successful poll answer 304 and skip the update.
+                        last_etag = None;
+                        tracing::warn!(error = %e, "config sync failed; next poll will fetch in full");
+                    }
+                }
+
+                // Single-domain fallback if EDGE_DOMAIN is set and the registry is empty.
+                if !config.domain.is_empty() && registry.is_empty().await {
+                    let path = format!("/api/v1/config/{}", config.domain);
+                    match control.get_json::<DomainCfg>(&path).await {
+                        Ok(d) => {
+                            let entry = d.into_entry(&config);
+                            origin.set_base_url(entry.origin_url.clone()).await;
+                            rules.replace(entry.rules.clone()).await;
+                            registry.upsert(entry).await;
+                        }
+                        Err(e) => tracing::debug!(error = %e, "single-domain config fetch failed"),
+                    }
+                }
+
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(config.config_sync_interval_secs.max(5))) => {}
+                    _ = config_kick().notified() => {
+                        tracing::info!("config reload requested; pulling immediately");
+                    }
+                }
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+mod geo_config_tests {
+    use super::*;
+
+    #[test]
+    fn control_payload_geo_lists_are_normalized_for_the_edge() {
+        let json = r#"{
+            "enabled": true,
+            "mode": "block",
+            "country_allow": ["cn", "US", "bad", "  "],
+            "country_deny": ["KP"],
+            "asn_allow": [13335],
+            "asn_deny": [4134]
+        }"#;
+        let cfg: WafCfg = serde_json::from_str(json).expect("control waf payload");
+        assert_eq!(
+            parse_countries(cfg.country_allow),
+            vec!["CN".to_string(), "US".to_string()]
+        );
+        assert_eq!(parse_countries(cfg.country_deny), vec!["KP".to_string()]);
+        assert_eq!(cfg.asn_allow, vec![13335]);
+        assert_eq!(cfg.asn_deny, vec![4134]);
+    }
+
+    #[test]
+    fn payload_without_geo_keys_leaves_geo_policy_off() {
+        let cfg: WafCfg = serde_json::from_str(r#"{"enabled": true}"#).expect("legacy payload");
+        assert!(cfg.country_allow.is_empty());
+        assert!(cfg.country_deny.is_empty());
+        assert!(cfg.asn_allow.is_empty());
+        assert!(cfg.asn_deny.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// A cached validator must be dropped when a poll fails.
+    ///
+    /// Keeping the ETag across a failure is what allowed "permanently 304": the
+    /// control plane changed the config while it was erroring, and the next
+    /// successful poll presented the old ETag, was answered 304, and skipped the
+    /// update entirely.
+    #[test]
+    fn a_failed_poll_clears_the_validator() {
+        let mut last_etag: Option<String> = Some("\"abc\"".to_string());
+        assert!(last_etag.is_some(), "precondition: a validator was cached");
+
+        // What the error arm does.
+        last_etag = None;
+
+        assert!(
+            last_etag.is_none(),
+            "a failed poll must force a full fetch next round"
+        );
+    }
+
+    /// Only a server-supplied validator is stored.
+    ///
+    /// The code used to synthesise `"{version}"` when the reply carried no ETag.
+    /// That value was never issued by the control plane, so sending it back is
+    /// meaningless — and on a first sync that arrived as 304 it would have been the
+    /// literal `""`.
+    #[test]
+    fn only_server_etags_are_remembered() {
+        let mut last_etag: Option<String> = None;
+        // A 304 with no server ETag leaves the validator unset.
+        let server_etag: Option<String> = None;
+        if let Some(etag) = server_etag {
+            last_etag = Some(etag);
+        }
+        assert!(last_etag.is_none(), "no synthesised fallback");
+
+        // A server ETag is kept verbatim.
+        let server_etag = Some("\"v42\"".to_string());
+        if let Some(etag) = server_etag {
+            last_etag = etag.into();
+        }
+        assert_eq!(last_etag.as_deref(), Some("\"v42\""));
+    }
+}

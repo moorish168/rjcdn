@@ -1,0 +1,86 @@
+[package]
+name = "edge"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "lagran-edge"
+path = "src/main.rs"
+
+[lib]
+name = "edge"
+path = "src/lib.rs"
+
+[dependencies]
+lagran-cache = { workspace = true }
+redis = { version = "0.27", features = [
+    "tokio-comp",
+    "connection-manager",
+    "script",
+    # Without TCP_NODELAY, Nagle + delayed ACK adds ~40 ms to a small
+    # request/response every so often. `redis-cli --latency` (which sets the flag)
+    # showed max 21 ms while the edge saw >50 ms timeouts: the extra delay was
+    # Nagle, not the network.
+    "tcp_nodelay",
+] }
+
+pingora = { version = "0.9.0", features = ["proxy", "openssl"] }
+pingora-cache = "0.9.0"
+# Static build friendliness (including musl): link a vendored OpenSSL.
+openssl = { version = "0.10", features = ["vendored"] }
+
+tokio = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+hyper-rustls = { workspace = true }
+rustls = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+lagran-waf-dsl = { path = "../../crates/lagran-waf-dsl" }
+maxminddb = "0.24"
+regex = { workspace = true }
+aho-corasick = "1.1"
+tracing = { workspace = true }
+dashmap = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+bytes = { workspace = true }
+libc = "0.2"
+http = { workspace = true }
+async-trait = { workspace = true }
+async-stream = "0.3"
+dotenvy = { workspace = true }
+rustls-pemfile = { workspace = true }
+tokio-rustls = { workspace = true }
+base64 = { workspace = true }
+flate2 = { workspace = true }
+httpdate = { workspace = true }
+ring = { workspace = true }
+webpki-roots = { workspace = true }
+tikv-jemallocator = { workspace = true }
+# JPEG/PNG → WebP (feature `image-webp`). libwebp-sys compiles its bundled
+# libwebp with the `cc` crate: no cmake and no system libwebp, only the C
+# compiler that vendored OpenSSL, jemalloc and ring already need (musl-gcc for
+# the static release build).
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }
+webp = { version = "0.3", optional = true }
+
+# HTTP/3 (QUIC) parallel to Pingora H1/H2.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls", "ring"] }
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+
+[features]
+# On by default so every build — `cargo test`, the release job, and the
+# from-source builds in docs/deployment.md — ships an edge that honours the
+# console's 「图片自动 WebP」 switch. `--no-default-features` leaves libwebp out;
+# such a build serves originals and logs a warning for sites with the switch on.
+default = ["image-webp"]
+image-webp = ["dep:image", "dep:webp"]

@@ -1,0 +1,151 @@
+//! Pull TLS certs from control plane (bulk + per-domain) and hot-load
+
+use crate::agent::ControlClient;
+use crate::config::EdgeConfig;
+use crate::server::cert_store::CertStore;
+use serde::Deserialize;
+use std::sync::Arc;
+use std::time::Duration;
+
+#[derive(Debug, Deserialize)]
+struct EdgeCertResponse {
+    domain: String,
+    #[serde(default)]
+    cert_pem: String,
+    #[serde(default)]
+    key_pem: String,
+    #[serde(default)]
+    status: String,
+}
+
+pub fn spawn_cert_sync(config: EdgeConfig, control: ControlClient, store: Arc<CertStore>) {
+    // Supervised: a cert sync that dies silently means the node keeps serving an
+    // expired certificate until the next restart.
+    crate::agent::spawn_supervised("cert-sync", move || {
+        let config = config.clone();
+        let control = control.clone();
+        let store = store.clone();
+        async move {
+            let mut etag: Option<String> = None;
+            // Immediate sync on startup so HTTPS can bind without re-issue.
+            if let Err(e) = sync_once(&control, &config, &store, &mut etag).await {
+                tracing::warn!(error = %e, "initial cert sync failed (will retry)");
+            }
+
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                if let Err(e) = sync_once(&control, &config, &store, &mut etag).await {
+                    tracing::debug!(error = %e, "cert sync tick failed");
+                }
+            }
+        }
+    });
+}
+
+async fn sync_once(
+    control: &ControlClient,
+    config: &EdgeConfig,
+    store: &Arc<CertStore>,
+    etag: &mut Option<String>,
+) -> Result<(), String> {
+    let mut applied = 0u32;
+    // Whether the bulk set already carried the configured EDGE_DOMAIN. The fallback
+    // below used to run every round regardless, adding a steady background request
+    // per node even when the answer was already in hand.
+    let mut covered_configured = false;
+
+    // 1) Bulk active certs
+    match control
+        .get_json_conditional::<Vec<EdgeCertResponse>>("/api/v1/certs/edge-sync", etag.as_deref())
+        .await
+    {
+        Ok(conditional) => {
+            if let Some(new_etag) = conditional.etag {
+                *etag = Some(new_etag);
+            }
+            if let Some(list) = conditional.value {
+                // The bulk response is the complete active set, so it also tells us
+                // which certificates must be dropped. Without this a certificate
+                // deleted or disabled in the console stayed installed forever.
+                let mut active_domains: Vec<String> = Vec::with_capacity(list.len());
+                for cert in list {
+                    if cert.status != "active" && !cert.status.is_empty() {
+                        continue;
+                    }
+                    if cert.cert_pem.is_empty() || cert.key_pem.is_empty() {
+                        continue;
+                    }
+                    match store.upsert(
+                        std::slice::from_ref(&cert.domain),
+                        cert.cert_pem.as_bytes(),
+                        cert.key_pem.as_bytes(),
+                    ) {
+                        Ok(()) => {
+                            applied += 1;
+                            if !config.domain.is_empty()
+                                && cert.domain.eq_ignore_ascii_case(&config.domain)
+                            {
+                                covered_configured = true;
+                            }
+                            active_domains.push(cert.domain.clone());
+                            tracing::debug!(domain = %cert.domain, "cert applied from edge-sync");
+                        }
+                        Err(e) => {
+                            tracing::warn!(domain = %cert.domain, error = %e, "cert apply failed")
+                        }
+                    }
+                }
+                // Only prune once something was actually applied: an empty or
+                // entirely failed response must not wipe the store.
+                if !active_domains.is_empty() {
+                    let removed = store.retain_only(&active_domains);
+                    if removed > 0 {
+                        tracing::info!(removed, "revoked certs no longer in the active set");
+                    }
+                }
+            } else {
+                tracing::debug!("edge cert bundle not modified (304)");
+            }
+        }
+        Err(e) => {
+            // Clear the validator. The control plane may have rotated a certificate
+            // while it was erroring, and a later poll that still presents the old ETag
+            // would be answered 304 — so the edge would keep serving the old
+            // certificate indefinitely, with only a debug line to show for it.
+            *etag = None;
+            tracing::warn!(
+                error = %e,
+                "edge-sync unavailable, trying the single-domain fallback; next round will fetch in full"
+            );
+        }
+    }
+
+    // 2) Fallback: EDGE_DOMAIN single fetch.
+    //
+    // Skipped when the bulk response already contained that domain: re-fetching it
+    // would ask the control plane for an answer it just gave us, once per node per
+    // poll, forever.
+    if !config.domain.is_empty() && !covered_configured {
+        let path = format!("/api/v1/certs/by-domain/{}", config.domain);
+        if let Ok(cert) = control.get_json::<EdgeCertResponse>(&path).await {
+            if (cert.status == "active" || cert.status.is_empty())
+                && !cert.cert_pem.is_empty()
+                && !cert.key_pem.is_empty()
+                && store
+                    .upsert(
+                        std::slice::from_ref(&cert.domain),
+                        cert.cert_pem.as_bytes(),
+                        cert.key_pem.as_bytes(),
+                    )
+                    .is_ok()
+            {
+                applied += 1;
+            }
+        }
+    }
+
+    if applied > 0 {
+        tracing::info!(applied, total = store.len(), "cert sync done");
+    }
+    Ok(())
+}

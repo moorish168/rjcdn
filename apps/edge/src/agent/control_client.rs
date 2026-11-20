@@ -1,0 +1,299 @@
+//! Shared HTTP(S) client for edge → control-plane calls.
+//!
+//! Supports `http://` and `https://` control URLs, reuses connections, adds the
+//! agent token header, and applies a request timeout.
+
+use crate::config::EdgeConfig;
+use bytes::Bytes;
+use flate2::write::GzEncoder;
+use flate2::Compression;
+use http::{HeaderMap, StatusCode};
+use http_body_util::{BodyExt, Full};
+use hyper::Request;
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::TokioExecutor;
+use serde::{de::DeserializeOwned, Serialize};
+use std::io::Write;
+use std::sync::Arc;
+use std::time::Duration;
+
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+type HttpsClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>;
+
+#[derive(Clone)]
+pub struct ControlClient {
+    client: Arc<HttpsClient>,
+    base: Arc<String>,
+    token: Arc<String>,
+    node_id: Arc<String>,
+}
+
+impl ControlClient {
+    pub fn new(config: &EdgeConfig) -> Self {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let mut http = HttpConnector::new();
+        http.enforce_http(false);
+        http.set_nodelay(true);
+        http.set_connect_timeout(Some(Duration::from_secs(5)));
+
+        let https = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_webpki_roots()
+            .https_or_http()
+            .enable_http1()
+            .enable_http2()
+            .wrap_connector(http);
+
+        let client = Client::builder(TokioExecutor::new())
+            .pool_idle_timeout(Duration::from_secs(90))
+            .pool_max_idle_per_host(16)
+            .build(https);
+
+        Self {
+            client: Arc::new(client),
+            base: Arc::new(config.control_url.trim_end_matches('/').to_string()),
+            token: Arc::new(config.agent_token.clone()),
+            node_id: Arc::new(config.node_id.clone()),
+        }
+    }
+
+    pub fn endpoint(&self, path: &str) -> String {
+        let path = path.trim_start_matches('/');
+        format!("{}/{}", self.base, path)
+    }
+
+    pub fn has_https(&self) -> bool {
+        self.base.starts_with("https://")
+    }
+
+    async fn send_response(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Bytes>,
+        content_type: Option<&str>,
+        content_encoding: Option<&str>,
+        if_none_match: Option<&str>,
+    ) -> Result<(StatusCode, HeaderMap, Bytes), String> {
+        let url = self.endpoint(path);
+        let mut builder = Request::builder().method(method).uri(&url);
+        if let Some(ct) = content_type {
+            builder = builder.header("content-type", ct);
+        }
+        if let Some(encoding) = content_encoding {
+            builder = builder.header("content-encoding", encoding);
+        }
+        if let Some(etag) = if_none_match.filter(|s| !s.is_empty()) {
+            builder = builder.header("if-none-match", etag);
+        }
+        if !self.token.is_empty() {
+            builder = builder.header("x-lagran-agent-token", self.token.as_str());
+        }
+        if !self.node_id.is_empty() {
+            builder = builder.header("x-lagran-node-id", self.node_id.as_str());
+        }
+        let req = builder
+            .body(Full::new(body.unwrap_or_default()))
+            .map_err(|e| format!("build request {url}: {e}"))?;
+
+        let send = async {
+            let resp = self.client.request(req).await.map_err(|e| e.to_string())?;
+            let status = resp.status();
+            let headers = resp.headers().clone();
+            let bytes = resp
+                .into_body()
+                .collect()
+                .await
+                .map_err(|e| e.to_string())?
+                .to_bytes();
+            if status != StatusCode::NOT_MODIFIED && !status.is_success() {
+                // Status and size only. Callers pass this straight into `warn!`, and a
+                // control-plane error body can echo the request — which for the config
+                // and cert endpoints is the domain's own configuration.
+                return Err(format!("HTTP {status} ({} body bytes)", bytes.len()));
+            }
+            Ok((status, headers, bytes))
+        };
+
+        tokio::time::timeout(REQUEST_TIMEOUT, send)
+            .await
+            .map_err(|_| format!("timeout after {REQUEST_TIMEOUT:?}: {url}"))?
+    }
+
+    async fn send(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Bytes>,
+        content_type: Option<&str>,
+    ) -> Result<Bytes, String> {
+        let (_, _, bytes) = self
+            .send_response(method, path, body, content_type, None, None)
+            .await?;
+        Ok(bytes)
+    }
+
+    pub async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, String> {
+        let bytes = self.send("GET", path, None, None).await?;
+        serde_json::from_slice(&bytes).map_err(|e| format!("invalid JSON from {path}: {e}"))
+    }
+
+    /// GET with If-None-Match. Returns `value = None` for HTTP 304.
+    pub async fn get_json_conditional<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        if_none_match: Option<&str>,
+    ) -> Result<ConditionalJson<T>, String> {
+        let (status, headers, bytes) = self
+            .send_response("GET", path, None, None, None, if_none_match)
+            .await?;
+        let etag = headers
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        if status == StatusCode::NOT_MODIFIED {
+            return Ok(ConditionalJson { etag, value: None });
+        }
+        let value =
+            serde_json::from_slice(&bytes).map_err(|e| format!("invalid JSON from {path}: {e}"))?;
+        Ok(ConditionalJson {
+            etag,
+            value: Some(value),
+        })
+    }
+
+    pub async fn post_json<B: Serialize>(&self, path: &str, body: &B) -> Result<(), String> {
+        let bytes = serde_json::to_vec(body).map_err(|e| e.to_string())?;
+        self.send(
+            "POST",
+            path,
+            Some(Bytes::from(bytes)),
+            Some("application/json"),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// POST a JSON document compressed with gzip.
+    pub async fn post_gzip_json<B: Serialize>(&self, path: &str, body: &B) -> Result<(), String> {
+        let json = serde_json::to_vec(body).map_err(|e| e.to_string())?;
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&json).map_err(|e| e.to_string())?;
+        let compressed = encoder.finish().map_err(|e| e.to_string())?;
+        self.send_response(
+            "POST",
+            path,
+            Some(Bytes::from(compressed)),
+            Some("application/json"),
+            Some("gzip"),
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// POST and decode the JSON reply (used by the heartbeat agent).
+    pub async fn post_json_for<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T, String> {
+        let bytes = serde_json::to_vec(body).map_err(|e| e.to_string())?;
+        let reply = self
+            .send(
+                "POST",
+                path,
+                Some(Bytes::from(bytes)),
+                Some("application/json"),
+            )
+            .await?;
+        serde_json::from_slice(&reply).map_err(|e| format!("invalid JSON from {path}: {e}"))
+    }
+
+    /// GET binary body with optional If-None-Match (used by geoip sync).
+    /// Longer timeout than JSON calls — Country MMDB is a few megabytes.
+    pub async fn get_bytes_conditional(
+        &self,
+        path: &str,
+        if_none_match: Option<&str>,
+    ) -> Result<(StatusCode, HeaderMap, Bytes), String> {
+        let url = self.endpoint(path);
+        let mut builder = Request::builder().method("GET").uri(&url);
+        if let Some(etag) = if_none_match.filter(|s| !s.is_empty()) {
+            let tag = if etag.starts_with('"') {
+                etag.to_string()
+            } else {
+                format!("\"{etag}\"")
+            };
+            builder = builder.header("if-none-match", tag);
+        }
+        if !self.token.is_empty() {
+            builder = builder.header("x-lagran-agent-token", self.token.as_str());
+        }
+        if !self.node_id.is_empty() {
+            builder = builder.header("x-lagran-node-id", self.node_id.as_str());
+        }
+        let req = builder
+            .body(Full::new(Bytes::new()))
+            .map_err(|e| format!("build request {url}: {e}"))?;
+
+        let send = async {
+            let resp = self.client.request(req).await.map_err(|e| e.to_string())?;
+            let status = resp.status();
+            let headers = resp.headers().clone();
+            let bytes = resp
+                .into_body()
+                .collect()
+                .await
+                .map_err(|e| e.to_string())?
+                .to_bytes();
+            if status != StatusCode::NOT_MODIFIED && !status.is_success() {
+                return Err(format!("HTTP {status} ({} body bytes)", bytes.len()));
+            }
+            Ok((status, headers, bytes))
+        };
+
+        const GEOIP_TIMEOUT: Duration = Duration::from_secs(120);
+        tokio::time::timeout(GEOIP_TIMEOUT, send)
+            .await
+            .map_err(|_| format!("timeout after {GEOIP_TIMEOUT:?}: {url}"))?
+    }
+}
+
+#[derive(Debug)]
+pub struct ConditionalJson<T> {
+    pub etag: Option<String>,
+    pub value: Option<T>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(control_url: &str, token: &str) -> EdgeConfig {
+        EdgeConfig {
+            control_url: control_url.to_string(),
+            agent_token: token.to_string(),
+            ..EdgeConfig::default()
+        }
+    }
+
+    #[test]
+    fn endpoint_joins_without_double_slash() {
+        let c = ControlClient::new(&config("http://control.test:8080/", ""));
+        assert_eq!(
+            c.endpoint("/api/v1/config"),
+            "http://control.test:8080/api/v1/config"
+        );
+        assert_eq!(
+            c.endpoint("api/v1/config"),
+            "http://control.test:8080/api/v1/config"
+        );
+        assert!(!c.has_https());
+
+        let c = ControlClient::new(&config("https://control.test", "secret"));
+        assert!(c.has_https());
+    }
+}

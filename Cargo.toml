@@ -1,0 +1,83 @@
+[workspace]
+resolver = "2"
+members = [
+    "apps/control",
+    "apps/dns",
+    "apps/edge",
+    "crates/lagran-cache",
+    "crates/lagran-waf-dsl",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Lagran Team"]
+license = "AGPL-3.0-only"
+# repository is set per deployment; do not hardcode an upstream in the workspace.
+
+[workspace.dependencies]
+# Pingora 0.9 uses tokio's BufStream with zero capacity; tokio 1.54 added an
+# assert that breaks it. Pin until Pingora supports the newer behavior.
+tokio = { version = "=1.53.1", features = ["full"] }
+async-trait = "0.1"
+
+axum = { version = "0.7", features = ["macros"] }
+# `util` provides `ServiceExt::oneshot`, used by the router-level tests. It must
+# be requested explicitly: relying on another dependency to enable it works
+# locally but breaks CI, where the feature set differs.
+tower = { version = "0.4", features = ["util"] }
+tower-http = { version = "0.5", features = ["cors", "trace", "decompression-gzip"] }
+hyper = { version = "1.1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full", "client-legacy"] }
+http-body-util = "0.1"
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "tls12", "ring", "webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+tokio-rustls = "0.26"
+rcgen = "0.13"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+sqlx = { version = "0.7", features = ["runtime-tokio", "postgres", "chrono", "uuid", "migrate"] }
+
+jsonwebtoken = "9"
+bcrypt = "0.15"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+anyhow = "1"
+thiserror = "1"
+chrono = { version = "0.4", features = ["serde"] }
+# Signal handling for the DNS server, which runs synchronous sockets with no
+# Tokio runtime to reach `tokio::signal`.
+ctrlc = { version = "3.4", features = ["termination"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+dotenvy = "0.15"
+dashmap = "5.5"
+bytes = "1"
+http = "1"
+
+# Edge helpers (WebSocket handshake, HTTP-date parsing)
+base64 = "0.22"
+flate2 = "1"
+httpdate = "1"
+regex = "1"
+ring = "0.17"
+webpki-roots = "1"
+
+# Global allocator for the long-running servers. glibc malloc's per-arena
+# contention shows up on the multi-threaded edge data plane, which allocates
+# constantly (header vectors, access-log records, WAF decoding).
+tikv-jemallocator = "0.6"
+
+lagran-cache = { path = "crates/lagran-cache" }
+
+# The edge data plane is a hot loop over Pingora/hyper generics, so cross-crate
+# inlining is worth the longer build. `panic = "abort"` is deliberately NOT set:
+# tokio isolates a panicking task with unwinding, and aborting would turn one
+# bad request into a full node outage.
+[profile.release]
+lto = "thin"
+codegen-units = 1

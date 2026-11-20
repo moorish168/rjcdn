@@ -1,0 +1,5612 @@
+//! Database access layer
+
+pub mod alert;
+pub mod config_release;
+pub mod dns_providers;
+pub mod prefetch;
+pub mod remote;
+pub use alert::*;
+pub use config_release::*;
+pub use dns_providers::*;
+pub use prefetch::*;
+pub use remote::*;
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
+use std::collections::{HashMap, HashSet};
+use uuid::Uuid;
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct UserRow {
+    pub id: Uuid,
+    pub email: String,
+    pub password_hash: String,
+    pub name: String,
+    pub role: String,
+    pub is_active: bool,
+    pub last_login_at: Option<DateTime<Utc>>,
+    pub token_version: i64,
+    pub created_at: DateTime<Utc>,
+    /// Populated by the admin list query only.
+    #[sqlx(default)]
+    pub project_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomainOrigin {
+    pub host: String,
+    pub port: u16,
+    pub proto: String,
+    #[serde(default = "default_origin_weight")]
+    pub weight: u32,
+    #[serde(default)]
+    pub priority: i32,
+    #[serde(default = "default_origin_enabled")]
+    pub enabled: bool,
+    /// Optional TLS SNI / certificate hostname when `host` is an IP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sni: Option<String>,
+    /// Optional Host header sent upstream. Falls back to `sni`, then to the
+    /// name the visitor requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_header: Option<String>,
+}
+
+fn default_origin_weight() -> u32 {
+    100
+}
+
+fn default_origin_enabled() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct DomainRow {
+    pub id: Uuid,
+    pub project_id: Option<Uuid>,
+    pub name: String,
+    /// Operator-facing label; empty means fall back to `name` in the UI.
+    #[sqlx(default)]
+    pub display_name: String,
+    pub origin_host: String,
+    pub origin_port: i32,
+    pub origin_proto: String,
+    pub ssl_enabled: bool,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+    pub rate_limit_rps: i32,
+    pub rate_limit_burst: i32,
+    #[sqlx(default)]
+    pub origins: sqlx::types::Json<Vec<DomainOrigin>>,
+    #[sqlx(default)]
+    pub backup_origin_host: String,
+    #[sqlx(default)]
+    pub backup_origin_port: i32,
+    #[sqlx(default)]
+    pub backup_origin_proto: String,
+    #[sqlx(default)]
+    pub shield_url: String,
+    #[sqlx(default)]
+    pub published_version_id: Option<Uuid>,
+    #[sqlx(default)]
+    pub access_mode: String,
+    #[sqlx(default)]
+    pub dns_zone_id: Option<Uuid>,
+    #[sqlx(default)]
+    pub auto_https: bool,
+    #[sqlx(default)]
+    pub cert_status: String,
+    /// Cloudflare-style CDN switch. When false on NS sites, DNS records stay
+    /// but answer with the origin (grey cloud / DNS only).
+    /// `None` only when a partial SELECT omitted the column — treat as enabled.
+    #[sqlx(default)]
+    pub cdn_enabled: Option<bool>,
+    /// Site master switch for edge caching. `None` = enabled (column omitted).
+    #[sqlx(default)]
+    pub cache_enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct NodeRow {
+    pub id: Uuid,
+    pub name: String,
+    pub region: String,
+    pub ip: String,
+    pub status: String,
+    pub last_heartbeat: Option<DateTime<Utc>>,
+    pub agent_url: String,
+    pub auth_token: String,
+    pub cpu_usage: Option<f64>,
+    pub memory_usage: Option<f64>,
+    pub active_connections: Option<i64>,
+    pub version: String,
+    pub created_at: DateTime<Utc>,
+    #[sqlx(default)]
+    pub public_ip: String,
+    #[sqlx(default)]
+    pub isp: String,
+    #[sqlx(default)]
+    pub country: String,
+    #[sqlx(default)]
+    pub province: String,
+    #[sqlx(default)]
+    pub city: String,
+    #[sqlx(default)]
+    pub weight: i32,
+    #[sqlx(default)]
+    pub max_bandwidth_mbps: i32,
+    /// Console-owned JSON text produced by the "add edge" wizard. Empty for
+    /// nodes registered before the wizard existed.
+    #[sqlx(default)]
+    pub edge_profile: String,
+    #[sqlx(default)]
+    pub region_id: Option<Uuid>,
+    #[sqlx(default)]
+    pub cache_policy_id: Option<Uuid>,
+    /// Node disk/memory storage policy (not path/TTL rule templates).
+    #[sqlx(default)]
+    pub cache_storage_policy_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct CacheRuleRow {
+    pub id: Uuid,
+    pub domain_id: Uuid,
+    pub path_pattern: String,
+    /// glob | regex
+    pub match_type: String,
+    pub ttl_seconds: i64,
+    pub priority: i32,
+    pub action: String,
+    pub swr_seconds: i64,
+    pub enabled: bool,
+    pub match_methods: String,
+    pub match_query: String,
+    pub browser_ttl_seconds: i64,
+    pub ignore_query: Option<bool>,
+    pub ignore_cookie: bool,
+    pub ignore_key_headers: Option<String>,
+    pub match_content_type: String,
+    pub note: String,
+}
+
+/// Fields shared by rule create/update.
+#[derive(Debug, Clone)]
+pub struct RuleInput<'a> {
+    pub path_pattern: &'a str,
+    pub match_type: &'a str,
+    pub ttl_seconds: i64,
+    pub priority: i32,
+    pub action: &'a str,
+    pub swr_seconds: i64,
+    pub enabled: bool,
+    pub match_methods: &'a str,
+    pub match_query: &'a str,
+    pub browser_ttl_seconds: i64,
+    pub ignore_query: Option<bool>,
+    pub ignore_cookie: bool,
+    pub ignore_key_headers: Option<&'a str>,
+    pub match_content_type: &'a str,
+    pub note: &'a str,
+}
+
+pub async fn find_user_by_email(pool: &PgPool, email: &str) -> sqlx::Result<Option<UserRow>> {
+    sqlx::query_as::<_, UserRow>(
+        "SELECT id, email, password_hash, name, role, is_active, last_login_at, token_version, created_at FROM users WHERE lower(email) = lower($1)",
+    )
+    .bind(email)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn find_user_by_id(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<UserRow>> {
+    sqlx::query_as::<_, UserRow>(
+        "SELECT id, email, password_hash, name, role, is_active, last_login_at, token_version, created_at FROM users WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// `(email, name)` for many users in one query.
+///
+/// Deliberately does not select `password_hash`: this is only used to decorate
+/// list responses.
+pub async fn user_identities(
+    pool: &PgPool,
+    user_ids: &[Uuid],
+) -> sqlx::Result<HashMap<Uuid, (String, String)>> {
+    let mut out: HashMap<Uuid, (String, String)> = HashMap::new();
+    if user_ids.is_empty() {
+        return Ok(out);
+    }
+    let rows: Vec<(Uuid, String, String)> =
+        sqlx::query_as("SELECT id, email, name FROM users WHERE id = ANY($1)")
+            .bind(user_ids)
+            .fetch_all(pool)
+            .await?;
+    for (id, email, name) in rows {
+        out.insert(id, (email, name));
+    }
+    Ok(out)
+}
+
+pub async fn create_user(
+    pool: &PgPool,
+    email: &str,
+    password_hash: &str,
+    name: &str,
+) -> sqlx::Result<UserRow> {
+    sqlx::query_as::<_, UserRow>(
+        r#"
+        INSERT INTO users (email, password_hash, name)
+        VALUES ($1, $2, $3)
+        RETURNING id, email, password_hash, name, role, is_active, last_login_at, token_version, created_at
+        "#,
+    )
+    .bind(email)
+    .bind(password_hash)
+    .bind(name)
+    .fetch_one(pool)
+    .await
+}
+
+/// Create a user, granting `admin` if this is the very first account.
+///
+/// The cold-start problem this solves: `SEED_DEMO` is refused when
+/// `REQUIRE_SECURE_SECRETS=true` and nothing else creates an account, so a fresh
+/// deployment would have no one who can log in. Rather than shipping a CLI bootstrap,
+/// the existing self-registration flow promotes its first caller — the operator turns
+/// `ALLOW_REGISTER` on, registers, and is immediately able to administer the instance.
+///
+/// The emptiness test and the INSERT are one statement, so two concurrent first
+/// registrations cannot both come out as admin: the second sees the first's row.
+pub async fn create_user_first_is_admin(
+    pool: &PgPool,
+    email: &str,
+    password_hash: &str,
+    name: &str,
+) -> sqlx::Result<UserRow> {
+    sqlx::query_as::<_, UserRow>(
+        r#"
+        INSERT INTO users (email, password_hash, name, role)
+        SELECT $1, $2, $3,
+               CASE WHEN EXISTS (SELECT 1 FROM users) THEN 'user' ELSE 'admin' END
+        RETURNING id, email, password_hash, name, role, is_active, last_login_at, token_version, created_at
+        "#,
+    )
+    .bind(email)
+    .bind(password_hash)
+    .bind(name)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn create_user_with_role(
+    pool: &PgPool,
+    email: &str,
+    password_hash: &str,
+    name: &str,
+    role: &str,
+) -> sqlx::Result<UserRow> {
+    sqlx::query_as::<_, UserRow>(
+        r#"
+        INSERT INTO users (email, password_hash, name, role)
+        VALUES ($1, $2, $3, $4)
+        RETURNING id, email, password_hash, name, role, is_active, last_login_at, token_version, created_at
+        "#,
+    )
+    .bind(email)
+    .bind(password_hash)
+    .bind(name)
+    .bind(role)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn list_users(pool: &PgPool) -> sqlx::Result<Vec<UserRow>> {
+    sqlx::query_as::<_, UserRow>(
+        r#"
+        SELECT u.id, u.email, u.password_hash, u.name, u.role, u.is_active,
+               u.last_login_at, u.token_version, u.created_at,
+               (SELECT COUNT(*) FROM projects p WHERE p.owner_id = u.id) AS project_count
+        FROM users u
+        ORDER BY u.created_at DESC
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn update_user_admin(
+    pool: &PgPool,
+    id: Uuid,
+    name: &str,
+    role: &str,
+    is_active: bool,
+    password_hash: Option<&str>,
+) -> sqlx::Result<Option<UserRow>> {
+    sqlx::query_as::<_, UserRow>(
+        r#"
+        UPDATE users SET
+            name = $2, role = $3, is_active = $4,
+            password_hash = COALESCE($5, password_hash),
+            token_version = token_version + CASE WHEN $5 IS NULL THEN 0 ELSE 1 END,
+            updated_at = NOW()
+        WHERE id = $1
+        RETURNING id, email, password_hash, name, role, is_active, last_login_at, token_version, created_at
+        "#,
+    )
+    .bind(id)
+    .bind(name)
+    .bind(role)
+    .bind(is_active)
+    .bind(password_hash)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn update_user_profile(
+    pool: &PgPool,
+    id: Uuid,
+    name: &str,
+) -> sqlx::Result<Option<UserRow>> {
+    sqlx::query_as::<_, UserRow>(
+        r#"
+        UPDATE users SET name = $2, updated_at = NOW()
+        WHERE id = $1
+        RETURNING id, email, password_hash, name, role, is_active, last_login_at, token_version, created_at
+        "#,
+    )
+    .bind(id)
+    .bind(name)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn update_user_password(
+    pool: &PgPool,
+    id: Uuid,
+    password_hash: &str,
+) -> sqlx::Result<Option<i64>> {
+    let row: Option<(i64,)> = sqlx::query_as(
+        "UPDATE users SET password_hash = $2, token_version = token_version + 1, \
+         updated_at = NOW() WHERE id = $1 RETURNING token_version",
+    )
+    .bind(id)
+    .bind(password_hash)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| r.0))
+}
+
+/// Change a user's login e-mail and revoke their existing sessions.
+pub async fn update_user_email(pool: &PgPool, id: Uuid, email: &str) -> sqlx::Result<Option<i64>> {
+    let row: Option<(i64,)> = sqlx::query_as(
+        "UPDATE users SET email = $2, token_version = token_version + 1, \
+         updated_at = NOW() WHERE id = $1 RETURNING token_version",
+    )
+    .bind(id)
+    .bind(email)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| r.0))
+}
+
+/// Revoke every JWT issued for this user before now.
+///
+/// `token_version` is checked by `Actor` and `/auth/me`, so bumping it makes all
+/// previously issued tokens fail immediately. Logout uses this because the JWT
+/// itself is stateless: clearing localStorage does not revoke anything.
+pub async fn bump_token_version(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<i64>> {
+    let row: Option<(i64,)> = sqlx::query_as(
+        "UPDATE users SET token_version = token_version + 1, updated_at = NOW() \
+         WHERE id = $1 RETURNING token_version",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| r.0))
+}
+
+/// Session fields needed to validate a JWT: current role, active flag and the
+/// token version/epoch. Incrementing `token_version` revokes old tokens.
+pub async fn get_user_session(
+    pool: &PgPool,
+    id: Uuid,
+) -> sqlx::Result<Option<(String, bool, i64)>> {
+    sqlx::query_as("SELECT role, is_active, token_version FROM users WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+}
+
+pub async fn touch_last_login(pool: &PgPool, id: Uuid) -> sqlx::Result<()> {
+    sqlx::query("UPDATE users SET last_login_at = NOW(), updated_at = NOW() WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn delete_user(pool: &PgPool, id: Uuid) -> sqlx::Result<u64> {
+    let r = sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected())
+}
+
+pub async fn count_active_admins(pool: &PgPool) -> sqlx::Result<i64> {
+    let (n,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM users WHERE role = 'admin' AND is_active")
+            .fetch_one(pool)
+            .await?;
+    Ok(n)
+}
+
+/// Full domain rows for the given ids, filtered in SQL.
+///
+/// The list endpoint used to load every domain and drop the invisible ones in
+/// Rust, so a tenant with access to two projects still paid for the whole table —
+/// including each row's `origins` JSONB.
+pub async fn list_domains_by_ids(pool: &PgPool, ids: &[Uuid]) -> sqlx::Result<Vec<DomainRow>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    sqlx::query_as::<_, DomainRow>(
+        r#"
+        SELECT id, project_id, name,
+               COALESCE(display_name, '') AS display_name,
+               origin_host, origin_port, origin_proto,
+               ssl_enabled, status, created_at, rate_limit_rps, rate_limit_burst,
+               COALESCE(origins, '[]'::jsonb) AS origins,
+               COALESCE(backup_origin_host, '') AS backup_origin_host,
+               COALESCE(backup_origin_port, 0) AS backup_origin_port,
+               COALESCE(backup_origin_proto, 'http') AS backup_origin_proto,
+               COALESCE(shield_url, '') AS shield_url,
+               published_version_id,
+               COALESCE(access_mode, 'cname') AS access_mode,
+               dns_zone_id,
+               COALESCE(auto_https, TRUE) AS auto_https,
+               COALESCE(cert_status, 'none') AS cert_status,
+               COALESCE(cdn_enabled, TRUE) AS cdn_enabled,
+               COALESCE(cache_enabled, TRUE) AS cache_enabled
+        FROM domains
+        WHERE id = ANY($1)
+        ORDER BY created_at DESC
+        "#,
+    )
+    .bind(ids)
+    .fetch_all(pool)
+    .await
+}
+
+/// `(id, name)` for every domain, for callers that only translate ids to names.
+///
+/// `list_domains` selects sixteen columns — including the `origins` JSONB — and
+/// sorts the whole table by `created_at`, which no index covers. Several handlers
+/// called it purely as an id-to-name map for a handful of ids, paying for the
+/// full row of every domain on every request.
+pub async fn domain_names(pool: &PgPool) -> sqlx::Result<HashMap<Uuid, String>> {
+    let rows: Vec<(Uuid, String)> = sqlx::query_as("SELECT id, name FROM domains")
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.into_iter().collect())
+}
+
+/// Names of the given domains only. Far cheaper than mapping the whole table
+/// when the caller already knows which ids it needs.
+pub async fn domain_names_by_ids(
+    pool: &PgPool,
+    ids: &[Uuid],
+) -> sqlx::Result<HashMap<Uuid, String>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows: Vec<(Uuid, String)> =
+        sqlx::query_as("SELECT id, name FROM domains WHERE id = ANY($1)")
+            .bind(ids)
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.into_iter().collect())
+}
+
+/// Every hostname (primary and extra) of the given sites. Logs, stats and WAF
+/// events are keyed by the Host a visitor used, so per-tenant visibility must
+/// include a site's extra hostnames too.
+pub async fn hostnames_by_ids(pool: &PgPool, ids: &[Uuid]) -> sqlx::Result<Vec<String>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    sqlx::query_scalar(
+        r#"
+        SELECT name FROM domains WHERE id = ANY($1)
+        UNION
+        SELECT lower(rtrim(btrim(hostname), '.')) FROM domain_hostnames WHERE domain_id = ANY($1)
+        "#,
+    )
+    .bind(ids)
+    .fetch_all(pool)
+    .await
+}
+
+/// Every hostname of every site.
+pub async fn all_hostnames(pool: &PgPool) -> sqlx::Result<Vec<String>> {
+    sqlx::query_scalar(
+        r#"
+        SELECT name FROM domains
+        UNION
+        SELECT lower(rtrim(btrim(hostname), '.')) FROM domain_hostnames
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// Whether every name in `names` exists (primary or alias), without loading full rows.
+pub async fn domains_exist(pool: &PgPool, names: &[String]) -> sqlx::Result<HashSet<String>> {
+    if names.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let rows: Vec<(String,)> = sqlx::query_as(
+        r#"
+        SELECT hostname FROM domain_hostnames WHERE hostname = ANY($1)
+        UNION
+        SELECT name FROM domains WHERE name = ANY($1)
+        "#,
+    )
+    .bind(names)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(name,)| name).collect())
+}
+
+pub async fn list_domains(pool: &PgPool) -> sqlx::Result<Vec<DomainRow>> {
+    sqlx::query_as::<_, DomainRow>(
+        r#"
+        SELECT id, project_id, name,
+               COALESCE(display_name, '') AS display_name,
+               origin_host, origin_port, origin_proto,
+               ssl_enabled, status, created_at, rate_limit_rps, rate_limit_burst,
+               COALESCE(origins, '[]'::jsonb) AS origins, COALESCE(backup_origin_host, '') AS backup_origin_host,
+               COALESCE(backup_origin_port, 0) AS backup_origin_port,
+               COALESCE(backup_origin_proto, 'http') AS backup_origin_proto,
+               COALESCE(shield_url, '') AS shield_url,
+               published_version_id,
+               COALESCE(access_mode, 'cname') AS access_mode,
+               dns_zone_id,
+               COALESCE(auto_https, TRUE) AS auto_https,
+               COALESCE(cert_status, 'none') AS cert_status,
+               COALESCE(cdn_enabled, TRUE) AS cdn_enabled,
+               COALESCE(cache_enabled, TRUE) AS cache_enabled
+        FROM domains
+        ORDER BY created_at DESC
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn get_domain(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<DomainRow>> {
+    sqlx::query_as::<_, DomainRow>(
+        r#"
+        SELECT id, project_id, name,
+               COALESCE(display_name, '') AS display_name,
+               origin_host, origin_port, origin_proto,
+               ssl_enabled, status, created_at, rate_limit_rps, rate_limit_burst,
+               COALESCE(origins, '[]'::jsonb) AS origins, COALESCE(backup_origin_host, '') AS backup_origin_host,
+               COALESCE(backup_origin_port, 0) AS backup_origin_port,
+               COALESCE(backup_origin_proto, 'http') AS backup_origin_proto,
+               COALESCE(shield_url, '') AS shield_url,
+               published_version_id,
+               COALESCE(access_mode, 'cname') AS access_mode,
+               dns_zone_id,
+               COALESCE(auto_https, TRUE) AS auto_https,
+               COALESCE(cert_status, 'none') AS cert_status,
+               COALESCE(cdn_enabled, TRUE) AS cdn_enabled,
+               COALESCE(cache_enabled, TRUE) AS cache_enabled
+        FROM domains WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn get_domain_by_name(pool: &PgPool, name: &str) -> sqlx::Result<Option<DomainRow>> {
+    // Resolve primary name or any alias on the site.
+    sqlx::query_as::<_, DomainRow>(
+        r#"
+        SELECT d.id, d.project_id, d.name,
+               COALESCE(d.display_name, '') AS display_name,
+               d.origin_host, d.origin_port, d.origin_proto,
+               d.ssl_enabled, d.status, d.created_at, d.rate_limit_rps, d.rate_limit_burst,
+               COALESCE(d.origins, '[]'::jsonb) AS origins,
+               COALESCE(d.backup_origin_host, '') AS backup_origin_host,
+               COALESCE(d.backup_origin_port, 0) AS backup_origin_port,
+               COALESCE(d.backup_origin_proto, 'http') AS backup_origin_proto,
+               COALESCE(d.shield_url, '') AS shield_url,
+               d.published_version_id,
+               COALESCE(d.access_mode, 'cname') AS access_mode,
+               d.dns_zone_id,
+               COALESCE(d.auto_https, TRUE) AS auto_https,
+               COALESCE(d.cert_status, 'none') AS cert_status,
+               COALESCE(d.cdn_enabled, TRUE) AS cdn_enabled,
+               COALESCE(d.cache_enabled, TRUE) AS cache_enabled
+        FROM domains d
+        WHERE lower(rtrim(btrim(d.name), '.')) = lower(rtrim(btrim($1), '.'))
+           OR EXISTS (
+                SELECT 1 FROM domain_hostnames h
+                WHERE h.domain_id = d.id
+                  AND lower(rtrim(btrim(h.hostname), '.')) = lower(rtrim(btrim($1), '.'))
+           )
+        LIMIT 1
+        "#,
+    )
+    .bind(name)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn create_domain(
+    pool: &PgPool,
+    name: &str,
+    origin_host: &str,
+    origin_port: i32,
+    origin_proto: &str,
+    ssl_enabled: bool,
+) -> sqlx::Result<DomainRow> {
+    create_domain_with_project(pool, name, origin_host, origin_port, origin_proto, ssl_enabled, None)
+        .await
+}
+
+pub async fn delete_domain(pool: &PgPool, id: Uuid) -> sqlx::Result<u64> {
+    // One transaction, no swallowed errors.
+    //
+    // These five statements used to run outside a transaction with `let _ =` on
+    // the first four. If the final `DELETE FROM domains` failed — a new foreign
+    // key, a permission change — the side tables had already been committed, so
+    // the domain survived with its CC bans, origin health history and prefetch
+    // schedule wiped. A failure now rolls the whole delete back, and a failure in
+    // a side table aborts instead of being ignored.
+    let mut tx = pool.begin().await?;
+    let names: Vec<String> = sqlx::query_scalar(
+        r#"
+        SELECT hostname FROM domain_hostnames WHERE domain_id = $1
+        UNION
+        SELECT name FROM domains WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .fetch_all(&mut *tx)
+    .await?;
+    if names.is_empty() {
+        return Ok(0);
+    }
+    for name in &names {
+        for statement in [
+            "DELETE FROM cc_bans WHERE domain = $1",
+            "DELETE FROM origin_health WHERE domain_name = $1",
+            "DELETE FROM prefetch_schedules WHERE domain = $1",
+            "DELETE FROM prefetch_tasks WHERE domain = $1",
+        ] {
+            sqlx::query(statement).bind(name).execute(&mut *tx).await?;
+        }
+    }
+    let removed = sqlx::query("DELETE FROM domains WHERE id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    tx.commit().await?;
+    Ok(removed)
+}
+
+pub async fn list_nodes(pool: &PgPool) -> sqlx::Result<Vec<NodeRow>> {
+    sqlx::query_as::<_, NodeRow>(
+        r#"
+        SELECT id, name, region, ip, status, last_heartbeat,
+               COALESCE(agent_url, '') AS agent_url, auth_token,
+               cpu_usage, memory_usage, active_connections,
+               COALESCE(version, '') AS version, created_at,
+               COALESCE(public_ip, '') AS public_ip,
+               COALESCE(isp, '') AS isp,
+               COALESCE(country, 'CN') AS country,
+               COALESCE(province, '') AS province,
+               COALESCE(city, '') AS city,
+               COALESCE(weight, 100) AS weight,
+               COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps,
+               COALESCE(edge_profile, '') AS edge_profile,
+               region_id,
+               cache_policy_id,
+               cache_storage_policy_id
+        FROM edge_nodes
+        ORDER BY name
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn get_node(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<NodeRow>> {
+    sqlx::query_as::<_, NodeRow>(
+        r#"
+        SELECT id, name, region, ip, status, last_heartbeat,
+               COALESCE(agent_url, '') AS agent_url, auth_token,
+               cpu_usage, memory_usage, active_connections,
+               COALESCE(version, '') AS version, created_at,
+               COALESCE(public_ip, '') AS public_ip,
+               COALESCE(isp, '') AS isp,
+               COALESCE(country, 'CN') AS country,
+               COALESCE(province, '') AS province,
+               COALESCE(city, '') AS city,
+               COALESCE(weight, 100) AS weight,
+               COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps,
+               COALESCE(edge_profile, '') AS edge_profile,
+               region_id,
+               cache_policy_id,
+               cache_storage_policy_id
+        FROM edge_nodes WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn get_node_by_name(pool: &PgPool, name: &str) -> sqlx::Result<Option<NodeRow>> {
+    sqlx::query_as::<_, NodeRow>(
+        r#"
+        SELECT id, name, region, ip, status, last_heartbeat,
+               COALESCE(agent_url, '') AS agent_url, auth_token,
+               cpu_usage, memory_usage, active_connections,
+               COALESCE(version, '') AS version, created_at,
+               COALESCE(public_ip, '') AS public_ip,
+               COALESCE(isp, '') AS isp,
+               COALESCE(country, 'CN') AS country,
+               COALESCE(province, '') AS province,
+               COALESCE(city, '') AS city,
+               COALESCE(weight, 100) AS weight,
+               COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps,
+               COALESCE(edge_profile, '') AS edge_profile,
+               region_id,
+               cache_policy_id,
+               cache_storage_policy_id
+        FROM edge_nodes WHERE name = $1
+        "#,
+    )
+    .bind(name)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn list_online_nodes_with_agent(pool: &PgPool) -> sqlx::Result<Vec<NodeRow>> {
+    sqlx::query_as::<_, NodeRow>(
+        r#"
+        SELECT id, name, region, ip, status, last_heartbeat,
+               COALESCE(agent_url, '') AS agent_url, auth_token,
+               cpu_usage, memory_usage, active_connections,
+               COALESCE(version, '') AS version, created_at,
+               COALESCE(public_ip, '') AS public_ip,
+               COALESCE(isp, '') AS isp,
+               COALESCE(country, 'CN') AS country,
+               COALESCE(province, '') AS province,
+               COALESCE(city, '') AS city,
+               COALESCE(weight, 100) AS weight,
+               COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps,
+               COALESCE(edge_profile, '') AS edge_profile,
+               region_id,
+               cache_policy_id,
+               cache_storage_policy_id
+        FROM edge_nodes
+        WHERE status = 'online' AND COALESCE(agent_url, '') <> ''
+        ORDER BY name
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// Pre-register a node. It stays `pending` until the first heartbeat arrives.
+pub async fn create_node(
+    pool: &PgPool,
+    name: &str,
+    region: &str,
+    ip: &str,
+    agent_url: &str,
+    auth_token: &str,
+) -> sqlx::Result<NodeRow> {
+    sqlx::query_as::<_, NodeRow>(
+        r#"
+        INSERT INTO edge_nodes (name, region, ip, agent_url, status, auth_token)
+        VALUES ($1, $2, $3, $4, 'pending', $5)
+        RETURNING id, name, region, ip, status, last_heartbeat,
+                  COALESCE(agent_url, '') AS agent_url, auth_token,
+                  cpu_usage, memory_usage, active_connections,
+                  COALESCE(version, '') AS version, created_at,
+               COALESCE(public_ip, '') AS public_ip,
+               COALESCE(isp, '') AS isp,
+               COALESCE(country, 'CN') AS country,
+               COALESCE(province, '') AS province,
+               COALESCE(city, '') AS city,
+               COALESCE(weight, 100) AS weight,
+               COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps,
+               COALESCE(edge_profile, '') AS edge_profile,
+               region_id,
+               cache_policy_id,
+               cache_storage_policy_id
+        "#,
+    )
+    .bind(name)
+    .bind(region)
+    .bind(ip)
+    .bind(agent_url)
+    .bind(auth_token)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn update_node(
+    pool: &PgPool,
+    id: Uuid,
+    name: &str,
+    region: &str,
+    agent_url: &str,
+) -> sqlx::Result<Option<NodeRow>> {
+    sqlx::query_as::<_, NodeRow>(
+        r#"
+        UPDATE edge_nodes
+        SET name = $2, region = $3, agent_url = $4, updated_at = NOW()
+        WHERE id = $1
+        RETURNING id, name, region, ip, status, last_heartbeat,
+                  COALESCE(agent_url, '') AS agent_url, auth_token,
+                  cpu_usage, memory_usage, active_connections,
+                  COALESCE(version, '') AS version, created_at,
+               COALESCE(public_ip, '') AS public_ip,
+               COALESCE(isp, '') AS isp,
+               COALESCE(country, 'CN') AS country,
+               COALESCE(province, '') AS province,
+               COALESCE(city, '') AS city,
+               COALESCE(weight, 100) AS weight,
+               COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps,
+               COALESCE(edge_profile, '') AS edge_profile,
+               region_id,
+               cache_policy_id,
+               cache_storage_policy_id
+        "#,
+    )
+    .bind(id)
+    .bind(name)
+    .bind(region)
+    .bind(agent_url)
+    .fetch_optional(pool)
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn update_node_meta(
+    pool: &PgPool,
+    id: Uuid,
+    public_ip: &str,
+    isp: &str,
+    country: &str,
+    province: &str,
+    city: &str,
+    weight: i32,
+    max_bandwidth_mbps: i32,
+    region_id: Option<Uuid>,
+    cache_policy_id: Option<Uuid>,
+) -> sqlx::Result<Option<NodeRow>> {
+    sqlx::query_as::<_, NodeRow>(
+        r#"
+        UPDATE edge_nodes SET
+            public_ip = $2, isp = $3, country = $4, province = $5,
+            city = $6, weight = $7, max_bandwidth_mbps = $8,
+            region_id = $9, cache_policy_id = $10,
+            updated_at = NOW()
+        WHERE id = $1
+        RETURNING id, name, region, ip, status, last_heartbeat,
+                  COALESCE(agent_url, '') AS agent_url, auth_token,
+                  cpu_usage, memory_usage, active_connections,
+                  COALESCE(version, '') AS version, created_at,
+                  COALESCE(public_ip, '') AS public_ip,
+                  COALESCE(isp, '') AS isp,
+                  COALESCE(country, 'CN') AS country,
+                  COALESCE(province, '') AS province,
+                  COALESCE(city, '') AS city,
+                  COALESCE(weight, 100) AS weight,
+                  COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps,
+               COALESCE(edge_profile, '') AS edge_profile,
+               region_id,
+               cache_policy_id,
+               cache_storage_policy_id
+        "#,
+    )
+    .bind(id)
+    .bind(public_ip)
+    .bind(isp)
+    .bind(country)
+    .bind(province)
+    .bind(city)
+    .bind(weight)
+    .bind(max_bandwidth_mbps)
+    .bind(region_id)
+    .bind(cache_policy_id)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn set_node_public_ip(pool: &PgPool, id: Uuid, public_ip: &str) -> sqlx::Result<()> {
+    sqlx::query("UPDATE edge_nodes SET public_ip = $2 WHERE id = $1")
+        .bind(id)
+        .bind(public_ip)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Store the console-generated hardware profile (opaque JSON text).
+///
+/// The console owns the shape; the control plane only round-trips it so the
+/// node detail drawer can rebuild the same `edge.env` the wizard produced.
+pub async fn update_node_edge_profile(
+    pool: &PgPool,
+    id: Uuid,
+    edge_profile: &str,
+) -> sqlx::Result<()> {
+    sqlx::query("UPDATE edge_nodes SET edge_profile = $2, updated_at = NOW() WHERE id = $1")
+        .bind(id)
+        .bind(edge_profile)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn set_node_status(
+    pool: &PgPool,
+    id: Uuid,
+    status: &str,
+) -> sqlx::Result<Option<NodeRow>> {
+    sqlx::query_as::<_, NodeRow>(
+        r#"
+        UPDATE edge_nodes
+        SET status = $2, updated_at = NOW()
+        WHERE id = $1
+        RETURNING id, name, region, ip, status, last_heartbeat,
+                  COALESCE(agent_url, '') AS agent_url, auth_token,
+                  cpu_usage, memory_usage, active_connections,
+                  COALESCE(version, '') AS version, created_at,
+               COALESCE(public_ip, '') AS public_ip,
+               COALESCE(isp, '') AS isp,
+               COALESCE(country, 'CN') AS country,
+               COALESCE(province, '') AS province,
+               COALESCE(city, '') AS city,
+               COALESCE(weight, 100) AS weight,
+               COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps,
+               COALESCE(edge_profile, '') AS edge_profile,
+               region_id,
+               cache_policy_id,
+               cache_storage_policy_id
+        "#,
+    )
+    .bind(id)
+    .bind(status)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn delete_node(pool: &PgPool, id: Uuid) -> sqlx::Result<u64> {
+    let r = sqlx::query("DELETE FROM edge_nodes WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected())
+}
+
+pub async fn node_token_exists(pool: &PgPool, token: &str) -> sqlx::Result<bool> {
+    if token.is_empty() {
+        return Ok(false);
+    }
+    // A disabled node must lose access immediately: otherwise draining it (or
+    // suspecting a compromise) still lets it pull every domain secret and TLS
+    // private key through the agent API.
+    let row: Option<(i32,)> = sqlx::query_as(
+        "SELECT 1 FROM edge_nodes WHERE auth_token = $1 AND status <> 'disabled' LIMIT 1",
+    )
+            .bind(token)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.is_some())
+}
+
+/// Resolve a per-node token to the node name it belongs to.
+pub async fn node_name_for_token(pool: &PgPool, token: &str) -> sqlx::Result<Option<String>> {
+    if token.is_empty() {
+        return Ok(None);
+    }
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT name FROM edge_nodes WHERE auth_token = $1 AND status <> 'disabled' LIMIT 1",
+    )
+            .bind(token)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|r| r.0))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn upsert_node_heartbeat(
+    pool: &PgPool,
+    node_key: &str,
+    region: &str,
+    ip: &str,
+    agent_url: &str,
+    cpu_usage: Option<f64>,
+    memory_usage: Option<f64>,
+    active_connections: Option<i64>,
+    version: &str,
+) -> sqlx::Result<NodeRow> {
+    let existing = sqlx::query_as::<_, NodeRow>(
+        r#"
+        SELECT id, name, region, ip, status, last_heartbeat,
+               COALESCE(agent_url, '') AS agent_url, auth_token,
+               cpu_usage, memory_usage, active_connections,
+               COALESCE(version, '') AS version, created_at,
+               COALESCE(public_ip, '') AS public_ip,
+               COALESCE(isp, '') AS isp,
+               COALESCE(country, 'CN') AS country,
+               COALESCE(province, '') AS province,
+               COALESCE(city, '') AS city,
+               COALESCE(weight, 100) AS weight,
+               COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps,
+               COALESCE(edge_profile, '') AS edge_profile,
+               region_id,
+               cache_policy_id,
+               cache_storage_policy_id
+        FROM edge_nodes WHERE name = $1
+        "#,
+    )
+    .bind(node_key)
+    .fetch_optional(pool)
+    .await?;
+
+    let node = existing.ok_or(sqlx::Error::RowNotFound)?;
+    // A disabled node keeps its status: it still reports telemetry but the
+    // edge stops serving traffic until an admin enables it again.
+    sqlx::query_as::<_, NodeRow>(
+        r#"
+            UPDATE edge_nodes
+            SET region = CASE WHEN region = '' THEN $2 ELSE region END,
+                ip = $3,
+                agent_url = CASE WHEN COALESCE(agent_url, '') = '' THEN $4 ELSE agent_url END,
+                status = CASE WHEN status = 'disabled' THEN 'disabled' ELSE 'online' END,
+                last_heartbeat = NOW(),
+                cpu_usage = $5,
+                memory_usage = $6,
+                active_connections = $7,
+                version = $8,
+                updated_at = NOW()
+            WHERE id = $1
+            RETURNING id, name, region, ip, status, last_heartbeat,
+                      COALESCE(agent_url, '') AS agent_url, auth_token,
+                      cpu_usage, memory_usage, active_connections,
+                      COALESCE(version, '') AS version, created_at,
+               COALESCE(public_ip, '') AS public_ip,
+               COALESCE(isp, '') AS isp,
+               COALESCE(country, 'CN') AS country,
+               COALESCE(province, '') AS province,
+               COALESCE(city, '') AS city,
+               COALESCE(weight, 100) AS weight,
+               COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps,
+               COALESCE(edge_profile, '') AS edge_profile,
+               region_id,
+               cache_policy_id,
+               cache_storage_policy_id
+            "#,
+    )
+    .bind(node.id)
+    .bind(region)
+    .bind(ip)
+    .bind(agent_url)
+    .bind(cpu_usage)
+    .bind(memory_usage)
+    .bind(active_connections)
+    .bind(version)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn list_rules_for_domain(
+    pool: &PgPool,
+    domain_id: Uuid,
+) -> sqlx::Result<Vec<CacheRuleRow>> {
+    sqlx::query_as::<_, CacheRuleRow>(
+        r#"
+        SELECT id, domain_id, path_pattern, match_type, ttl_seconds, priority, action, swr_seconds,
+               enabled, match_methods, match_query, browser_ttl_seconds, ignore_query, ignore_cookie, ignore_key_headers, match_content_type, note
+        FROM cache_rules
+        WHERE domain_id = $1
+        ORDER BY priority DESC
+        "#,
+    )
+    .bind(domain_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// Seed the local demo account, and only when explicitly asked for.
+///
+/// This used to unconditionally promote `demo@lagran.dev` (password `demo123`,
+/// printed to the startup log) to `admin`. On any deployment that forgot
+/// `SEED_DEMO=false` that is a remote root-equivalent account with a published
+/// password, so seeding now requires an explicit opt-in and the account is
+/// created as an ordinary user. An operator who wants an admin must promote it.
+pub async fn ensure_demo_user(pool: &PgPool) -> anyhow::Result<()> {
+    let exists = find_user_by_email(pool, "demo@lagran.dev").await?;
+    if exists.is_none() {
+        let hash = crate::utils::hash_password(DEMO_PASSWORD)
+            .map_err(|e| anyhow::anyhow!("bcrypt error: {e}"))?;
+        create_user(pool, "demo@lagran.dev", &hash, "Demo User").await?;
+        tracing::warn!(
+            email = "demo@lagran.dev",
+            "seeded demo account with the well-known demo password; it has no admin rights \
+             — change the password or delete the account"
+        );
+    }
+    Ok(())
+}
+
+/// Password for the optionally seeded demo account.
+const DEMO_PASSWORD: &str = "demo123";
+
+pub async fn ensure_demo_domain(pool: &PgPool) -> sqlx::Result<()> {
+    if get_domain_by_name(pool, "cdn.example.com").await?.is_none() {
+        let d = create_domain(pool, "cdn.example.com", "example.com", 443, "https", true).await?;
+        sqlx::query(
+            r#"
+            INSERT INTO cache_rules (domain_id, path_pattern, ttl_seconds, priority)
+            VALUES ($1, '/*', 60, 0)
+            "#,
+        )
+        .bind(d.id)
+        .execute(pool)
+        .await?;
+        tracing::info!("seeded demo domain cdn.example.com");
+    }
+    Ok(())
+}
+
+pub async fn update_domain(
+    pool: &PgPool,
+    id: Uuid,
+    origin_host: Option<&str>,
+    origin_port: Option<i32>,
+    origin_proto: Option<&str>,
+    ssl_enabled: Option<bool>,
+    status: Option<&str>,
+) -> sqlx::Result<Option<DomainRow>> {
+    let existing = get_domain(pool, id).await?;
+    let Some(e) = existing else {
+        return Ok(None);
+    };
+    let host = origin_host.unwrap_or(&e.origin_host);
+    let port = origin_port.unwrap_or(e.origin_port);
+    let proto = origin_proto.unwrap_or(&e.origin_proto);
+    let ssl = ssl_enabled.unwrap_or(e.ssl_enabled);
+    let st = status.unwrap_or(&e.status);
+
+    let row = sqlx::query_as::<_, DomainRow>(
+        r#"
+        UPDATE domains SET
+            origin_host = $2, origin_port = $3, origin_proto = $4,
+            ssl_enabled = $5, status = $6, updated_at = NOW()
+        WHERE id = $1
+        RETURNING id, project_id, name, origin_host, origin_port, origin_proto,
+                  ssl_enabled, status, created_at, rate_limit_rps, rate_limit_burst
+        "#,
+    )
+    .bind(id)
+    .bind(host)
+    .bind(port)
+    .bind(proto)
+    .bind(ssl)
+    .bind(st)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
+pub async fn list_all_rules(pool: &PgPool) -> sqlx::Result<Vec<(CacheRuleRow, String)>> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        id: Uuid,
+        domain_id: Uuid,
+        path_pattern: String,
+        match_type: String,
+        ttl_seconds: i64,
+        priority: i32,
+        action: String,
+        swr_seconds: i64,
+        enabled: bool,
+        match_methods: String,
+        match_query: String,
+        browser_ttl_seconds: i64,
+        ignore_query: Option<bool>,
+        ignore_cookie: bool,
+        ignore_key_headers: Option<String>,
+        match_content_type: String,
+        note: String,
+        domain_name: String,
+    }
+    let rows = sqlx::query_as::<_, Row>(
+        r#"
+        SELECT r.id, r.domain_id, r.path_pattern, r.match_type, r.ttl_seconds, r.priority,
+               r.action, r.swr_seconds, r.enabled, r.match_methods, r.match_query,
+               r.browser_ttl_seconds, r.ignore_query, r.ignore_cookie, r.ignore_key_headers, r.match_content_type, r.note, d.name AS domain_name
+        FROM cache_rules r
+        JOIN domains d ON d.id = r.domain_id
+        ORDER BY r.priority DESC, r.path_pattern
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            (
+                CacheRuleRow {
+                    id: r.id,
+                    domain_id: r.domain_id,
+                    path_pattern: r.path_pattern,
+                    match_type: r.match_type,
+                    ttl_seconds: r.ttl_seconds,
+                    priority: r.priority,
+                    action: r.action,
+                    swr_seconds: r.swr_seconds,
+                    enabled: r.enabled,
+                    match_methods: r.match_methods,
+                    match_query: r.match_query,
+                    browser_ttl_seconds: r.browser_ttl_seconds,
+                    ignore_query: r.ignore_query,
+                    ignore_cookie: r.ignore_cookie,
+                    ignore_key_headers: r.ignore_key_headers,
+                    match_content_type: r.match_content_type,
+                    note: r.note,
+                },
+                r.domain_name,
+            )
+        })
+        .collect())
+}
+
+pub async fn create_rule(
+    pool: &PgPool,
+    domain_id: Uuid,
+    input: &RuleInput<'_>,
+) -> sqlx::Result<CacheRuleRow> {
+    sqlx::query_as::<_, CacheRuleRow>(
+        r#"
+        INSERT INTO cache_rules
+            (domain_id, path_pattern, match_type, ttl_seconds, priority, action, swr_seconds,
+             enabled, match_methods, match_query, browser_ttl_seconds, ignore_query, ignore_cookie, ignore_key_headers, match_content_type, note)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+        RETURNING id, domain_id, path_pattern, match_type, ttl_seconds, priority, action, swr_seconds,
+                  enabled, match_methods, match_query, browser_ttl_seconds, ignore_query, ignore_cookie, ignore_key_headers, match_content_type, note
+        "#,
+    )
+    .bind(domain_id)
+    .bind(input.path_pattern)
+    .bind(input.match_type)
+    .bind(input.ttl_seconds)
+    .bind(input.priority)
+    .bind(input.action)
+    .bind(input.swr_seconds)
+    .bind(input.enabled)
+    .bind(input.match_methods)
+    .bind(input.match_query)
+    .bind(input.browser_ttl_seconds)
+    .bind(input.ignore_query)
+    .bind(input.ignore_cookie)
+    .bind(input.ignore_key_headers)
+    .bind(input.match_content_type)
+    .bind(input.note)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn update_rule(
+    pool: &PgPool,
+    id: Uuid,
+    input: &RuleInput<'_>,
+) -> sqlx::Result<Option<CacheRuleRow>> {
+    sqlx::query_as::<_, CacheRuleRow>(
+        r#"
+        UPDATE cache_rules SET
+            path_pattern = $2, match_type = $3, ttl_seconds = $4, priority = $5, action = $6,
+            swr_seconds = $7, enabled = $8, match_methods = $9, match_query = $10,
+            browser_ttl_seconds = $11, ignore_query = $12, ignore_cookie = $13,
+            ignore_key_headers = $14, match_content_type = $15, note = $16
+        WHERE id = $1
+        RETURNING id, domain_id, path_pattern, match_type, ttl_seconds, priority, action, swr_seconds,
+                  enabled, match_methods, match_query, browser_ttl_seconds, ignore_query, ignore_cookie, ignore_key_headers, match_content_type, note
+        "#,
+    )
+    .bind(id)
+    .bind(input.path_pattern)
+    .bind(input.match_type)
+    .bind(input.ttl_seconds)
+    .bind(input.priority)
+    .bind(input.action)
+    .bind(input.swr_seconds)
+    .bind(input.enabled)
+    .bind(input.match_methods)
+    .bind(input.match_query)
+    .bind(input.browser_ttl_seconds)
+    .bind(input.ignore_query)
+    .bind(input.ignore_cookie)
+    .bind(input.ignore_key_headers)
+    .bind(input.match_content_type)
+    .bind(input.note)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn get_rule(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<CacheRuleRow>> {
+    sqlx::query_as::<_, CacheRuleRow>(
+        r#"
+        SELECT id, domain_id, path_pattern, match_type, ttl_seconds, priority, action, swr_seconds,
+               enabled, match_methods, match_query, browser_ttl_seconds, ignore_query, ignore_cookie, ignore_key_headers, match_content_type, note
+        FROM cache_rules WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn delete_rule(pool: &PgPool, id: Uuid) -> sqlx::Result<u64> {
+    let r = sqlx::query("DELETE FROM cache_rules WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected())
+}
+
+pub async fn mark_stale_nodes_offline(pool: &PgPool, timeout_secs: i64) -> sqlx::Result<u64> {
+    let r = sqlx::query(
+        r#"
+        UPDATE edge_nodes
+        SET status = 'offline'
+        WHERE status = 'online'
+          AND (last_heartbeat IS NULL
+               OR last_heartbeat < NOW() - make_interval(secs => $1))
+        "#,
+    )
+    .bind(timeout_secs)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected())
+}
+
+pub async fn count_domains(pool: &PgPool) -> sqlx::Result<i64> {
+    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM domains")
+        .fetch_one(pool)
+        .await?;
+    Ok(n)
+}
+
+pub async fn count_online_nodes(pool: &PgPool) -> sqlx::Result<i64> {
+    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM edge_nodes WHERE status = 'online'")
+        .fetch_one(pool)
+        .await?;
+    Ok(n)
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct CertRow {
+    pub id: Uuid,
+    pub domain_id: Option<Uuid>,
+    pub domain_name: String,
+    pub cert_pem: String,
+    pub key_pem: String,
+    pub issuer: String,
+    pub not_before: Option<DateTime<Utc>>,
+    pub not_after: Option<DateTime<Utc>>,
+    pub status: String,
+    pub auto_renew: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+pub async fn insert_metrics(
+    pool: &PgPool,
+    node_name: &str,
+    domain: &str,
+    requests: i64,
+    cache_hits: i64,
+    cache_misses: i64,
+    bytes_sent: i64,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO edge_metrics (node_name, domain, requests, cache_hits, cache_misses, bytes_sent)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        "#,
+    )
+    .bind(node_name)
+    .bind(domain)
+    .bind(requests)
+    .bind(cache_hits)
+    .bind(cache_misses)
+    .bind(bytes_sent)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Insert a batch of per-domain metric samples in one transaction.
+pub async fn insert_metrics_batch(
+    pool: &PgPool,
+    rows: &[(String, String, i64, i64, i64, i64)],
+) -> sqlx::Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut nodes = Vec::with_capacity(rows.len());
+    let mut domains = Vec::with_capacity(rows.len());
+    let mut requests = Vec::with_capacity(rows.len());
+    let mut hits = Vec::with_capacity(rows.len());
+    let mut misses = Vec::with_capacity(rows.len());
+    let mut bytes = Vec::with_capacity(rows.len());
+    for (node, domain, req, hit, miss, sent) in rows {
+        nodes.push(node.clone());
+        domains.push(domain.clone());
+        requests.push(*req);
+        hits.push(*hit);
+        misses.push(*miss);
+        bytes.push(*sent);
+    }
+    sqlx::query(
+        r#"
+        INSERT INTO edge_metrics
+          (node_name, domain, requests, cache_hits, cache_misses, bytes_sent)
+        SELECT t.node_name, t.domain, t.requests, t.cache_hits, t.cache_misses, t.bytes_sent
+        FROM UNNEST(
+          $1::text[], $2::text[], $3::bigint[], $4::bigint[], $5::bigint[], $6::bigint[]
+        ) AS t(node_name, domain, requests, cache_hits, cache_misses, bytes_sent)
+        "#,
+    )
+    .bind(nodes)
+    .bind(domains)
+    .bind(requests)
+    .bind(hits)
+    .bind(misses)
+    .bind(bytes)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn sum_metrics(pool: &PgPool) -> sqlx::Result<(i64, i64, i64, i64)> {
+    #[derive(sqlx::FromRow)]
+    struct S {
+        requests: Option<i64>,
+        hits: Option<i64>,
+        misses: Option<i64>,
+        bytes: Option<i64>,
+    }
+    let s = sqlx::query_as::<_, S>(
+        r#"
+        SELECT
+            COALESCE(SUM(requests), 0)::bigint AS requests,
+            COALESCE(SUM(cache_hits), 0)::bigint AS hits,
+            COALESCE(SUM(cache_misses), 0)::bigint AS misses,
+            COALESCE(SUM(bytes_sent), 0)::bigint AS bytes
+        FROM edge_metrics
+        WHERE reported_at > NOW() - INTERVAL '24 hours'
+        "#,
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok((
+        s.requests.unwrap_or(0),
+        s.hits.unwrap_or(0),
+        s.misses.unwrap_or(0),
+        s.bytes.unwrap_or(0),
+    ))
+}
+
+pub async fn sum_metrics_for(
+    pool: &PgPool,
+    hosts: &[String],
+) -> sqlx::Result<(i64, i64, i64, i64)> {
+    #[derive(sqlx::FromRow)]
+    struct S {
+        requests: Option<i64>,
+        hits: Option<i64>,
+        misses: Option<i64>,
+        bytes: Option<i64>,
+    }
+    let s = sqlx::query_as::<_, S>(
+        r#"
+        SELECT
+            COALESCE(SUM(requests), 0)::bigint AS requests,
+            COALESCE(SUM(cache_hits), 0)::bigint AS hits,
+            COALESCE(SUM(cache_misses), 0)::bigint AS misses,
+            COALESCE(SUM(bytes_sent), 0)::bigint AS bytes
+        FROM edge_metrics
+        WHERE reported_at > NOW() - INTERVAL '24 hours'
+          AND domain = ANY($1)
+        "#,
+    )
+    .bind(hosts)
+    .fetch_one(pool)
+    .await?;
+    Ok((
+        s.requests.unwrap_or(0),
+        s.hits.unwrap_or(0),
+        s.misses.unwrap_or(0),
+        s.bytes.unwrap_or(0),
+    ))
+}
+
+pub async fn metrics_by_domain_for(
+    pool: &PgPool,
+    hosts: &[String],
+    hours: i32,
+) -> sqlx::Result<Vec<(String, i64, i64, i64, i64)>> {
+    sqlx::query_as(
+        r#"
+        SELECT COALESCE(NULLIF(domain, ''), '(unknown)') AS domain,
+               COALESCE(SUM(requests), 0)::bigint,
+               COALESCE(SUM(cache_hits), 0)::bigint,
+               COALESCE(SUM(cache_misses), 0)::bigint,
+               COALESCE(SUM(bytes_sent), 0)::bigint
+        FROM edge_metrics
+        WHERE reported_at > NOW() - make_interval(hours => $2)
+          AND domain = ANY($1)
+        GROUP BY 1
+        ORDER BY 2 DESC
+        "#,
+    )
+    .bind(hosts)
+    .bind(hours)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn metrics_timeseries(
+    pool: &PgPool,
+    hosts: Option<&[String]>,
+    start_hours: i32,
+    end_hours: i32,
+    bucket_secs: i32,
+) -> sqlx::Result<Vec<(DateTime<Utc>, i64, i64, i64, i64)>> {
+    sqlx::query_as(
+        r#"
+        SELECT
+            to_timestamp(floor(extract(epoch FROM reported_at) / $3) * $3) AS bucket,
+            COALESCE(SUM(requests), 0)::bigint,
+            COALESCE(SUM(cache_hits), 0)::bigint,
+            COALESCE(SUM(cache_misses), 0)::bigint,
+            COALESCE(SUM(bytes_sent), 0)::bigint
+        FROM edge_metrics
+        WHERE reported_at >= NOW() - make_interval(hours => $1)
+          AND reported_at < NOW() - make_interval(hours => $2)
+          AND ($4::text[] IS NULL OR domain = ANY($4))
+        GROUP BY 1
+        ORDER BY 1
+        "#,
+    )
+    .bind(start_hours)
+    .bind(end_hours)
+    .bind(bucket_secs)
+    .bind(hosts)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn list_certs(pool: &PgPool) -> sqlx::Result<Vec<CertRow>> {
+    sqlx::query_as::<_, CertRow>(
+        r#"
+        SELECT id, domain_id, domain_name, cert_pem, key_pem, issuer,
+               not_before, not_after, status, auto_renew, created_at
+        FROM certificates
+        ORDER BY created_at DESC
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn get_cert(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<CertRow>> {
+    sqlx::query_as::<_, CertRow>(
+        r#"
+        SELECT id, domain_id, domain_name, cert_pem, key_pem, issuer,
+               not_before, not_after, status, auto_renew, created_at
+        FROM certificates WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn update_cert_material(
+    pool: &PgPool,
+    id: Uuid,
+    cert_pem: &str,
+    key_pem: &str,
+    issuer: &str,
+    not_before: DateTime<Utc>,
+    not_after: DateTime<Utc>,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE certificates
+        SET cert_pem = $2,
+            key_pem = $3,
+            issuer = $4,
+            not_before = $5,
+            not_after = $6,
+            status = 'active',
+            updated_at = NOW()
+        WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .bind(cert_pem)
+    .bind(key_pem)
+    .bind(issuer)
+    .bind(not_before)
+    .bind(not_after)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn get_cert_by_domain(pool: &PgPool, domain_name: &str) -> sqlx::Result<Option<CertRow>> {
+    sqlx::query_as::<_, CertRow>(
+        r#"
+        SELECT id, domain_id, domain_name, cert_pem, key_pem, issuer,
+               not_before, not_after, status, auto_renew, created_at
+        FROM certificates
+        WHERE domain_name = $1 AND status = 'active'
+        ORDER BY updated_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(domain_name)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Parse the certificate's real validity window (first certificate in the PEM).
+fn parse_cert_validity(cert_pem: &str) -> Option<(chrono::DateTime<Utc>, chrono::DateTime<Utc>)> {
+    let certs: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+        .collect::<Result<_, _>>()
+        .ok()?;
+    let der = certs.first()?;
+    let (_, parsed) = x509_parser::parse_x509_certificate(der.as_ref()).ok()?;
+    let validity = parsed.validity();
+    let start = chrono::DateTime::<Utc>::from_timestamp(validity.not_before.timestamp(), 0)?;
+    let end = chrono::DateTime::<Utc>::from_timestamp(validity.not_after.timestamp(), 0)?;
+    Some((start, end))
+}
+
+pub async fn create_cert(
+    pool: &PgPool,
+    domain_id: Option<Uuid>,
+    domain_name: &str,
+    cert_pem: &str,
+    key_pem: &str,
+    issuer: &str,
+    auto_renew: bool,
+) -> sqlx::Result<CertRow> {
+    // Simple expiry parse: if PEM looks present mark active for 90 days
+    // Real validity comes from the certificate itself. A fabricated now+90d
+    // made the console and expiry alerts report a date that had nothing to do
+    // with the certificate.
+    let validity = if cert_pem.contains("BEGIN CERTIFICATE") && key_pem.contains("BEGIN") {
+        parse_cert_validity(cert_pem)
+    } else {
+        None
+    };
+    let status = if validity.is_some() {
+        "active"
+    } else if cert_pem.is_empty() {
+        "pending"
+    } else {
+        "error"
+    };
+    let (not_before, not_after) = match validity {
+        Some((start, end)) => (Some(start), Some(end)),
+        None => (None, None),
+    };
+
+    // Serialise "replace the active certificate" per domain. Two concurrent
+    // uploads used to leave two `active` rows, and `get_cert_by_domain` picks
+    // the newest by `updated_at`, so whichever landed last silently shadowed
+    // the other. Superseding the old row in the same transaction guarantees at
+    // most one active certificate per domain name.
+    let mut tx = pool.begin().await?;
+    if let Some(id) = domain_id {
+        sqlx::query("SELECT 1 FROM domains WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    } else {
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+            .bind(domain_name)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if status == "active" {
+        sqlx::query(
+            "UPDATE certificates SET status = 'superseded'
+             WHERE lower(domain_name) = lower($1) AND status = 'active'",
+        )
+        .bind(domain_name)
+        .execute(&mut *tx)
+        .await?;
+    }
+    let row = sqlx::query_as::<_, CertRow>(
+        r#"
+        INSERT INTO certificates
+            (domain_id, domain_name, cert_pem, key_pem, issuer, not_before, not_after, status, auto_renew)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        RETURNING id, domain_id, domain_name, cert_pem, key_pem, issuer,
+                  not_before, not_after, status, auto_renew, created_at
+        "#,
+    )
+    .bind(domain_id)
+    .bind(domain_name)
+    .bind(cert_pem)
+    .bind(key_pem)
+    .bind(issuer)
+    .bind(not_before)
+    .bind(not_after)
+    .bind(status)
+    .bind(auto_renew)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(row)
+}
+
+pub async fn delete_cert(pool: &PgPool, id: Uuid) -> sqlx::Result<u64> {
+    let r = sqlx::query("DELETE FROM certificates WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected())
+}
+
+pub async fn put_acme_challenge(
+    pool: &PgPool,
+    token: &str,
+    key_auth: &str,
+    domain: &str,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO acme_challenges (token, key_authorization, domain_name, expires_at)
+        VALUES ($1, $2, $3, NOW() + INTERVAL '1 hour')
+        ON CONFLICT (token) DO UPDATE
+          SET key_authorization = EXCLUDED.key_authorization,
+              domain_name = EXCLUDED.domain_name,
+              expires_at = EXCLUDED.expires_at
+        "#,
+    )
+    .bind(token)
+    .bind(key_auth)
+    .bind(domain)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn get_acme_challenge(pool: &PgPool, token: &str) -> sqlx::Result<Option<String>> {
+    let row: Option<(String,)> = sqlx::query_as(
+        r#"
+        SELECT key_authorization FROM acme_challenges
+        WHERE token = $1 AND expires_at > NOW()
+        "#,
+    )
+    .bind(token)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| r.0))
+}
+
+pub async fn get_acme_account(
+    pool: &PgPool,
+    directory: &str,
+) -> sqlx::Result<Option<(String, String)>> {
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT key_pem, kid FROM acme_accounts WHERE directory = $1")
+            .bind(directory)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row)
+}
+
+pub async fn save_acme_account(
+    pool: &PgPool,
+    directory: &str,
+    key_pem: &str,
+    kid: &str,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO acme_accounts (directory, key_pem, kid)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (directory) DO UPDATE
+          SET key_pem = EXCLUDED.key_pem,
+              kid = EXCLUDED.kid,
+              updated_at = NOW()
+        "#,
+    )
+    .bind(directory)
+    .bind(key_pem)
+    .bind(kid)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct LoginLogRow {
+    pub id: i64,
+    pub created_at: DateTime<Utc>,
+    pub user_id: Option<Uuid>,
+    pub email: String,
+    pub client_ip: String,
+    pub user_agent: String,
+    pub success: bool,
+    pub reason: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_login_log(
+    pool: &PgPool,
+    user_id: Option<Uuid>,
+    email: &str,
+    client_ip: &str,
+    user_agent: &str,
+    success: bool,
+    reason: &str,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO login_logs (user_id, email, client_ip, user_agent, success, reason)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        "#,
+    )
+    .bind(user_id)
+    .bind(email)
+    .bind(client_ip)
+    .bind(user_agent)
+    .bind(success)
+    .bind(reason)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn list_login_logs(
+    pool: &PgPool,
+    limit: i64,
+    owner_email: Option<&str>,
+) -> sqlx::Result<Vec<LoginLogRow>> {
+    sqlx::query_as::<_, LoginLogRow>(
+        r#"
+        SELECT id, created_at, user_id, email, client_ip, user_agent, success, reason
+        FROM login_logs
+        WHERE ($2::text IS NULL OR email = $2)
+        ORDER BY created_at DESC, id DESC
+        LIMIT $1
+        "#,
+    )
+    .bind(limit.clamp(1, 1000))
+    .bind(owner_email)
+    .fetch_all(pool)
+    .await
+}
+
+/// Retention for authentication attempt history.
+pub async fn purge_old_login_logs(pool: &PgPool, days: i64) -> sqlx::Result<u64> {
+    let days = days.max(1);
+    let result = sqlx::query(
+        r#"DELETE FROM login_logs WHERE created_at < NOW() - ($1::text || ' days')::interval"#,
+    )
+    .bind(days.to_string())
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct AuditRow {
+    pub id: Uuid,
+    pub actor: String,
+    pub action: String,
+    pub resource: String,
+    pub detail: String,
+    pub ip: String,
+    pub created_at: DateTime<Utc>,
+}
+
+pub async fn insert_audit(
+    pool: &PgPool,
+    actor: &str,
+    action: &str,
+    resource: &str,
+    detail: &str,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO audit_logs (actor, action, resource, detail)
+        VALUES ($1, $2, $3, $4)
+        "#,
+    )
+    .bind(actor)
+    .bind(action)
+    .bind(resource)
+    .bind(detail)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn list_audit(pool: &PgPool, limit: i64) -> sqlx::Result<Vec<AuditRow>> {
+    sqlx::query_as::<_, AuditRow>(
+        r#"
+        SELECT id, actor, action, resource, detail, ip, created_at
+        FROM audit_logs
+        ORDER BY created_at DESC
+        LIMIT $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn set_domain_display_name(
+    pool: &PgPool,
+    id: Uuid,
+    display_name: &str,
+) -> sqlx::Result<u64> {
+    let r = sqlx::query(
+        r#"
+        UPDATE domains
+        SET display_name = $2, updated_at = NOW()
+        WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .bind(display_name)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected())
+}
+
+pub async fn set_domain_status(
+    pool: &PgPool,
+    id: Uuid,
+    status: &str,
+) -> sqlx::Result<Option<DomainRow>> {
+    sqlx::query_as::<_, DomainRow>(
+        r#"
+        UPDATE domains SET status = $2, updated_at = NOW()
+        WHERE id = $1
+        RETURNING id, project_id, name, origin_host, origin_port, origin_proto,
+                  ssl_enabled, status, created_at, rate_limit_rps, rate_limit_burst
+        "#,
+    )
+    .bind(id)
+    .bind(status)
+    .fetch_optional(pool)
+    .await
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ProjectRow {
+    pub id: Uuid,
+    pub name: String,
+    pub owner_id: Uuid,
+    pub created_at: DateTime<Utc>,
+    pub domain_count: Option<i64>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct OriginHealthRow {
+    pub domain_name: String,
+    pub origin_url: String,
+    pub healthy: bool,
+    pub latency_ms: i32,
+    pub last_check_at: Option<DateTime<Utc>>,
+    pub last_error: String,
+    pub consecutive_fails: i32,
+}
+
+pub async fn list_projects_for_user(pool: &PgPool, user_id: Uuid) -> sqlx::Result<Vec<ProjectRow>> {
+    sqlx::query_as::<_, ProjectRow>(
+        r#"
+        SELECT p.id, p.name, p.owner_id, p.created_at,
+               (SELECT COUNT(*) FROM domains d WHERE d.project_id = p.id) AS domain_count
+        FROM projects p
+        WHERE p.owner_id = $1
+           OR EXISTS (
+             SELECT 1 FROM project_members m
+             WHERE m.project_id = p.id AND m.user_id = $1
+           )
+        ORDER BY p.created_at DESC
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn list_all_projects(pool: &PgPool) -> sqlx::Result<Vec<ProjectRow>> {
+    sqlx::query_as::<_, ProjectRow>(
+        r#"
+        SELECT p.id, p.name, p.owner_id, p.created_at,
+               (SELECT COUNT(*) FROM domains d WHERE d.project_id = p.id) AS domain_count
+        FROM projects p
+        ORDER BY p.created_at DESC
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn create_project(pool: &PgPool, name: &str, owner_id: Uuid) -> sqlx::Result<ProjectRow> {
+    let row = sqlx::query_as::<_, ProjectRow>(
+        r#"
+        INSERT INTO projects (name, owner_id)
+        VALUES ($1, $2)
+        RETURNING id, name, owner_id, created_at, 0::bigint AS domain_count
+        "#,
+    )
+    .bind(name)
+    .bind(owner_id)
+    .fetch_one(pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO project_members (project_id, user_id, role) VALUES ($1, $2, 'owner') ON CONFLICT DO NOTHING",
+    )
+    .bind(row.id)
+    .bind(owner_id)
+    .execute(pool)
+    .await?;
+    Ok(row)
+}
+
+pub async fn get_project(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<ProjectRow>> {
+    sqlx::query_as::<_, ProjectRow>(
+        r#"
+        SELECT p.id, p.name, p.owner_id, p.created_at,
+               (SELECT COUNT(*) FROM domains d WHERE d.project_id = p.id) AS domain_count
+        FROM projects p WHERE p.id = $1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn delete_project(pool: &PgPool, id: Uuid, owner_id: Uuid) -> sqlx::Result<u64> {
+    let r = sqlx::query("DELETE FROM projects WHERE id = $1 AND owner_id = $2")
+        .bind(id)
+        .bind(owner_id)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected())
+}
+
+pub async fn delete_project_any(pool: &PgPool, id: Uuid) -> sqlx::Result<u64> {
+    let r = sqlx::query("DELETE FROM projects WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected())
+}
+
+pub async fn user_can_access_project(
+    pool: &PgPool,
+    project_id: Uuid,
+    user_id: Uuid,
+) -> sqlx::Result<bool> {
+    let (n,): (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*) FROM projects p
+        WHERE p.id = $1 AND (
+          p.owner_id = $2 OR EXISTS (
+            SELECT 1 FROM project_members m WHERE m.project_id = p.id AND m.user_id = $2
+          )
+        )
+        "#,
+    )
+    .bind(project_id)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(n > 0)
+}
+
+pub async fn list_domains_by_project(
+    pool: &PgPool,
+    project_id: Uuid,
+) -> sqlx::Result<Vec<DomainRow>> {
+    sqlx::query_as::<_, DomainRow>(
+        r#"
+        SELECT id, project_id, name, origin_host, origin_port, origin_proto,
+               ssl_enabled, status, created_at, rate_limit_rps, rate_limit_burst,
+               COALESCE(origins, '[]'::jsonb) AS origins, COALESCE(backup_origin_host, '') AS backup_origin_host,
+               COALESCE(backup_origin_port, 0) AS backup_origin_port,
+               COALESCE(backup_origin_proto, 'http') AS backup_origin_proto,
+               COALESCE(shield_url, '') AS shield_url,
+               published_version_id
+        FROM domains WHERE project_id = $1
+        ORDER BY created_at DESC
+        "#,
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn assign_domain_project(
+    pool: &PgPool,
+    domain_id: Uuid,
+    project_id: Option<Uuid>,
+) -> sqlx::Result<u64> {
+    let r = sqlx::query("UPDATE domains SET project_id = $2, updated_at = NOW() WHERE id = $1")
+        .bind(domain_id)
+        .bind(project_id)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected())
+}
+
+pub async fn upsert_origin_health(
+    pool: &PgPool,
+    domain_name: &str,
+    origin_url: &str,
+    healthy: bool,
+    latency_ms: i32,
+    last_error: &str,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO origin_health (domain_name, origin_url, healthy, latency_ms, last_check_at, last_error, consecutive_fails)
+        VALUES ($1, $2, $3, $4, NOW(), $5, CASE WHEN $3 THEN 0 ELSE 1 END)
+        ON CONFLICT (domain_name, origin_url) DO UPDATE SET
+          healthy = EXCLUDED.healthy,
+          latency_ms = EXCLUDED.latency_ms,
+          last_check_at = NOW(),
+          last_error = EXCLUDED.last_error,
+          consecutive_fails = CASE
+            WHEN EXCLUDED.healthy THEN 0
+            ELSE origin_health.consecutive_fails + 1
+          END
+        "#,
+    )
+    .bind(domain_name)
+    .bind(origin_url)
+    .bind(healthy)
+    .bind(latency_ms)
+    .bind(last_error)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn list_origin_health(pool: &PgPool) -> sqlx::Result<Vec<OriginHealthRow>> {
+    sqlx::query_as::<_, OriginHealthRow>(
+        r#"
+        SELECT oh.domain_name, oh.origin_url, oh.healthy, oh.latency_ms,
+               oh.last_check_at, oh.last_error, oh.consecutive_fails
+        FROM origin_health oh
+        JOIN domains d ON d.name = oh.domain_name
+        ORDER BY oh.domain_name
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// Resolve firing events tied to a domain that is being deleted. Historical
+/// resolved events remain available for audit, but nothing stays "firing".
+pub async fn resolve_domain_alert_events(pool: &PgPool, domain_name: &str) -> sqlx::Result<u64> {
+    let result = sqlx::query(
+        r#"
+        UPDATE alert_events
+        SET status = 'resolved', resolved_at = NOW()
+        WHERE status = 'firing'
+          AND split_part(fingerprint, '|', 1) = $1
+        "#,
+    )
+    .bind(domain_name)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+pub async fn get_domain_rate_limit(pool: &PgPool, name: &str) -> sqlx::Result<Option<(i32, i32)>> {
+    let row: Option<(i32, i32)> =
+        sqlx::query_as("SELECT rate_limit_rps, rate_limit_burst FROM domains WHERE name = $1")
+            .bind(name)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row)
+}
+
+pub async fn set_domain_rate_limit(
+    pool: &PgPool,
+    id: Uuid,
+    rps: i32,
+    burst: i32,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE domains SET rate_limit_rps = $2, rate_limit_burst = $3, updated_at = NOW() WHERE id = $1",
+    )
+    .bind(id)
+    .bind(rps)
+    .bind(burst)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn create_domain_with_project(
+    pool: &PgPool,
+    name: &str,
+    origin_host: &str,
+    origin_port: i32,
+    origin_proto: &str,
+    ssl: bool,
+    project_id: Option<Uuid>,
+) -> sqlx::Result<DomainRow> {
+    let mut tx = pool.begin().await?;
+    let row = sqlx::query_as::<_, DomainRow>(
+        r#"
+        INSERT INTO domains (name, origin_host, origin_port, origin_proto, ssl_enabled, status, project_id)
+        VALUES ($1, $2, $3, $4, $5, 'active', $6)
+        RETURNING id, project_id, name, origin_host, origin_port, origin_proto,
+                  ssl_enabled, status, created_at, rate_limit_rps, rate_limit_burst
+        "#,
+    )
+    .bind(name)
+    .bind(origin_host)
+    .bind(origin_port)
+    .bind(origin_proto)
+    .bind(ssl)
+    .bind(project_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    sqlx::query(
+        r#"
+        INSERT INTO domain_hostnames (domain_id, hostname, is_primary)
+        VALUES ($1, $2, TRUE)
+        "#,
+    )
+    .bind(row.id)
+    .bind(name)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(row)
+}
+
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct DomainHostnameRow {
+    pub id: Uuid,
+    pub domain_id: Uuid,
+    pub hostname: String,
+    pub is_primary: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+pub async fn list_domain_hostnames(
+    pool: &PgPool,
+    domain_id: Uuid,
+) -> sqlx::Result<Vec<DomainHostnameRow>> {
+    sqlx::query_as::<_, DomainHostnameRow>(
+        r#"
+        SELECT id, domain_id, hostname, is_primary, created_at
+        FROM domain_hostnames
+        WHERE domain_id = $1
+        ORDER BY is_primary DESC, created_at ASC
+        "#,
+    )
+    .bind(domain_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// All hostnames for every site, for the config publisher / list DTO batch.
+pub async fn list_domain_hostnames_all(pool: &PgPool) -> sqlx::Result<Vec<DomainHostnameRow>> {
+    sqlx::query_as::<_, DomainHostnameRow>(
+        r#"
+        SELECT id, domain_id, hostname, is_primary, created_at
+        FROM domain_hostnames
+        ORDER BY domain_id, is_primary DESC, created_at ASC
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn hostname_taken(pool: &PgPool, hostname: &str) -> sqlx::Result<bool> {
+    let exists: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS(
+            SELECT 1 FROM domain_hostnames
+            WHERE lower(rtrim(btrim(hostname), '.')) = lower(rtrim(btrim($1), '.'))
+        ) OR EXISTS(
+            SELECT 1 FROM domains
+            WHERE lower(rtrim(btrim(name), '.')) = lower(rtrim(btrim($1), '.'))
+        )
+        "#,
+    )
+    .bind(hostname)
+    .fetch_one(pool)
+    .await?;
+    Ok(exists)
+}
+
+pub async fn add_domain_hostname(
+    pool: &PgPool,
+    domain_id: Uuid,
+    hostname: &str,
+    is_primary: bool,
+) -> sqlx::Result<DomainHostnameRow> {
+    sqlx::query_as::<_, DomainHostnameRow>(
+        r#"
+        INSERT INTO domain_hostnames (domain_id, hostname, is_primary)
+        VALUES ($1, $2, $3)
+        RETURNING id, domain_id, hostname, is_primary, created_at
+        "#,
+    )
+    .bind(domain_id)
+    .bind(hostname)
+    .bind(is_primary)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn delete_domain_hostname(pool: &PgPool, domain_id: Uuid, id: Uuid) -> sqlx::Result<u64> {
+    let r = sqlx::query(
+        r#"
+        DELETE FROM domain_hostnames
+        WHERE id = $1 AND domain_id = $2 AND is_primary = FALSE
+        "#,
+    )
+    .bind(id)
+    .bind(domain_id)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected())
+}
+
+pub async fn set_primary_hostname(
+    pool: &PgPool,
+    domain_id: Uuid,
+    hostname: &str,
+) -> sqlx::Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("UPDATE domain_hostnames SET is_primary = FALSE WHERE domain_id = $1")
+        .bind(domain_id)
+        .execute(&mut *tx)
+        .await?;
+    let updated = sqlx::query(
+        r#"
+        UPDATE domain_hostnames
+        SET is_primary = TRUE
+        WHERE domain_id = $1 AND lower(rtrim(btrim(hostname), '.')) = lower(rtrim(btrim($2), '.'))
+        "#,
+    )
+    .bind(domain_id)
+    .bind(hostname)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if updated == 0 {
+        sqlx::query(
+            r#"
+            INSERT INTO domain_hostnames (domain_id, hostname, is_primary)
+            VALUES ($1, $2, TRUE)
+            "#,
+        )
+        .bind(domain_id)
+        .bind(hostname)
+        .execute(&mut *tx)
+        .await?;
+    }
+    sqlx::query("UPDATE domains SET name = $2, updated_at = NOW() WHERE id = $1")
+        .bind(domain_id)
+        .bind(hostname)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn list_certs_for_domain_id(
+    pool: &PgPool,
+    domain_id: Uuid,
+) -> sqlx::Result<Vec<CertRow>> {
+    sqlx::query_as::<_, CertRow>(
+        r#"
+        SELECT id, domain_id, domain_name, cert_pem, key_pem, issuer,
+               not_before, not_after, status, auto_renew, created_at
+        FROM certificates
+        WHERE domain_id = $1
+           OR lower(domain_name) IN (
+                SELECT lower(hostname) FROM domain_hostnames WHERE domain_id = $1
+           )
+           OR lower(domain_name) = (
+                SELECT lower(name) FROM domains WHERE id = $1
+           )
+        ORDER BY created_at DESC
+        "#,
+    )
+    .bind(domain_id)
+    .fetch_all(pool)
+    .await
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct DomainSettingsRow {
+    pub ignore_query_string: bool,
+    pub cache_key_ignore_headers: String,
+    pub cors_origins: String,
+    pub hotlink_allow_referers: String,
+    pub origin_timeout_ms: i32,
+    pub custom_headers: String,
+    pub rate_limit_rps: i32,
+    pub rate_limit_burst: i32,
+    pub cc_enabled: bool,
+    pub cc_rps: i32,
+    pub cc_burst: i32,
+    pub cc_ban_after: i32,
+    pub cc_ban_seconds: i32,
+    pub cc_mode: String,
+    pub cc_allow_ips: String,
+    #[sqlx(default)]
+    pub shield_url: String,
+    #[sqlx(default)]
+    pub signed_url_enabled: bool,
+    #[sqlx(default)]
+    pub signed_url_mode: String,
+    #[sqlx(default)]
+    pub signed_url_paths: String,
+    #[sqlx(default)]
+    pub signed_url_secret: String,
+    #[sqlx(default)]
+    pub signed_url_previous_secret: String,
+    #[sqlx(default)]
+    pub signed_url_ttl_secs: i32,
+    #[sqlx(default)]
+    pub origin_auth_header: String,
+    #[sqlx(default)]
+    pub origin_auth_value: String,
+    #[sqlx(default)]
+    pub hotlink_signature_enabled: bool,
+    #[sqlx(default)]
+    pub websocket_enabled: bool,
+    #[sqlx(default)]
+    pub http2_enabled: bool,
+    #[sqlx(default)]
+    pub http3_enabled: bool,
+    #[sqlx(default)]
+    pub gzip_enabled: bool,
+    #[sqlx(default)]
+    pub image_webp_enabled: bool,
+    #[sqlx(default)]
+    pub min_tls_version: String,
+    #[sqlx(default)]
+    pub access_mode: String,
+    #[sqlx(default)]
+    pub dns_zone_id: Option<Uuid>,
+    #[sqlx(default)]
+    pub auto_https: bool,
+    #[sqlx(default)]
+    pub cert_status: String,
+    #[sqlx(default)]
+    pub cert_last_error: String,
+    #[sqlx(default)]
+    pub access_log_enabled: bool,
+    #[sqlx(default)]
+    pub cache_enabled: Option<bool>,
+    /// Site-bound default cache conditions pack (`cache_policies`), not node disk.
+    #[sqlx(default)]
+    pub cache_policy_id: Option<Uuid>,
+}
+
+impl Default for DomainSettingsRow {
+    fn default() -> Self {
+        Self {
+            ignore_query_string: false,
+            cache_key_ignore_headers: String::new(),
+            cors_origins: String::new(),
+            hotlink_allow_referers: String::new(),
+            origin_timeout_ms: 0,
+            custom_headers: String::new(),
+            rate_limit_rps: 0,
+            rate_limit_burst: 0,
+            cc_enabled: false,
+            cc_rps: 20,
+            cc_burst: 40,
+            cc_ban_after: 5,
+            cc_ban_seconds: 300,
+            cc_mode: "block".into(),
+            cc_allow_ips: String::new(),
+            shield_url: String::new(),
+            signed_url_enabled: false,
+            signed_url_mode: "off".into(),
+            signed_url_paths: String::new(),
+            signed_url_secret: String::new(),
+            signed_url_previous_secret: String::new(),
+            signed_url_ttl_secs: 3600,
+            origin_auth_header: String::new(),
+            origin_auth_value: String::new(),
+            hotlink_signature_enabled: false,
+            websocket_enabled: true,
+            http2_enabled: true,
+            http3_enabled: false,
+            gzip_enabled: true,
+            image_webp_enabled: false,
+            min_tls_version: "1.2".into(),
+            access_mode: "cname".into(),
+            dns_zone_id: None,
+            auto_https: true,
+            cert_status: "none".into(),
+            cert_last_error: String::new(),
+            access_log_enabled: true,
+            cache_enabled: Some(true),
+            cache_policy_id: None,
+        }
+    }
+}
+
+pub async fn get_domain_settings(
+    pool: &PgPool,
+    name: &str,
+) -> sqlx::Result<Option<DomainSettingsRow>> {
+    sqlx::query_as::<_, DomainSettingsRow>(
+        r#"
+        SELECT ignore_query_string, cache_key_ignore_headers, cors_origins,
+               hotlink_allow_referers, origin_timeout_ms, custom_headers,
+               rate_limit_rps, rate_limit_burst,
+               cc_enabled, cc_rps, cc_burst, cc_ban_after, cc_ban_seconds, cc_mode, cc_allow_ips,
+               COALESCE(shield_url, '') AS shield_url,
+               signed_url_enabled,
+               COALESCE(signed_url_mode, 'off') AS signed_url_mode,
+               COALESCE(signed_url_paths, '') AS signed_url_paths,
+               COALESCE(signed_url_secret, '') AS signed_url_secret,
+               COALESCE(signed_url_previous_secret, '') AS signed_url_previous_secret,
+               COALESCE(signed_url_ttl_secs, 3600) AS signed_url_ttl_secs,
+               COALESCE(origin_auth_header, '') AS origin_auth_header,
+               COALESCE(origin_auth_value, '') AS origin_auth_value,
+               COALESCE(hotlink_signature_enabled, FALSE) AS hotlink_signature_enabled,
+               COALESCE(websocket_enabled, TRUE) AS websocket_enabled,
+               COALESCE(http2_enabled, TRUE) AS http2_enabled,
+               COALESCE(http3_enabled, FALSE) AS http3_enabled,
+               COALESCE(gzip_enabled, TRUE) AS gzip_enabled,
+               COALESCE(image_webp_enabled, FALSE) AS image_webp_enabled,
+               COALESCE(min_tls_version, '1.2') AS min_tls_version,
+               COALESCE(access_mode, 'cname') AS access_mode,
+               dns_zone_id,
+               COALESCE(auto_https, TRUE) AS auto_https,
+               COALESCE(cert_status, 'none') AS cert_status,
+               COALESCE(cert_last_error, '') AS cert_last_error,
+               COALESCE(access_log_enabled, TRUE) AS access_log_enabled,
+               COALESCE(cache_enabled, TRUE) AS cache_enabled,
+               cache_policy_id
+        FROM domains WHERE name = $1
+        "#,
+    )
+    .bind(name)
+    .fetch_optional(pool)
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn update_domain_settings(
+    pool: &PgPool,
+    id: Uuid,
+    ignore_query: Option<bool>,
+    cors: Option<&str>,
+    hotlink: Option<&str>,
+    timeout_ms: Option<i32>,
+    headers: Option<&str>,
+    rps: Option<i32>,
+    burst: Option<i32>,
+    cc_enabled: Option<bool>,
+    cc_rps: Option<i32>,
+    cc_burst: Option<i32>,
+    cc_ban_after: Option<i32>,
+    cc_ban_seconds: Option<i32>,
+    cc_mode: Option<&str>,
+    cc_allow_ips: Option<&str>,
+    shield_url: Option<&str>,
+    cache_key_ignore_headers: Option<&str>,
+) -> sqlx::Result<u64> {
+    // Merge in the database, not in Rust.
+    //
+    // This used to SELECT the whole settings row, patch it in memory, then write
+    // every column back. Two concurrent edits therefore raced: each read the same
+    // pre-edit snapshot and the later write restored the earlier request's values
+    // for every field it had not meant to touch. `COALESCE($n, column)` updates
+    // only the fields the caller supplied, so a partially-specified PUT cannot
+    // clobber a concurrent one.
+    let r = sqlx::query(
+        r#"
+        UPDATE domains SET
+          ignore_query_string = COALESCE($2, ignore_query_string),
+          cors_origins = COALESCE($3, cors_origins),
+          hotlink_allow_referers = COALESCE($4, hotlink_allow_referers),
+          origin_timeout_ms = COALESCE($5, origin_timeout_ms),
+          custom_headers = COALESCE($6, custom_headers),
+          rate_limit_rps = COALESCE($7, rate_limit_rps),
+          rate_limit_burst = COALESCE($8, rate_limit_burst),
+          cc_enabled = COALESCE($9, cc_enabled),
+          cc_rps = COALESCE($10, cc_rps),
+          cc_burst = COALESCE($11, cc_burst),
+          cc_ban_after = COALESCE($12, cc_ban_after),
+          cc_ban_seconds = COALESCE($13, cc_ban_seconds),
+          cc_mode = COALESCE($14, cc_mode),
+          cc_allow_ips = COALESCE($15, cc_allow_ips),
+          shield_url = COALESCE($16, shield_url),
+          cache_key_ignore_headers = COALESCE($17, cache_key_ignore_headers),
+          updated_at = NOW()
+        WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .bind(ignore_query)
+    .bind(cors)
+    .bind(hotlink)
+    .bind(timeout_ms)
+    .bind(headers)
+    .bind(rps)
+    .bind(burst)
+    .bind(cc_enabled)
+    .bind(cc_rps)
+    .bind(cc_burst)
+    .bind(cc_ban_after)
+    .bind(cc_ban_seconds)
+    .bind(cc_mode)
+    .bind(cc_allow_ips)
+    .bind(shield_url)
+    .bind(cache_key_ignore_headers)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn update_domain_signed_url(
+    pool: &PgPool,
+    id: Uuid,
+    enabled: Option<bool>,
+    signed_url_mode: Option<&str>,
+    signed_url_paths: Option<&str>,
+    secret: Option<&str>,
+    previous_secret: Option<&str>,
+    ttl_secs: Option<i32>,
+) -> sqlx::Result<u64> {
+    let r = sqlx::query(
+        r#"
+        UPDATE domains SET
+          signed_url_enabled = COALESCE($2, signed_url_enabled),
+          signed_url_mode = COALESCE($3, signed_url_mode),
+          signed_url_paths = COALESCE($4, signed_url_paths),
+          signed_url_secret = COALESCE($5, signed_url_secret),
+          signed_url_previous_secret = COALESCE($6, signed_url_previous_secret),
+          signed_url_ttl_secs = COALESCE($7, signed_url_ttl_secs),
+          updated_at = NOW()
+        WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .bind(enabled)
+    .bind(signed_url_mode)
+    .bind(signed_url_paths)
+    .bind(secret)
+    .bind(previous_secret)
+    .bind(ttl_secs.map(|v| v.clamp(0, 86_400)))
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected())
+}
+
+pub async fn update_domain_protocol_settings(
+    pool: &PgPool,
+    id: Uuid,
+    websocket_enabled: Option<bool>,
+    http2_enabled: Option<bool>,
+    http3_enabled: Option<bool>,
+    gzip_enabled: Option<bool>,
+    image_webp_enabled: Option<bool>,
+    access_mode: Option<&str>,
+    auto_https: Option<bool>,
+    min_tls_version: Option<&str>,
+    access_log_enabled: Option<bool>,
+) -> sqlx::Result<u64> {
+    let r = sqlx::query(
+        r#"
+        UPDATE domains SET
+          websocket_enabled = COALESCE($2, websocket_enabled),
+          http2_enabled = COALESCE($3, http2_enabled),
+          http3_enabled = COALESCE($4, http3_enabled),
+          gzip_enabled = COALESCE($5, gzip_enabled),
+          image_webp_enabled = COALESCE($6, image_webp_enabled),
+          access_mode = COALESCE($7, access_mode),
+          auto_https = COALESCE($8, auto_https),
+          min_tls_version = COALESCE($9, min_tls_version),
+          access_log_enabled = COALESCE($10, access_log_enabled),
+          updated_at = NOW()
+        WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .bind(websocket_enabled)
+    .bind(http2_enabled)
+    .bind(http3_enabled)
+    .bind(gzip_enabled)
+    .bind(image_webp_enabled)
+    .bind(access_mode)
+    .bind(auto_https)
+    .bind(min_tls_version)
+    .bind(access_log_enabled)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected())
+}
+
+pub async fn set_domain_dns_zone(
+    pool: &PgPool,
+    id: Uuid,
+    dns_zone_id: Option<Uuid>,
+) -> sqlx::Result<u64> {
+    let r = sqlx::query(
+        r#"
+        UPDATE domains SET dns_zone_id = $2, updated_at = NOW() WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .bind(dns_zone_id)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected())
+}
+
+pub async fn set_domain_cert_status(
+    pool: &PgPool,
+    id: Uuid,
+    status: &str,
+    last_error: &str,
+) -> sqlx::Result<u64> {
+    let r = sqlx::query(
+        r#"
+        UPDATE domains SET
+          cert_status = $2,
+          cert_last_error = $3,
+          updated_at = NOW()
+        WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .bind(status)
+    .bind(last_error)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected())
+}
+
+/// Sites that opted into auto HTTPS and still need a certificate.
+/// Sites the automatic-HTTPS worker should look at now.
+///
+/// Rows in backoff (`cert_next_attempt_at` in the future) are skipped, so a site
+/// whose validation keeps failing is retried at a growing interval instead of
+/// every tick.
+pub async fn list_domains_due_for_auto_https(pool: &PgPool) -> sqlx::Result<Vec<DomainRow>> {
+    sqlx::query_as::<_, DomainRow>(
+        r#"
+        SELECT id, project_id, name, origin_host, origin_port, origin_proto,
+               ssl_enabled, status, created_at, rate_limit_rps, rate_limit_burst,
+               COALESCE(origins, '[]'::jsonb) AS origins,
+               COALESCE(backup_origin_host, '') AS backup_origin_host,
+               COALESCE(backup_origin_port, 0) AS backup_origin_port,
+               COALESCE(backup_origin_proto, 'http') AS backup_origin_proto,
+               COALESCE(shield_url, '') AS shield_url,
+               published_version_id,
+               COALESCE(access_mode, 'cname') AS access_mode,
+               dns_zone_id,
+               COALESCE(auto_https, TRUE) AS auto_https,
+               COALESCE(cert_status, 'none') AS cert_status,
+               COALESCE(cdn_enabled, TRUE) AS cdn_enabled
+        FROM domains
+        WHERE auto_https = TRUE
+          AND status = 'active'
+          AND cert_status IN ('none', 'pending', 'error')
+          AND (cert_next_attempt_at IS NULL OR cert_next_attempt_at <= NOW())
+        ORDER BY cert_next_attempt_at NULLS FIRST, updated_at ASC
+        LIMIT 50
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// Certificate in place: clear the error and the backoff.
+pub async fn auto_https_mark_active(pool: &PgPool, id: Uuid) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE domains SET cert_status = 'active', cert_last_error = '',
+               cert_attempts = 0, cert_next_attempt_at = NULL, updated_at = NOW()
+        WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// DNS is not pointed at the platform yet. Not a failure: check again after
+/// `recheck_secs` without touching the failure counter.
+pub async fn auto_https_mark_waiting(
+    pool: &PgPool,
+    id: Uuid,
+    note: &str,
+    recheck_secs: i64,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE domains SET cert_status = 'pending', cert_last_error = $2,
+               cert_next_attempt_at = NOW() + make_interval(secs => $3)
+        WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .bind(note)
+    .bind(recheck_secs as f64)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Issuance failed: back off 15 min, 30 min, 1 h … capped at 24 h. Returns the
+/// time of the next attempt.
+pub async fn auto_https_mark_failed(
+    pool: &PgPool,
+    id: Uuid,
+    error: &str,
+) -> sqlx::Result<Option<DateTime<Utc>>> {
+    sqlx::query_scalar(
+        r#"
+        UPDATE domains SET
+            cert_status = 'error',
+            cert_last_error = $2,
+            cert_next_attempt_at = NOW() + LEAST(
+                INTERVAL '24 hours',
+                INTERVAL '15 minutes' * power(2, LEAST(cert_attempts, 7))
+            ),
+            cert_attempts = cert_attempts + 1,
+            updated_at = NOW()
+        WHERE id = $1
+        RETURNING cert_next_attempt_at
+        "#,
+    )
+    .bind(id)
+    .bind(error)
+    .fetch_optional(pool)
+    .await
+    .map(Option::flatten)
+}
+
+/// Queue a site for (re)issuance now: used when auto-HTTPS is switched on, the
+/// access mode changes, or an operator retries by hand.
+pub async fn auto_https_queue(pool: &PgPool, id: Uuid, reset_attempts: bool) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE domains SET cert_status = 'pending', cert_last_error = '',
+               cert_next_attempt_at = NULL,
+               cert_attempts = CASE WHEN $2 THEN 0 ELSE cert_attempts END,
+               updated_at = NOW()
+        WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .bind(reset_attempts)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// When the next automatic attempt is allowed (None = now).
+pub async fn auto_https_next_attempt(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<DateTime<Utc>>> {
+    sqlx::query_scalar("SELECT cert_next_attempt_at FROM domains WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .map(Option::flatten)
+}
+
+/// Active certificates stored under any of `names`.
+pub async fn active_certs_named(pool: &PgPool, names: &[String]) -> sqlx::Result<Vec<CertRow>> {
+    sqlx::query_as::<_, CertRow>(
+        r#"
+        SELECT id, domain_id, domain_name, cert_pem, key_pem, issuer,
+               not_before, not_after, status, auto_renew, created_at
+        FROM certificates
+        WHERE status = 'active' AND lower(domain_name) = ANY($1)
+        "#,
+    )
+    .bind(names)
+    .fetch_all(pool)
+    .await
+}
+
+/// DNS names (SAN dNSName entries) of the first certificate in a PEM chain.
+pub fn cert_dns_names(cert_pem: &str) -> Vec<String> {
+    let Ok(certs) = rustls_pemfile::certs(&mut cert_pem.as_bytes()).collect::<Result<Vec<_>, _>>()
+    else {
+        return Vec::new();
+    };
+    let Some(der) = certs.first() else {
+        return Vec::new();
+    };
+    let Ok((_, parsed)) = x509_parser::parse_x509_certificate(der.as_ref()) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    if let Ok(Some(san)) = parsed.subject_alternative_name() {
+        for name in &san.value.general_names {
+            if let x509_parser::extensions::GeneralName::DNSName(dns) = name {
+                names.push(dns.trim_end_matches('.').to_ascii_lowercase());
+            }
+        }
+    }
+    names
+}
+
+/// Whether `pattern` (a SAN entry, possibly `*.example.com`) covers `host`.
+pub fn san_covers(pattern: &str, host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let pattern = pattern.trim_end_matches('.').to_ascii_lowercase();
+    if pattern == host {
+        return true;
+    }
+    match (pattern.strip_prefix("*."), host.split_once('.')) {
+        (Some(suffix), Some((first, rest))) => !first.is_empty() && rest == suffix,
+        _ => false,
+    }
+}
+
+pub async fn update_domain_security(
+    pool: &PgPool,
+    id: Uuid,
+    origin_auth_header: Option<&str>,
+    origin_auth_value: Option<&str>,
+    hotlink_signature_enabled: Option<bool>,
+) -> sqlx::Result<u64> {
+    let r = sqlx::query(
+        r#"
+        UPDATE domains SET
+          origin_auth_header = COALESCE($2, origin_auth_header),
+          origin_auth_value = COALESCE($3, origin_auth_value),
+          hotlink_signature_enabled = COALESCE($4, hotlink_signature_enabled),
+          updated_at = NOW()
+        WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .bind(origin_auth_header)
+    .bind(origin_auth_value)
+    .bind(hotlink_signature_enabled)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected())
+}
+
+pub async fn create_prefetch(
+    pool: &PgPool,
+    domain: &str,
+    url_path: &str,
+    headers: &std::collections::HashMap<String, String>,
+) -> sqlx::Result<Uuid> {
+    let (id,): (Uuid,) = sqlx::query_as(
+        r#"
+        INSERT INTO prefetch_tasks (domain, url_path, headers, status)
+        VALUES ($1, $2, $3, 'pending')
+        RETURNING id
+        "#,
+    )
+    .bind(domain)
+    .bind(url_path)
+    .bind(sqlx::types::Json(headers.clone()))
+    .fetch_one(pool)
+    .await?;
+    Ok(id)
+}
+
+pub async fn list_prefetch(
+    pool: &PgPool,
+    limit: i64,
+) -> sqlx::Result<Vec<(Uuid, String, String, String, String)>> {
+    sqlx::query_as(
+        r#"
+        SELECT id, domain, url_path, status, message
+        FROM prefetch_tasks
+        ORDER BY created_at DESC
+        LIMIT $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn metrics_by_domain(
+    pool: &PgPool,
+    hours: i32,
+) -> sqlx::Result<Vec<(String, i64, i64, i64, i64)>> {
+    sqlx::query_as(
+        r#"
+        SELECT COALESCE(NULLIF(domain, ''), '(unknown)') AS domain,
+               COALESCE(SUM(requests), 0)::bigint,
+               COALESCE(SUM(cache_hits), 0)::bigint,
+               COALESCE(SUM(cache_misses), 0)::bigint,
+               COALESCE(SUM(bytes_sent), 0)::bigint
+        FROM edge_metrics
+        WHERE reported_at > NOW() - make_interval(hours => $1)
+        GROUP BY 1
+        ORDER BY 2 DESC
+        "#,
+    )
+    .bind(hours)
+    .fetch_all(pool)
+    .await
+}
+
+/// Per-node/per-domain counters for the multi-node hit-ratio dashboard.
+pub async fn metrics_by_node(
+    pool: &PgPool,
+    hours: i32,
+    hosts: Option<&[String]>,
+) -> sqlx::Result<Vec<(String, String, i64, i64, i64, i64)>> {
+    sqlx::query_as(
+        r#"
+        SELECT node_name,
+               COALESCE(NULLIF(domain, ''), '(unknown)') AS domain,
+               COALESCE(SUM(requests), 0)::bigint,
+               COALESCE(SUM(cache_hits), 0)::bigint,
+               COALESCE(SUM(cache_misses), 0)::bigint,
+               COALESCE(SUM(bytes_sent), 0)::bigint
+        FROM edge_metrics
+        WHERE reported_at > NOW() - make_interval(hours => $1)
+          AND ($2::text[] IS NULL OR domain = ANY($2))
+        GROUP BY 1, 2
+        ORDER BY 3 DESC
+        "#,
+    )
+    .bind(hours)
+    .bind(hosts)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn get_backup_origin(
+    pool: &PgPool,
+    name: &str,
+) -> sqlx::Result<Option<(String, i32, String)>> {
+    let row: Option<(String, i32, String)> = sqlx::query_as(
+        r#"
+        SELECT backup_origin_host, backup_origin_port, backup_origin_proto
+        FROM domains WHERE name = $1
+        "#,
+    )
+    .bind(name)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.filter(|r| !r.0.is_empty() && r.1 > 0))
+}
+
+pub async fn set_backup_origin(
+    pool: &PgPool,
+    id: Uuid,
+    host: &str,
+    port: i32,
+    proto: &str,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE domains SET
+          backup_origin_host = $2,
+          backup_origin_port = $3,
+          backup_origin_proto = $4,
+          updated_at = NOW()
+        WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .bind(host)
+    .bind(port)
+    .bind(proto)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn set_domain_origins(
+    pool: &PgPool,
+    id: Uuid,
+    origins: &[DomainOrigin],
+) -> sqlx::Result<()> {
+    let value = serde_json::to_value(origins).unwrap_or_else(|_| serde_json::json!([]));
+    sqlx::query(
+        r#"
+        UPDATE domains SET origins = $2, updated_at = NOW()
+        WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .bind(value)
+    .execute(pool)
+    .await?;
+    let urls: Vec<String> = origins
+        .iter()
+        .map(|o| format!("{}://{}:{}", o.proto, o.host, o.port))
+        .collect();
+    if !urls.is_empty() {
+        let _ = sqlx::query(
+            r#"
+            DELETE FROM origin_health
+            WHERE domain_name = (SELECT name FROM domains WHERE id = $1)
+              AND origin_url <> ALL($2)
+            "#,
+        )
+        .bind(id)
+        .bind(&urls)
+        .execute(pool)
+        .await;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct AccessLogRow {
+    pub id: i64,
+    pub ts: DateTime<Utc>,
+    pub node_id: String,
+    pub client_ip: String,
+    pub method: String,
+    pub host: String,
+    pub path: String,
+    pub status: i32,
+    pub bytes: i64,
+    pub latency_ms: i32,
+    pub cache_status: String,
+    pub action: String,
+    pub user_agent: String,
+    pub referer: String,
+}
+
+#[allow(clippy::type_complexity)]
+pub async fn insert_access_logs_batch(
+    pool: &PgPool,
+    entries: &[(
+        String, // ts
+        String, // node_id
+        String, // client_ip
+        String, // method
+        String, // host
+        String, // path
+        i32,    // status
+        i64,    // bytes
+        i32,    // latency_ms
+        String, // cache
+        String, // action
+        String, // ua
+        String, // ref
+    )],
+) -> sqlx::Result<u64> {
+    if entries.is_empty() {
+        return Ok(0);
+    }
+    let mut ts = Vec::with_capacity(entries.len());
+    let mut nodes = Vec::with_capacity(entries.len());
+    let mut clients = Vec::with_capacity(entries.len());
+    let mut methods = Vec::with_capacity(entries.len());
+    let mut hosts = Vec::with_capacity(entries.len());
+    let mut paths = Vec::with_capacity(entries.len());
+    let mut statuses = Vec::with_capacity(entries.len());
+    let mut bytes = Vec::with_capacity(entries.len());
+    let mut latencies = Vec::with_capacity(entries.len());
+    let mut caches = Vec::with_capacity(entries.len());
+    let mut actions = Vec::with_capacity(entries.len());
+    let mut agents = Vec::with_capacity(entries.len());
+    let mut referers = Vec::with_capacity(entries.len());
+    for e in entries {
+        ts.push(e.0.clone());
+        nodes.push(e.1.clone());
+        clients.push(e.2.clone());
+        methods.push(e.3.clone());
+        hosts.push(e.4.clone());
+        paths.push(e.5.clone());
+        statuses.push(e.6);
+        bytes.push(e.7);
+        latencies.push(e.8);
+        caches.push(e.9.clone());
+        actions.push(e.10.clone());
+        agents.push(e.11.clone());
+        referers.push(e.12.clone());
+    }
+    let result = sqlx::query(
+        r#"
+        INSERT INTO access_logs
+          (ts, node_id, client_ip, method, host, path, status, bytes, latency_ms, cache_status, action, user_agent, referer)
+        SELECT
+          COALESCE(NULLIF(t.ts, '')::timestamptz, NOW()),
+          t.node_id, t.client_ip, t.method, t.host, t.path, t.status, t.bytes,
+          t.latency_ms, t.cache_status, t.action, t.user_agent, t.referer
+        FROM UNNEST(
+          $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[],
+          $7::int[], $8::bigint[], $9::int[], $10::text[], $11::text[], $12::text[], $13::text[]
+        ) AS t(ts, node_id, client_ip, method, host, path, status, bytes, latency_ms, cache_status, action, user_agent, referer)
+        "#,
+    )
+    .bind(ts)
+    .bind(nodes)
+    .bind(clients)
+    .bind(methods)
+    .bind(hosts)
+    .bind(paths)
+    .bind(statuses)
+    .bind(bytes)
+    .bind(latencies)
+    .bind(caches)
+    .bind(actions)
+    .bind(agents)
+    .bind(referers)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Hostnames (including aliases and wildcards) whose site has access logs off.
+pub async fn list_access_log_disabled_hosts(pool: &PgPool) -> sqlx::Result<Vec<String>> {
+    sqlx::query_scalar(
+        r#"
+        SELECT lower(rtrim(btrim(h.hostname), '.'))
+        FROM domain_hostnames h
+        JOIN domains d ON d.id = h.domain_id
+        WHERE NOT COALESCE(d.access_log_enabled, TRUE)
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn list_access_logs(
+    pool: &PgPool,
+    host: Option<&str>,
+    visible_hosts: Option<Vec<String>>,
+    status_min: Option<i32>,
+    status_max: Option<i32>,
+    limit: i64,
+) -> sqlx::Result<Vec<AccessLogRow>> {
+    sqlx::query_as::<_, AccessLogRow>(
+        r#"
+        SELECT id, ts, node_id, client_ip, method, host, path, status, bytes,
+               latency_ms, cache_status, action, user_agent, referer
+        FROM access_logs
+        WHERE host <> ''
+          AND ($1::text IS NULL OR host = $1)
+          AND ($2::text[] IS NULL OR host = ANY($2))
+          AND ($3::int IS NULL OR status >= $3)
+          AND ($4::int IS NULL OR status < $4)
+        ORDER BY ts DESC
+        LIMIT $5
+        "#,
+    )
+    .bind(host.filter(|s| !s.is_empty()))
+    .bind(visible_hosts)
+    .bind(status_min)
+    .bind(status_max)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// Roles & tenancy
+// ---------------------------------------------------------------------------
+
+/// Global role (`admin` | `user`) for a user; `None` when the user is gone.
+pub async fn get_user_role(pool: &PgPool, user_id: Uuid) -> sqlx::Result<Option<String>> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT role FROM users WHERE id = $1 AND is_active")
+            .bind(user_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|r| r.0))
+}
+
+/// Effective role of `user_id` inside `project_id`:
+/// `owner` | `admin` | `member`, or `None` when the user has no access.
+pub async fn project_role(
+    pool: &PgPool,
+    project_id: Uuid,
+    user_id: Uuid,
+) -> sqlx::Result<Option<String>> {
+    let row: Option<(String,)> = sqlx::query_as(
+        r#"
+        SELECT CASE WHEN p.owner_id = $2 THEN 'owner' ELSE COALESCE(m.role, '') END
+        FROM projects p
+        LEFT JOIN project_members m ON m.project_id = p.id AND m.user_id = $2
+        WHERE p.id = $1
+        "#,
+    )
+    .bind(project_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| r.0).filter(|role| !role.is_empty()))
+}
+
+/// Project a domain belongs to. `None` = domain missing, `Some(None)` = no project.
+pub async fn domain_project(pool: &PgPool, domain_id: Uuid) -> sqlx::Result<Option<Option<Uuid>>> {
+    let row: Option<(Option<Uuid>,)> =
+        sqlx::query_as("SELECT project_id FROM domains WHERE id = $1")
+            .bind(domain_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|r| r.0))
+}
+
+/// All domain ids readable by a non-admin user (via project ownership/membership).
+pub async fn domains_for_user(pool: &PgPool, user_id: Uuid) -> sqlx::Result<Vec<Uuid>> {
+    let rows: Vec<(Uuid,)> = sqlx::query_as(
+        r#"
+        SELECT d.id
+        FROM domains d
+        JOIN projects p ON p.id = d.project_id
+        LEFT JOIN project_members m ON m.project_id = p.id AND m.user_id = $1
+        WHERE p.owner_id = $1 OR m.user_id IS NOT NULL
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|r| r.0).collect())
+}
+
+/// The per-user "Default" project, created on first use.
+pub async fn ensure_personal_project(pool: &PgPool, user_id: Uuid) -> sqlx::Result<Uuid> {
+    let existing: Option<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM projects WHERE owner_id = $1 AND name = 'Default' LIMIT 1")
+            .bind(user_id)
+            .fetch_optional(pool)
+            .await?;
+    if let Some((id,)) = existing {
+        return Ok(id);
+    }
+    let row = create_project(pool, "Default", user_id).await?;
+    Ok(row.id)
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct MemberRow {
+    pub user_id: Uuid,
+    pub email: String,
+    pub name: String,
+    pub role: String,
+    pub created_at: DateTime<Utc>,
+}
+
+pub async fn list_project_members(pool: &PgPool, project_id: Uuid) -> sqlx::Result<Vec<MemberRow>> {
+    sqlx::query_as::<_, MemberRow>(
+        r#"
+        SELECT u.id AS user_id, u.email, u.name, m.role, m.created_at
+        FROM project_members m
+        JOIN users u ON u.id = m.user_id
+        WHERE m.project_id = $1
+        ORDER BY m.role, u.email
+        "#,
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn upsert_project_member(
+    pool: &PgPool,
+    project_id: Uuid,
+    user_id: Uuid,
+    role: &str,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO project_members (project_id, user_id, role)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (project_id, user_id) DO UPDATE SET role = EXCLUDED.role
+        "#,
+    )
+    .bind(project_id)
+    .bind(user_id)
+    .bind(role)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn remove_project_member(
+    pool: &PgPool,
+    project_id: Uuid,
+    user_id: Uuid,
+) -> sqlx::Result<u64> {
+    let r = sqlx::query(
+        "DELETE FROM project_members WHERE project_id = $1 AND user_id = $2 AND role <> 'owner'",
+    )
+    .bind(project_id)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected())
+}
+
+// ---------------------------------------------------------------------------
+// Bulk config delivery (one round-trip per table instead of per domain)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct DomainFullRow {
+    pub id: Uuid,
+    pub name: String,
+    pub origin_host: String,
+    pub origin_port: i32,
+    pub origin_proto: String,
+    pub ssl_enabled: bool,
+    pub status: String,
+    pub rate_limit_rps: i32,
+    pub rate_limit_burst: i32,
+    pub ignore_query_string: bool,
+    pub cache_key_ignore_headers: String,
+    pub cors_origins: String,
+    pub hotlink_allow_referers: String,
+    pub origin_timeout_ms: i32,
+    pub custom_headers: String,
+    #[sqlx(default)]
+    pub origins: sqlx::types::Json<Vec<DomainOrigin>>,
+    pub backup_origin_host: String,
+    pub backup_origin_port: i32,
+    pub backup_origin_proto: String,
+    pub cc_enabled: bool,
+    pub cc_rps: i32,
+    pub cc_burst: i32,
+    pub cc_ban_after: i32,
+    pub cc_ban_seconds: i32,
+    pub cc_mode: String,
+    pub cc_allow_ips: String,
+    #[sqlx(default)]
+    pub shield_url: String,
+    #[sqlx(default)]
+    pub signed_url_enabled: bool,
+    #[sqlx(default)]
+    pub signed_url_mode: String,
+    #[sqlx(default)]
+    pub signed_url_paths: String,
+    #[sqlx(default)]
+    pub signed_url_secret: String,
+    #[sqlx(default)]
+    pub signed_url_previous_secret: String,
+    #[sqlx(default)]
+    pub signed_url_ttl_secs: i32,
+    #[sqlx(default)]
+    pub origin_auth_header: String,
+    #[sqlx(default)]
+    pub origin_auth_value: String,
+    #[sqlx(default)]
+    pub hotlink_signature_enabled: bool,
+    #[sqlx(default)]
+    pub published_version_id: Option<Uuid>,
+    #[sqlx(default)]
+    pub websocket_enabled: bool,
+    #[sqlx(default)]
+    pub http2_enabled: bool,
+    #[sqlx(default)]
+    pub http3_enabled: bool,
+    #[sqlx(default)]
+    pub gzip_enabled: bool,
+    #[sqlx(default)]
+    pub image_webp_enabled: bool,
+    #[sqlx(default)]
+    pub min_tls_version: String,
+    #[sqlx(default)]
+    pub access_log_enabled: bool,
+    /// Site master switch for edge caching. `None` = enabled (legacy SELECT).
+    #[sqlx(default)]
+    pub cache_enabled: Option<bool>,
+}
+
+pub async fn list_domains_full(pool: &PgPool) -> sqlx::Result<Vec<DomainFullRow>> {
+    sqlx::query_as::<_, DomainFullRow>(
+        r#"
+        SELECT id, name, origin_host, origin_port, origin_proto, ssl_enabled, status,
+               rate_limit_rps, rate_limit_burst, ignore_query_string,
+               COALESCE(cache_key_ignore_headers, '') AS cache_key_ignore_headers, cors_origins,
+               hotlink_allow_referers, origin_timeout_ms, custom_headers,
+               COALESCE(origins, '[]'::jsonb) AS origins, backup_origin_host, backup_origin_port, backup_origin_proto,
+               cc_enabled, cc_rps, cc_burst, cc_ban_after, cc_ban_seconds, cc_mode, cc_allow_ips,
+               COALESCE(shield_url, '') AS shield_url,
+               signed_url_enabled,
+               COALESCE(signed_url_mode, 'off') AS signed_url_mode,
+               COALESCE(signed_url_paths, '') AS signed_url_paths,
+               COALESCE(signed_url_secret, '') AS signed_url_secret,
+               COALESCE(signed_url_previous_secret, '') AS signed_url_previous_secret,
+               COALESCE(signed_url_ttl_secs, 3600) AS signed_url_ttl_secs,
+               COALESCE(origin_auth_header, '') AS origin_auth_header,
+               COALESCE(origin_auth_value, '') AS origin_auth_value,
+               COALESCE(hotlink_signature_enabled, FALSE) AS hotlink_signature_enabled,
+               published_version_id,
+               COALESCE(websocket_enabled, TRUE) AS websocket_enabled,
+               COALESCE(http2_enabled, TRUE) AS http2_enabled,
+               COALESCE(http3_enabled, FALSE) AS http3_enabled,
+               COALESCE(gzip_enabled, TRUE) AS gzip_enabled,
+               COALESCE(image_webp_enabled, FALSE) AS image_webp_enabled,
+               COALESCE(min_tls_version, '1.2') AS min_tls_version,
+               COALESCE(access_log_enabled, TRUE) AS access_log_enabled,
+               COALESCE(cache_enabled, TRUE) AS cache_enabled
+        FROM domains
+        ORDER BY name
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn get_domain_full_by_name(
+    pool: &PgPool,
+    name: &str,
+) -> sqlx::Result<Option<DomainFullRow>> {
+    sqlx::query_as::<_, DomainFullRow>(
+        r#"
+        SELECT id, name, origin_host, origin_port, origin_proto, ssl_enabled, status,
+               rate_limit_rps, rate_limit_burst, ignore_query_string,
+               COALESCE(cache_key_ignore_headers, '') AS cache_key_ignore_headers, cors_origins,
+               hotlink_allow_referers, origin_timeout_ms, custom_headers,
+               COALESCE(origins, '[]'::jsonb) AS origins, backup_origin_host, backup_origin_port, backup_origin_proto,
+               cc_enabled, cc_rps, cc_burst, cc_ban_after, cc_ban_seconds, cc_mode, cc_allow_ips,
+               COALESCE(shield_url, '') AS shield_url,
+               signed_url_enabled,
+               COALESCE(signed_url_mode, 'off') AS signed_url_mode,
+               COALESCE(signed_url_paths, '') AS signed_url_paths,
+               COALESCE(signed_url_secret, '') AS signed_url_secret,
+               COALESCE(signed_url_previous_secret, '') AS signed_url_previous_secret,
+               COALESCE(signed_url_ttl_secs, 3600) AS signed_url_ttl_secs,
+               COALESCE(origin_auth_header, '') AS origin_auth_header,
+               COALESCE(origin_auth_value, '') AS origin_auth_value,
+               COALESCE(hotlink_signature_enabled, FALSE) AS hotlink_signature_enabled,
+               published_version_id,
+               COALESCE(websocket_enabled, TRUE) AS websocket_enabled,
+               COALESCE(http2_enabled, TRUE) AS http2_enabled,
+               COALESCE(http3_enabled, FALSE) AS http3_enabled,
+               COALESCE(gzip_enabled, TRUE) AS gzip_enabled,
+               COALESCE(image_webp_enabled, FALSE) AS image_webp_enabled,
+               COALESCE(min_tls_version, '1.2') AS min_tls_version,
+               COALESCE(access_log_enabled, TRUE) AS access_log_enabled,
+               COALESCE(cache_enabled, TRUE) AS cache_enabled
+        FROM domains WHERE name = $1
+        "#,
+    )
+    .bind(name)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn set_domain_cache_enabled(
+    pool: &PgPool,
+    id: Uuid,
+    enabled: bool,
+) -> sqlx::Result<Option<DomainRow>> {
+    sqlx::query("UPDATE domains SET cache_enabled = $2, updated_at = NOW() WHERE id = $1")
+        .bind(id)
+        .bind(enabled)
+        .execute(pool)
+        .await?;
+    get_domain(pool, id).await
+}
+
+pub async fn list_rules_flat(pool: &PgPool) -> sqlx::Result<Vec<CacheRuleRow>> {
+    sqlx::query_as::<_, CacheRuleRow>(
+        r#"
+        SELECT id, domain_id, path_pattern, match_type, ttl_seconds, priority, action, swr_seconds,
+               enabled, match_methods, match_query, browser_ttl_seconds, ignore_query, ignore_cookie, ignore_key_headers, match_content_type, note
+        FROM cache_rules
+        ORDER BY domain_id, priority DESC, path_pattern
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// WAF
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct WafSettingsRow {
+    pub domain_id: Uuid,
+    pub enabled: bool,
+    pub mode: String,
+    pub sqli: bool,
+    pub xss: bool,
+    pub traversal: bool,
+    pub scanners: bool,
+    pub rce: bool,
+    pub ssrf: bool,
+    pub xxe: bool,
+    pub log4shell: bool,
+    pub crlf: bool,
+    pub ssti: bool,
+    pub nosql: bool,
+    pub ldap: bool,
+    pub java: bool,
+    pub webshell: bool,
+    pub protocol: bool,
+    pub challenge_difficulty: i32,
+    pub challenge_ttl_secs: i32,
+    pub security_level: String,
+    pub managed_rulesets: String,
+    pub waf_rulepack_version: String,
+    pub waf_gray_percent: i32,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct WafRuleRow {
+    pub id: Uuid,
+    pub domain_id: Uuid,
+    pub name: String,
+    pub field: String,
+    pub operator: String,
+    pub value: String,
+    pub action: String,
+    pub priority: i32,
+    pub enabled: bool,
+    pub expr: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct WafIpRow {
+    pub id: Uuid,
+    pub domain_id: Uuid,
+    pub kind: String,
+    pub ip: String,
+    pub note: String,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct WafGeoRow {
+    pub id: Uuid,
+    pub domain_id: Uuid,
+    pub kind: String,
+    pub value: String,
+    pub note: String,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct WafEventRow {
+    pub id: i64,
+    pub ts: DateTime<Utc>,
+    pub domain: String,
+    pub node_id: String,
+    pub client_ip: String,
+    pub method: String,
+    pub path: String,
+    pub action: String,
+    pub category: String,
+    pub rule_name: String,
+    pub mode: String,
+}
+
+pub async fn get_waf_settings(
+    pool: &PgPool,
+    domain_id: Uuid,
+) -> sqlx::Result<Option<WafSettingsRow>> {
+    sqlx::query_as::<_, WafSettingsRow>(
+        r#"
+        SELECT domain_id, enabled, mode, sqli, xss, traversal, scanners,
+               rce, ssrf, xxe, log4shell, crlf,
+               ssti, nosql, ldap, java, webshell, protocol,
+               challenge_difficulty, challenge_ttl_secs, security_level,
+               COALESCE(managed_rulesets, '') AS managed_rulesets,
+               COALESCE(waf_rulepack_version, '') AS waf_rulepack_version,
+               COALESCE(waf_gray_percent, 0) AS waf_gray_percent
+        FROM waf_settings WHERE domain_id = $1
+        "#,
+    )
+    .bind(domain_id)
+    .fetch_optional(pool)
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn upsert_waf_settings(
+    pool: &PgPool,
+    domain_id: Uuid,
+    enabled: bool,
+    mode: &str,
+    sqli: bool,
+    xss: bool,
+    traversal: bool,
+    scanners: bool,
+    rce: bool,
+    ssrf: bool,
+    xxe: bool,
+    log4shell: bool,
+    crlf: bool,
+    ssti: bool,
+    nosql: bool,
+    ldap: bool,
+    java: bool,
+    webshell: bool,
+    protocol: bool,
+    challenge_difficulty: i32,
+    challenge_ttl_secs: i32,
+    security_level: &str,
+    managed_rulesets: &str,
+    waf_rulepack_version: &str,
+    waf_gray_percent: i32,
+) -> sqlx::Result<WafSettingsRow> {
+    sqlx::query_as::<_, WafSettingsRow>(
+        r#"
+        INSERT INTO waf_settings
+            (domain_id, enabled, mode, sqli, xss, traversal, scanners,
+             rce, ssrf, xxe, log4shell, crlf,
+             ssti, nosql, ldap, java, webshell, protocol,
+             challenge_difficulty, challenge_ttl_secs, security_level,
+             managed_rulesets, waf_rulepack_version, waf_gray_percent)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
+        ON CONFLICT (domain_id) DO UPDATE SET
+          enabled = EXCLUDED.enabled,
+          mode = EXCLUDED.mode,
+          sqli = EXCLUDED.sqli,
+          xss = EXCLUDED.xss,
+          traversal = EXCLUDED.traversal,
+          scanners = EXCLUDED.scanners,
+          rce = EXCLUDED.rce,
+          ssrf = EXCLUDED.ssrf,
+          xxe = EXCLUDED.xxe,
+          log4shell = EXCLUDED.log4shell,
+          crlf = EXCLUDED.crlf,
+          ssti = EXCLUDED.ssti,
+          nosql = EXCLUDED.nosql,
+          ldap = EXCLUDED.ldap,
+          java = EXCLUDED.java,
+          webshell = EXCLUDED.webshell,
+          protocol = EXCLUDED.protocol,
+          challenge_difficulty = EXCLUDED.challenge_difficulty,
+          challenge_ttl_secs = EXCLUDED.challenge_ttl_secs,
+          security_level = EXCLUDED.security_level,
+          managed_rulesets = EXCLUDED.managed_rulesets,
+          waf_rulepack_version = EXCLUDED.waf_rulepack_version,
+          waf_gray_percent = EXCLUDED.waf_gray_percent,
+          updated_at = NOW()
+        RETURNING domain_id, enabled, mode, sqli, xss, traversal, scanners,
+                  rce, ssrf, xxe, log4shell, crlf,
+                  ssti, nosql, ldap, java, webshell, protocol,
+                  challenge_difficulty, challenge_ttl_secs, security_level,
+                  managed_rulesets, waf_rulepack_version, waf_gray_percent
+        "#,
+    )
+    .bind(domain_id)
+    .bind(enabled)
+    .bind(mode)
+    .bind(sqli)
+    .bind(xss)
+    .bind(traversal)
+    .bind(scanners)
+    .bind(rce)
+    .bind(ssrf)
+    .bind(xxe)
+    .bind(log4shell)
+    .bind(crlf)
+    .bind(ssti)
+    .bind(nosql)
+    .bind(ldap)
+    .bind(java)
+    .bind(webshell)
+    .bind(protocol)
+    .bind(challenge_difficulty)
+    .bind(challenge_ttl_secs)
+    .bind(security_level)
+    .bind(managed_rulesets)
+    .bind(waf_rulepack_version)
+    .bind(waf_gray_percent)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn list_waf_settings_all(pool: &PgPool) -> sqlx::Result<Vec<WafSettingsRow>> {
+    sqlx::query_as::<_, WafSettingsRow>(
+        r#"
+        SELECT domain_id, enabled, mode, sqli, xss, traversal, scanners,
+               rce, ssrf, xxe, log4shell, crlf,
+               ssti, nosql, ldap, java, webshell, protocol,
+               challenge_difficulty, challenge_ttl_secs, security_level,
+               COALESCE(managed_rulesets, '') AS managed_rulesets,
+               COALESCE(waf_rulepack_version, '') AS waf_rulepack_version,
+               COALESCE(waf_gray_percent, 0) AS waf_gray_percent
+        FROM waf_settings
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn list_waf_rules(pool: &PgPool, domain_id: Uuid) -> sqlx::Result<Vec<WafRuleRow>> {
+    sqlx::query_as::<_, WafRuleRow>(
+        r#"
+        SELECT id, domain_id, name, field, operator, value, action, priority, enabled, expr, created_at
+        FROM waf_rules WHERE domain_id = $1
+        ORDER BY priority DESC, created_at
+        "#,
+    )
+    .bind(domain_id)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn list_waf_rules_all(pool: &PgPool) -> sqlx::Result<Vec<WafRuleRow>> {
+    sqlx::query_as::<_, WafRuleRow>(
+        r#"
+        SELECT id, domain_id, name, field, operator, value, action, priority, enabled, expr, created_at
+        FROM waf_rules ORDER BY domain_id, priority DESC, created_at
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn get_waf_rule(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<WafRuleRow>> {
+    sqlx::query_as::<_, WafRuleRow>(
+        r#"
+        SELECT id, domain_id, name, field, operator, value, action, priority, enabled, expr, created_at
+        FROM waf_rules WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn create_waf_rule(
+    pool: &PgPool,
+    domain_id: Uuid,
+    name: &str,
+    field: &str,
+    operator: &str,
+    value: &str,
+    action: &str,
+    priority: i32,
+    enabled: bool,
+    expr: &str,
+) -> sqlx::Result<WafRuleRow> {
+    sqlx::query_as::<_, WafRuleRow>(
+        r#"
+        INSERT INTO waf_rules (domain_id, name, field, operator, value, action, priority, enabled, expr)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        RETURNING id, domain_id, name, field, operator, value, action, priority, enabled, expr, created_at
+        "#,
+    )
+    .bind(domain_id)
+    .bind(name)
+    .bind(field)
+    .bind(operator)
+    .bind(value)
+    .bind(action)
+    .bind(priority)
+    .bind(enabled)
+    .bind(expr)
+    .fetch_one(pool)
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn update_waf_rule(
+    pool: &PgPool,
+    id: Uuid,
+    name: &str,
+    field: &str,
+    operator: &str,
+    value: &str,
+    action: &str,
+    priority: i32,
+    enabled: bool,
+    expr: &str,
+) -> sqlx::Result<Option<WafRuleRow>> {
+    sqlx::query_as::<_, WafRuleRow>(
+        r#"
+        UPDATE waf_rules SET
+          name = $2, field = $3, operator = $4, value = $5,
+          action = $6, priority = $7, enabled = $8, expr = $9
+        WHERE id = $1
+        RETURNING id, domain_id, name, field, operator, value, action, priority, enabled, expr, created_at
+        "#,
+    )
+    .bind(id)
+    .bind(name)
+    .bind(field)
+    .bind(operator)
+    .bind(value)
+    .bind(action)
+    .bind(priority)
+    .bind(enabled)
+    .bind(expr)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn delete_waf_rule(pool: &PgPool, id: Uuid) -> sqlx::Result<u64> {
+    let r = sqlx::query("DELETE FROM waf_rules WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected())
+}
+
+pub async fn list_waf_ips(pool: &PgPool, domain_id: Uuid) -> sqlx::Result<Vec<WafIpRow>> {
+    sqlx::query_as::<_, WafIpRow>(
+        r#"
+        SELECT id, domain_id, kind, ip, note, enabled, created_at
+        FROM waf_ip_rules WHERE domain_id = $1
+        ORDER BY kind, created_at
+        "#,
+    )
+    .bind(domain_id)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn list_waf_ips_all(pool: &PgPool) -> sqlx::Result<Vec<WafIpRow>> {
+    sqlx::query_as::<_, WafIpRow>(
+        "SELECT id, domain_id, kind, ip, note, enabled, created_at FROM waf_ip_rules ORDER BY domain_id, kind",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn get_waf_ip(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<WafIpRow>> {
+    sqlx::query_as::<_, WafIpRow>(
+        "SELECT id, domain_id, kind, ip, note, enabled, created_at FROM waf_ip_rules WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn create_waf_ip(
+    pool: &PgPool,
+    domain_id: Uuid,
+    kind: &str,
+    ip: &str,
+    note: &str,
+) -> sqlx::Result<WafIpRow> {
+    sqlx::query_as::<_, WafIpRow>(
+        r#"
+        INSERT INTO waf_ip_rules (domain_id, kind, ip, note)
+        VALUES ($1, $2, $3, $4)
+        RETURNING id, domain_id, kind, ip, note, enabled, created_at
+        "#,
+    )
+    .bind(domain_id)
+    .bind(kind)
+    .bind(ip)
+    .bind(note)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn update_waf_ip(
+    pool: &PgPool,
+    id: Uuid,
+    kind: &str,
+    ip: &str,
+    note: &str,
+    enabled: bool,
+) -> sqlx::Result<Option<WafIpRow>> {
+    sqlx::query_as::<_, WafIpRow>(
+        r#"
+        UPDATE waf_ip_rules SET kind = $2, ip = $3, note = $4, enabled = $5
+        WHERE id = $1
+        RETURNING id, domain_id, kind, ip, note, enabled, created_at
+        "#,
+    )
+    .bind(id)
+    .bind(kind)
+    .bind(ip)
+    .bind(note)
+    .bind(enabled)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn delete_waf_ip(pool: &PgPool, id: Uuid) -> sqlx::Result<u64> {
+    let r = sqlx::query("DELETE FROM waf_ip_rules WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected())
+}
+
+pub async fn list_waf_geo(pool: &PgPool, domain_id: Uuid) -> sqlx::Result<Vec<WafGeoRow>> {
+    sqlx::query_as::<_, WafGeoRow>(
+        r#"
+        SELECT id, domain_id, kind, value, note, enabled, created_at
+        FROM waf_geo_rules WHERE domain_id = $1
+        ORDER BY kind, value
+        "#,
+    )
+    .bind(domain_id)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn list_waf_geo_all(pool: &PgPool) -> sqlx::Result<Vec<WafGeoRow>> {
+    sqlx::query_as::<_, WafGeoRow>(
+        "SELECT id, domain_id, kind, value, note, enabled, created_at FROM waf_geo_rules ORDER BY domain_id, kind, value",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn get_waf_geo(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<WafGeoRow>> {
+    sqlx::query_as::<_, WafGeoRow>(
+        "SELECT id, domain_id, kind, value, note, enabled, created_at FROM waf_geo_rules WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn waf_ip_exists(
+    pool: &PgPool,
+    domain_id: Uuid,
+    kind: &str,
+    ip: &str,
+) -> sqlx::Result<bool> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM waf_ip_rules WHERE domain_id = $1 AND kind = $2 AND ip = $3)",
+    )
+    .bind(domain_id)
+    .bind(kind)
+    .bind(ip)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn waf_ip_exists_except(
+    pool: &PgPool,
+    id: Uuid,
+    domain_id: Uuid,
+    kind: &str,
+    ip: &str,
+) -> sqlx::Result<bool> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM waf_ip_rules WHERE domain_id = $1 AND kind = $2 AND ip = $3 AND id <> $4)",
+    )
+    .bind(domain_id)
+    .bind(kind)
+    .bind(ip)
+    .bind(id)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn waf_geo_exists(
+    pool: &PgPool,
+    domain_id: Uuid,
+    kind: &str,
+    value: &str,
+) -> sqlx::Result<bool> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM waf_geo_rules WHERE domain_id = $1 AND kind = $2 AND value = $3)",
+    )
+    .bind(domain_id)
+    .bind(kind)
+    .bind(value)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn waf_geo_exists_except(
+    pool: &PgPool,
+    id: Uuid,
+    domain_id: Uuid,
+    kind: &str,
+    value: &str,
+) -> sqlx::Result<bool> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM waf_geo_rules WHERE domain_id = $1 AND kind = $2 AND value = $3 AND id <> $4)",
+    )
+    .bind(domain_id)
+    .bind(kind)
+    .bind(value)
+    .bind(id)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn create_waf_geo(
+    pool: &PgPool,
+    domain_id: Uuid,
+    kind: &str,
+    value: &str,
+    note: &str,
+    enabled: bool,
+) -> sqlx::Result<WafGeoRow> {
+    sqlx::query_as::<_, WafGeoRow>(
+        r#"
+        INSERT INTO waf_geo_rules (domain_id, kind, value, note, enabled)
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING id, domain_id, kind, value, note, enabled, created_at
+        "#,
+    )
+    .bind(domain_id)
+    .bind(kind)
+    .bind(value)
+    .bind(note)
+    .bind(enabled)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn update_waf_geo(
+    pool: &PgPool,
+    id: Uuid,
+    kind: &str,
+    value: &str,
+    note: &str,
+    enabled: bool,
+) -> sqlx::Result<Option<WafGeoRow>> {
+    sqlx::query_as::<_, WafGeoRow>(
+        r#"
+        UPDATE waf_geo_rules SET kind = $2, value = $3, note = $4, enabled = $5
+        WHERE id = $1
+        RETURNING id, domain_id, kind, value, note, enabled, created_at
+        "#,
+    )
+    .bind(id)
+    .bind(kind)
+    .bind(value)
+    .bind(note)
+    .bind(enabled)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn delete_waf_geo(pool: &PgPool, id: Uuid) -> sqlx::Result<u64> {
+    let r = sqlx::query("DELETE FROM waf_geo_rules WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected())
+}
+
+#[derive(Debug, Clone)]
+pub struct WafEventInput {
+    pub domain: String,
+    pub node_id: String,
+    pub client_ip: String,
+    pub method: String,
+    pub path: String,
+    pub action: String,
+    pub category: String,
+    pub rule_name: String,
+    pub mode: String,
+}
+
+pub async fn insert_waf_events_batch(pool: &PgPool, events: &[WafEventInput]) -> sqlx::Result<u64> {
+    if events.is_empty() {
+        return Ok(0);
+    }
+    let mut domains = Vec::with_capacity(events.len());
+    let mut nodes = Vec::with_capacity(events.len());
+    let mut clients = Vec::with_capacity(events.len());
+    let mut methods = Vec::with_capacity(events.len());
+    let mut paths = Vec::with_capacity(events.len());
+    let mut actions = Vec::with_capacity(events.len());
+    let mut categories = Vec::with_capacity(events.len());
+    let mut rules = Vec::with_capacity(events.len());
+    let mut modes = Vec::with_capacity(events.len());
+    for e in events {
+        domains.push(e.domain.clone());
+        nodes.push(e.node_id.clone());
+        clients.push(e.client_ip.clone());
+        methods.push(e.method.clone());
+        paths.push(e.path.clone());
+        actions.push(e.action.clone());
+        categories.push(e.category.clone());
+        rules.push(e.rule_name.clone());
+        modes.push(e.mode.clone());
+    }
+    let result = sqlx::query(
+        r#"
+        INSERT INTO waf_events
+          (domain, node_id, client_ip, method, path, action, category, rule_name, mode)
+        SELECT t.domain, t.node_id, t.client_ip, t.method, t.path, t.action,
+               t.category, t.rule_name, t.mode
+        FROM UNNEST(
+          $1::text[], $2::text[], $3::text[], $4::text[], $5::text[],
+          $6::text[], $7::text[], $8::text[], $9::text[]
+        ) AS t(domain, node_id, client_ip, method, path, action, category, rule_name, mode)
+        "#,
+    )
+    .bind(domains)
+    .bind(nodes)
+    .bind(clients)
+    .bind(methods)
+    .bind(paths)
+    .bind(actions)
+    .bind(categories)
+    .bind(rules)
+    .bind(modes)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+pub async fn list_waf_events(
+    pool: &PgPool,
+    domain: Option<&str>,
+    visible_domains: Option<Vec<String>>,
+    action: Option<&str>,
+    limit: i64,
+) -> sqlx::Result<Vec<WafEventRow>> {
+    // Visibility filtering must happen before LIMIT. Filtering the newest 500
+    // rows in Rust let one noisy tenant fill the page and hid a smaller
+    // tenant's own events entirely.
+    sqlx::query_as::<_, WafEventRow>(
+        r#"
+        SELECT id, ts, domain, node_id, client_ip, method, path, action, category, rule_name, mode
+        FROM waf_events
+        WHERE ($1::text IS NULL OR domain = $1)
+          AND ($2::text[] IS NULL OR domain = ANY($2))
+          AND ($3::text IS NULL OR action = $3)
+        ORDER BY ts DESC LIMIT $4
+        "#,
+    )
+    .bind(domain.filter(|d| !d.is_empty()))
+    .bind(visible_domains)
+    .bind(action.filter(|a| !a.is_empty()))
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// Whether this published release is still the newest one.
+///
+/// Rolling back an older release would restore a `previous_versions` snapshot
+/// that predates everything published since, silently undoing newer changes.
+pub async fn is_latest_published(pool: &PgPool, id: Uuid) -> sqlx::Result<bool> {
+    sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT NOT EXISTS (
+            SELECT 1
+            FROM config_releases newer
+            JOIN config_releases current ON current.id = $1
+            WHERE newer.status = 'published'
+              AND newer.id <> $1
+              AND newer.published_at > current.published_at
+        )
+        "#,
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+}
+
+/// Aggregated WAF events for the dashboard.
+///
+/// `expr` is validated against a fixed whitelist before being interpolated.
+pub async fn waf_stats_group(
+    pool: &PgPool,
+    days: i32,
+    domain: Option<&str>,
+    domains: Option<Vec<String>>,
+    expr: &str,
+    limit: i64,
+) -> sqlx::Result<Vec<(String, i64)>> {
+    const DAY_EXPR: &str = "to_char(date_trunc('day', ts), 'YYYY-MM-DD')";
+    let (expr, order) = match expr {
+        "action" | "category" | "client_ip" | "rule_name" | "path" => (expr, "ORDER BY 2 DESC"),
+        "day" => (DAY_EXPR, "ORDER BY 1 ASC"),
+        _ => return Ok(Vec::new()),
+    };
+    let sql = format!(
+        r#"
+        SELECT COALESCE(NULLIF({expr}, ''), '(unknown)') AS k, COUNT(*)::bigint AS c
+        FROM waf_events
+        WHERE ts >= NOW() - make_interval(days => $1)
+          AND ($2::text IS NULL OR domain = $2)
+          AND ($3::text[] IS NULL OR domain = ANY($3))
+        GROUP BY 1 {order} LIMIT $4
+        "#
+    );
+    sqlx::query_as::<_, (String, i64)>(&sql)
+        .bind(days)
+        .bind(domain)
+        .bind(domains)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+}
+
+// ---------------------------------------------------------------------------
+// Cross-node CC bans
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct CcBanRow {
+    pub domain: String,
+    pub ip: String,
+    pub reason: String,
+    pub source: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub revoked_by: String,
+}
+
+pub async fn upsert_cc_ban(
+    pool: &PgPool,
+    domain: &str,
+    ip: &str,
+    seconds: i64,
+    reason: &str,
+    source: &str,
+) -> sqlx::Result<CcBanRow> {
+    sqlx::query_as::<_, CcBanRow>(
+        r#"
+        INSERT INTO cc_bans (domain, ip, reason, source, expires_at)
+        VALUES ($1, $2, $3, $4, NOW() + ($5 * INTERVAL '1 second'))
+        ON CONFLICT (domain, ip) DO UPDATE SET
+            expires_at = GREATEST(cc_bans.expires_at, EXCLUDED.expires_at),
+            reason = EXCLUDED.reason,
+            source = EXCLUDED.source,
+            revoked_at = NULL,
+            revoked_by = '',
+            updated_at = NOW()
+        RETURNING domain, ip, reason, source, created_at, updated_at, expires_at,
+                  revoked_at, revoked_by
+        "#,
+    )
+    .bind(domain)
+    .bind(ip)
+    .bind(reason)
+    .bind(source)
+    .bind(seconds)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn list_active_cc_bans(
+    pool: &PgPool,
+    domain: Option<&str>,
+) -> sqlx::Result<Vec<CcBanRow>> {
+    sqlx::query_as::<_, CcBanRow>(
+        r#"
+        SELECT domain, ip, reason, source, created_at, updated_at, expires_at,
+               revoked_at, revoked_by
+        FROM cc_bans
+        WHERE expires_at > NOW()
+          AND revoked_at IS NULL
+          AND ($1::text IS NULL OR domain = $1)
+        ORDER BY expires_at DESC
+        "#,
+    )
+    .bind(domain)
+    .fetch_all(pool)
+    .await
+}
+
+/// Full ban history for the console, including expired and revoked rows.
+pub async fn list_cc_ban_history(
+    pool: &PgPool,
+    domain: Option<&str>,
+    visible_domains: Option<Vec<String>>,
+    limit: i64,
+) -> sqlx::Result<Vec<CcBanRow>> {
+    sqlx::query_as::<_, CcBanRow>(
+        r#"
+        SELECT domain, ip, reason, source, created_at, updated_at, expires_at,
+               revoked_at, revoked_by
+        FROM cc_bans
+        WHERE ($1::text IS NULL OR domain = $1)
+          AND ($2::text[] IS NULL OR domain = ANY($2))
+        ORDER BY created_at DESC
+        LIMIT $3
+        "#,
+    )
+    .bind(domain)
+    .bind(visible_domains)
+    .bind(limit.clamp(1, 1000))
+    .fetch_all(pool)
+    .await
+}
+
+/// Soft-unban: keep the row for history and stop syncing it to edges.
+pub async fn revoke_cc_ban(pool: &PgPool, domain: &str, ip: &str, by: &str) -> sqlx::Result<u64> {
+    let r = sqlx::query(
+        r#"
+        UPDATE cc_bans
+        SET revoked_at = NOW(), revoked_by = $3, updated_at = NOW()
+        WHERE domain = $1 AND ip = $2 AND revoked_at IS NULL
+        "#,
+    )
+    .bind(domain)
+    .bind(ip)
+    .bind(by)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected())
+}
+
+pub async fn delete_cc_ban(pool: &PgPool, domain: &str, ip: &str) -> sqlx::Result<u64> {
+    let r = sqlx::query("DELETE FROM cc_bans WHERE domain = $1 AND ip = $2")
+        .bind(domain)
+        .bind(ip)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected())
+}
+
+/// Delete access_logs and edge_metrics older than `days` days.
+pub async fn purge_old_telemetry(pool: &PgPool, days: i64) -> sqlx::Result<(u64, u64)> {
+    let days = days.max(1);
+    let a = sqlx::query(
+        r#"DELETE FROM access_logs WHERE created_at < NOW() - ($1::text || ' days')::interval"#,
+    )
+    .bind(days.to_string())
+    .execute(pool)
+    .await?
+    .rows_affected();
+    let m = sqlx::query(
+        r#"DELETE FROM edge_metrics WHERE reported_at < NOW() - ($1::text || ' days')::interval"#,
+    )
+    .bind(days.to_string())
+    .execute(pool)
+    .await?
+    .rows_affected();
+    let _ = sqlx::query(
+        r#"DELETE FROM waf_events WHERE created_at < NOW() - ($1::text || ' days')::interval"#,
+    )
+    .bind(days.to_string())
+    .execute(pool)
+    .await;
+    Ok((a, m))
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct UserGroupRow {
+    pub id: Uuid,
+    pub name: String,
+    pub description: String,
+    pub permissions: Vec<String>,
+    #[sqlx(default)]
+    pub member_count: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+pub async fn list_user_groups(pool: &PgPool) -> sqlx::Result<Vec<UserGroupRow>> {
+    sqlx::query_as::<_, UserGroupRow>(
+        r#"
+        SELECT g.id, g.name, g.description, g.permissions,
+               (SELECT COUNT(*) FROM user_group_members m WHERE m.group_id = g.id) AS member_count,
+               g.created_at, g.updated_at
+        FROM user_groups g
+        ORDER BY g.name
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn get_user_group(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<UserGroupRow>> {
+    sqlx::query_as::<_, UserGroupRow>(
+        r#"
+        SELECT g.id, g.name, g.description, g.permissions,
+               (SELECT COUNT(*) FROM user_group_members m WHERE m.group_id = g.id) AS member_count,
+               g.created_at, g.updated_at
+        FROM user_groups g WHERE g.id = $1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn create_user_group(
+    pool: &PgPool,
+    name: &str,
+    description: &str,
+    permissions: &[String],
+) -> sqlx::Result<UserGroupRow> {
+    sqlx::query_as::<_, UserGroupRow>(
+        r#"
+        INSERT INTO user_groups (name, description, permissions)
+        VALUES ($1, $2, $3)
+        RETURNING id, name, description, permissions, 0::bigint AS member_count, created_at, updated_at
+        "#,
+    )
+    .bind(name)
+    .bind(description)
+    .bind(permissions)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn update_user_group(
+    pool: &PgPool,
+    id: Uuid,
+    name: &str,
+    description: &str,
+    permissions: &[String],
+) -> sqlx::Result<Option<UserGroupRow>> {
+    sqlx::query_as::<_, UserGroupRow>(
+        r#"
+        UPDATE user_groups
+        SET name = $2, description = $3, permissions = $4, updated_at = NOW()
+        WHERE id = $1
+        RETURNING id, name, description, permissions,
+                  (SELECT COUNT(*) FROM user_group_members m WHERE m.group_id = user_groups.id) AS member_count,
+                  created_at, updated_at
+        "#,
+    )
+    .bind(id)
+    .bind(name)
+    .bind(description)
+    .bind(permissions)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn delete_user_group(pool: &PgPool, id: Uuid) -> sqlx::Result<u64> {
+    let r = sqlx::query("DELETE FROM user_groups WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected())
+}
+
+pub async fn set_user_groups(pool: &PgPool, user_id: Uuid, group_ids: &[Uuid]) -> sqlx::Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM user_group_members WHERE user_id = $1")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    for group_id in group_ids {
+        sqlx::query(
+            "INSERT INTO user_group_members (group_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        )
+        .bind(group_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await
+}
+
+pub async fn groups_for_user(pool: &PgPool, user_id: Uuid) -> sqlx::Result<Vec<UserGroupRow>> {
+    sqlx::query_as::<_, UserGroupRow>(
+        r#"
+        SELECT g.id, g.name, g.description, g.permissions,
+               (SELECT COUNT(*) FROM user_group_members m WHERE m.group_id = g.id) AS member_count,
+               g.created_at, g.updated_at
+        FROM user_groups g
+        JOIN user_group_members m ON m.group_id = g.id
+        WHERE m.user_id = $1
+        ORDER BY g.name
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn permissions_for_user(pool: &PgPool, user_id: Uuid) -> sqlx::Result<Vec<String>> {
+    let permissions: Vec<String> = sqlx::query_scalar(
+        r#"
+        SELECT COALESCE(array_agg(DISTINCT p), '{}')
+        FROM user_group_members m
+        JOIN user_groups g ON g.id = m.group_id
+        CROSS JOIN LATERAL unnest(g.permissions) AS p
+        WHERE m.user_id = $1
+        "#,
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(permissions)
+}
+
+/// Permissions plus whether the user was ever restricted by a group.
+///
+/// The distinction matters: a user who never joined a group keeps the legacy
+/// unrestricted behaviour, while a restricted user with no grants must be
+/// denied. The flag is sticky on purpose — removing the last group must not
+/// silently hand every module back.
+pub async fn permissions_and_membership(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> sqlx::Result<(Vec<String>, bool)> {
+    let permissions = permissions_for_user(pool, user_id).await?;
+    let restricted: bool =
+        sqlx::query_scalar("SELECT permissions_restricted FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(pool)
+            .await?;
+    Ok((permissions, restricted))
+}
+
+pub async fn group_member_ids(pool: &PgPool, group_id: Uuid) -> sqlx::Result<Vec<Uuid>> {
+    sqlx::query_scalar(
+        "SELECT user_id FROM user_group_members WHERE group_id = $1 ORDER BY user_id",
+    )
+    .bind(group_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// Member ids for many groups in one query.
+///
+/// The list endpoint previously issued one query per group (classic N+1).
+pub async fn group_member_ids_for(
+    pool: &PgPool,
+    group_ids: &[Uuid],
+) -> sqlx::Result<HashMap<Uuid, Vec<Uuid>>> {
+    let mut out: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+    if group_ids.is_empty() {
+        return Ok(out);
+    }
+    let rows: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        "SELECT group_id, user_id FROM user_group_members \
+         WHERE group_id = ANY($1) ORDER BY group_id, user_id",
+    )
+    .bind(group_ids)
+    .fetch_all(pool)
+    .await?;
+    for (group_id, user_id) in rows {
+        out.entry(group_id).or_default().push(user_id);
+    }
+    Ok(out)
+}
+
+pub async fn set_group_members(
+    pool: &PgPool,
+    group_id: Uuid,
+    user_ids: &[Uuid],
+) -> sqlx::Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM user_group_members WHERE group_id = $1")
+        .bind(group_id)
+        .execute(&mut *tx)
+        .await?;
+    for user_id in user_ids {
+        sqlx::query(
+            "INSERT INTO user_group_members (group_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        )
+        .bind(group_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    // Membership marks the user as restricted from now on, even if they are
+    // removed from every group later.
+    if !user_ids.is_empty() {
+        sqlx::query("UPDATE users SET permissions_restricted = TRUE WHERE id = ANY($1)")
+            .bind(user_ids)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct PurgeRetryRow {
+    pub id: uuid::Uuid,
+    pub node_id: String,
+    pub agent_url: String,
+    pub payload: sqlx::types::Json<serde_json::Value>,
+    pub attempts: i32,
+    pub auth_token: String,
+}
+
+pub async fn list_nodes_with_agent(pool: &PgPool) -> sqlx::Result<Vec<(String, String, String)>> {
+    sqlx::query_as(
+        r#"
+        SELECT name, COALESCE(agent_url, ''), COALESCE(auth_token, '')
+        FROM edge_nodes
+        WHERE COALESCE(agent_url, '') <> ''
+        ORDER BY name
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn enqueue_purge_retry(
+    pool: &PgPool,
+    node_id: &str,
+    agent_url: &str,
+    payload: &serde_json::Value,
+    error: &str,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO purge_retries (node_id, agent_url, payload, last_error)
+        VALUES ($1, $2, $3, $4)
+        "#,
+    )
+    .bind(node_id)
+    .bind(agent_url)
+    .bind(sqlx::types::Json(payload))
+    .bind(error)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Delete purge retries that have used up their attempts.
+///
+/// `due_purge_retries` only selects `attempts < 10`, so a row that reached 10 was
+/// invisible to the loop and its `DELETE` was never issued — a node offline long
+/// enough left a row behind forever. Sweeping by the same threshold the SELECT uses
+/// keeps the two in step: whatever cannot be selected cannot accumulate.
+pub async fn purge_exhausted_retries(pool: &PgPool) -> sqlx::Result<u64> {
+    let result = sqlx::query("DELETE FROM purge_retries WHERE attempts >= 10")
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+pub async fn due_purge_retries(pool: &PgPool, limit: i64) -> sqlx::Result<Vec<PurgeRetryRow>> {
+    sqlx::query_as::<_, PurgeRetryRow>(
+        r#"
+        SELECT r.id, r.node_id, r.agent_url, r.payload, r.attempts,
+               COALESCE(n.auth_token, '') AS auth_token
+        FROM purge_retries r
+        LEFT JOIN edge_nodes n ON n.name = r.node_id
+        WHERE r.next_at <= NOW() AND r.attempts < 10
+        ORDER BY r.next_at
+        LIMIT $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn finish_purge_retry(pool: &PgPool, id: uuid::Uuid) -> sqlx::Result<()> {
+    sqlx::query("DELETE FROM purge_retries WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn defer_purge_retry(
+    pool: &PgPool,
+    id: uuid::Uuid,
+    attempts: i32,
+    error: &str,
+) -> sqlx::Result<()> {
+    let delay_secs = (30_i64 * (1_i64 << attempts.clamp(0, 6))).min(3600);
+    sqlx::query(
+        r#"
+        UPDATE purge_retries
+        SET attempts = attempts + 1,
+            next_at = NOW() + make_interval(secs => $2),
+            last_error = $3
+        WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .bind(delay_secs as f64)
+    .bind(error)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Publish DNS-01 challenge values in one transaction.
+///
+/// `records` are `(owner, value)` pairs with owners relative to the zone
+/// (`_acme-challenge`, `_acme-challenge.www`), the same form the DNS servers
+/// match against. An apex+wildcard order has two values at the same owner, so
+/// both are inserted side by side. The serial bump makes every lagran-dns apply
+/// the change on its next sync.
+pub async fn publish_acme_txt(
+    pool: &PgPool,
+    zone_id: Uuid,
+    records: &[(String, String)],
+) -> sqlx::Result<()> {
+    let mut owners: Vec<String> = records.iter().map(|(o, _)| o.clone()).collect();
+    owners.sort();
+    owners.dedup();
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM dns_records WHERE zone_id = $1 AND rtype = 'TXT' AND name = ANY($2)")
+        .bind(zone_id)
+        .bind(&owners)
+        .execute(&mut *tx)
+        .await?;
+    for (owner, value) in records {
+        sqlx::query(
+            r#"
+            INSERT INTO dns_records (zone_id, name, rtype, content, ttl, priority, cdn_proxied, enabled)
+            VALUES ($1, $2, 'TXT', $3, 30, NULL, FALSE, TRUE)
+            ON CONFLICT DO NOTHING
+            "#,
+        )
+        .bind(zone_id)
+        .bind(owner)
+        .bind(value)
+        .execute(&mut *tx)
+        .await?;
+    }
+    sqlx::query("UPDATE dns_zones SET serial = serial + 1, updated_at = NOW() WHERE id = $1")
+        .bind(zone_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await
+}
+
+/// Remove DNS-01 challenge records (success or failure) and bump the serial.
+pub async fn remove_acme_txt(pool: &PgPool, zone_id: Uuid, owners: &[String]) -> sqlx::Result<()> {
+    if owners.is_empty() {
+        return Ok(());
+    }
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM dns_records WHERE zone_id = $1 AND rtype = 'TXT' AND name = ANY($2)")
+        .bind(zone_id)
+        .bind(owners)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE dns_zones SET serial = serial + 1, updated_at = NOW() WHERE id = $1")
+        .bind(zone_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct DnsZoneMeta {
+    pub id: Uuid,
+    pub name: String,
+    pub kind: String,
+    pub project_id: Option<Uuid>,
+}
+
+pub async fn get_dns_zone_meta(pool: &PgPool, zone_id: Uuid) -> sqlx::Result<Option<DnsZoneMeta>> {
+    sqlx::query_as::<_, DnsZoneMeta>(
+        "SELECT id, lower(rtrim(btrim(name), '.')) AS name, kind, project_id FROM dns_zones WHERE id = $1",
+    )
+    .bind(zone_id)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn get_dns_zone_meta_by_name(pool: &PgPool, name: &str) -> sqlx::Result<Option<DnsZoneMeta>> {
+    let name = name.trim().trim_end_matches('.').to_ascii_lowercase();
+    sqlx::query_as::<_, DnsZoneMeta>(
+        r#"
+        SELECT id, lower(rtrim(btrim(name), '.')) AS name, kind, project_id
+        FROM dns_zones
+        WHERE lower(rtrim(btrim(name), '.')) = $1
+        LIMIT 1
+        "#,
+    )
+    .bind(name)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Glue IPs of a zone's NS set (the servers LE will query).
+pub async fn dns_zone_ns_ips(pool: &PgPool, zone_id: Uuid) -> sqlx::Result<Vec<String>> {
+    sqlx::query_scalar("SELECT ip FROM dns_zone_ns WHERE zone_id = $1 ORDER BY sort_order, name")
+        .bind(zone_id)
+        .fetch_all(pool)
+        .await
+}
+
+/// Platform NS hostnames from the schedule zone (for delegation checks).
+pub async fn platform_ns_names(pool: &PgPool) -> sqlx::Result<Vec<String>> {
+    sqlx::query_scalar(
+        r#"
+        SELECT lower(rtrim(btrim(n.name), '.'))
+        FROM dns_settings s
+        JOIN dns_zone_ns n ON n.zone_id = s.schedule_zone_id
+        ORDER BY n.sort_order, n.name
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct PlatformNsRow {
+    pub name: String,
+    pub ip: String,
+}
+
+/// Full platform NS + glue from the schedule zone.
+pub async fn platform_ns_entries(pool: &PgPool) -> sqlx::Result<Vec<PlatformNsRow>> {
+    sqlx::query_as::<_, PlatformNsRow>(
+        r#"
+        SELECT n.name, n.ip
+        FROM dns_settings s
+        JOIN dns_zone_ns n ON n.zone_id = s.schedule_zone_id
+        ORDER BY n.sort_order, n.name
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn get_dns_zone_by_name(pool: &PgPool, name: &str) -> sqlx::Result<Option<(Uuid, String)>> {
+    let name = name.trim().trim_end_matches('.').to_ascii_lowercase();
+    sqlx::query_as::<_, (Uuid, String)>(
+        r#"
+        SELECT id, name FROM dns_zones
+        WHERE lower(rtrim(btrim(name), '.')) = $1
+        LIMIT 1
+        "#,
+    )
+    .bind(name)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Ensure a hosted zone for NS access: copy platform NS, create proxied A records.
+///
+/// An existing zone is reused only when it belongs to the same project as the
+/// site. Otherwise any tenant could create `anything.victim.com` in NS mode and
+/// get records written into victim.com's zone — which the platform serves
+/// authoritatively — taking over a subdomain of someone else's domain. The
+/// platform schedule zone is never reused for site records.
+pub async fn ensure_ns_hosted_zone(
+    pool: &PgPool,
+    apex: &str,
+    hostnames: &[String],
+    project_id: Option<Uuid>,
+) -> sqlx::Result<Uuid> {
+    let apex = apex.trim().trim_end_matches('.').to_ascii_lowercase();
+    if let Some(zone) = get_dns_zone_meta_by_name(pool, &apex).await? {
+        if zone.kind == "schedule" {
+            return Err(sqlx::Error::Protocol(format!(
+                "{apex} 是平台调度域，不能作为站点的托管 Zone"
+            )));
+        }
+        if zone.project_id != project_id {
+            return Err(sqlx::Error::Protocol(format!(
+                "{apex} 已由其他项目托管，不能在其中添加站点记录"
+            )));
+        }
+        // Keep NS in sync with the current schedule zone glue.
+        sync_zone_ns_from_platform(pool, zone.id).await?;
+        ensure_proxied_hostnames(pool, zone.id, &apex, hostnames).await?;
+        bump_dns_zone_serial(pool, zone.id).await?;
+        return Ok(zone.id);
+    }
+
+    let ns = platform_ns_entries(pool).await?;
+    if ns.is_empty() {
+        return Err(sqlx::Error::Protocol(
+            "platform schedule zone has no NS entries; configure CDN 主域 first".into(),
+        ));
+    }
+    let soa_mname = ns
+        .first()
+        .map(|n| n.name.trim_end_matches('.').to_ascii_lowercase())
+        .unwrap_or_else(|| format!("ns1.{apex}"));
+    let soa_rname = format!("hostmaster.{apex}");
+
+    let mut tx = pool.begin().await?;
+    let zone_id: Uuid = sqlx::query_scalar(
+        r#"
+        INSERT INTO dns_zones (name, kind, soa_mname, soa_rname, ttl_default, serial, enabled, project_id)
+        VALUES ($1, 'hosted', $2, $3, 30, 1, TRUE, $4)
+        RETURNING id
+        "#,
+    )
+    .bind(&apex)
+    .bind(&soa_mname)
+    .bind(&soa_rname)
+    .bind(project_id)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    for (idx, entry) in ns.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO dns_zone_ns (zone_id, name, ip, sort_order) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(zone_id)
+        .bind(entry.name.trim_end_matches('.').to_ascii_lowercase())
+        .bind(&entry.ip)
+        .bind(idx as i32)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+
+    ensure_proxied_hostnames(pool, zone_id, &apex, hostnames).await?;
+    Ok(zone_id)
+}
+
+/// Sync NS/glue of a hosted zone from the platform schedule zone.
+pub async fn sync_zone_ns_from_platform(pool: &PgPool, zone_id: Uuid) -> sqlx::Result<()> {
+    let ns = platform_ns_entries(pool).await?;
+    if ns.is_empty() {
+        return Ok(());
+    }
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM dns_zone_ns WHERE zone_id = $1")
+        .bind(zone_id)
+        .execute(&mut *tx)
+        .await?;
+    for (idx, entry) in ns.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO dns_zone_ns (zone_id, name, ip, sort_order) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(zone_id)
+        .bind(entry.name.trim_end_matches('.').to_ascii_lowercase())
+        .bind(&entry.ip)
+        .bind(idx as i32)
+        .execute(&mut *tx)
+        .await?;
+    }
+    if let Some(first) = ns.first() {
+        let mname = first.name.trim_end_matches('.').to_ascii_lowercase();
+        sqlx::query(
+            "UPDATE dns_zones SET soa_mname = $2, updated_at = NOW() WHERE id = $1 AND kind = 'hosted'",
+        )
+        .bind(zone_id)
+        .bind(&mname)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Propagate schedule NS/glue into every hosted zone that serves the platform's
+/// NS set: zones of NS-access sites, zones with no NS of their own yet, and
+/// zones whose NS still equal `previous_ns` (the platform set before this
+/// save). A zone with its own NS names (vanity NS) is left alone.
+///
+/// Zones added on the 域名与记录 page used to get no NS at all, so lagran-dns
+/// skipped them and their records were never served.
+pub async fn propagate_schedule_ns_to_ns_zones(pool: &PgPool, previous_ns: &[String]) -> sqlx::Result<u64> {
+    let mut previous: Vec<String> = previous_ns
+        .iter()
+        .map(|n| n.trim().trim_end_matches('.').to_ascii_lowercase())
+        .filter(|n| !n.is_empty())
+        .collect();
+    previous.sort();
+    previous.dedup();
+    let zone_ids: Vec<Uuid> = sqlx::query_scalar(
+        r#"
+        SELECT z.id
+        FROM dns_zones z
+        WHERE z.kind = 'hosted'
+          AND (
+            EXISTS (SELECT 1 FROM domains d
+                    WHERE d.dns_zone_id = z.id AND COALESCE(d.access_mode, 'cname') = 'ns')
+            OR NOT EXISTS (SELECT 1 FROM dns_zone_ns n WHERE n.zone_id = z.id)
+            OR (cardinality($1::text[]) > 0
+                AND ARRAY(SELECT lower(rtrim(n.name, '.')) FROM dns_zone_ns n WHERE n.zone_id = z.id) @> $1::text[]
+                AND ARRAY(SELECT lower(rtrim(n.name, '.')) FROM dns_zone_ns n WHERE n.zone_id = z.id) <@ $1::text[])
+          )
+        "#,
+    )
+    .bind(&previous)
+    .fetch_all(pool)
+    .await?;
+    let mut n = 0u64;
+    for id in zone_ids {
+        sync_zone_ns_from_platform(pool, id).await?;
+        bump_dns_zone_serial(pool, id).await?;
+        n += 1;
+    }
+    Ok(n)
+}
+
+/// Give hosted zones that have no NS the platform's set (startup repair).
+///
+/// Such zones were skipped by lagran-dns, so this only ever makes a zone
+/// servable; zones that already have NS are not touched. Does nothing until
+/// the CDN 主域 has NS servers.
+pub async fn repair_hosted_zones_without_ns(pool: &PgPool) -> sqlx::Result<u64> {
+    if platform_ns_entries(pool).await?.is_empty() {
+        return Ok(0);
+    }
+    let zone_ids: Vec<Uuid> = sqlx::query_scalar(
+        r#"
+        SELECT z.id
+        FROM dns_zones z
+        WHERE z.kind = 'hosted'
+          AND NOT EXISTS (SELECT 1 FROM dns_zone_ns n WHERE n.zone_id = z.id)
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut n = 0u64;
+    for id in zone_ids {
+        sync_zone_ns_from_platform(pool, id).await?;
+        bump_dns_zone_serial(pool, id).await?;
+        n += 1;
+    }
+    Ok(n)
+}
+
+pub async fn bump_dns_zone_serial(pool: &PgPool, zone_id: Uuid) -> sqlx::Result<i64> {
+    sqlx::query_scalar(
+        "UPDATE dns_zones SET serial = serial + 1, updated_at = NOW() WHERE id = $1 RETURNING serial",
+    )
+    .bind(zone_id)
+    .fetch_one(pool)
+    .await
+}
+
+/// Relative owner of `hostname` inside `zone` (`@` for the apex).
+pub fn relative_owner(hostname: &str, zone: &str) -> Option<String> {
+    let host = hostname.trim().trim_end_matches('.').to_ascii_lowercase();
+    let zone = zone.trim().trim_end_matches('.').to_ascii_lowercase();
+    if host == zone {
+        Some("@".into())
+    } else {
+        host.strip_suffix(&format!(".{zone}"))
+            .filter(|rest| !rest.is_empty())
+            .map(str::to_string)
+    }
+}
+
+/// Create/update proxied A placeholders for NS hostnames (answers flattened by GeoDNS).
+///
+/// Used when bootstrapping a zone before the site row is linked. Prefer
+/// [`sync_site_managed_dns`] once `domains.dns_zone_id` is set — that path also
+/// respects `cdn_enabled` (grey cloud → origin).
+async fn ensure_proxied_hostnames(
+    pool: &PgPool,
+    zone_id: Uuid,
+    apex: &str,
+    hostnames: &[String],
+) -> sqlx::Result<()> {
+    let mut changed = false;
+    for host in hostnames {
+        // Outside this apex — skip; CNAME path handles those.
+        let Some(relative) = relative_owner(host, apex) else {
+            continue;
+        };
+        // A proxied CNAME written by an earlier build for this name becomes a
+        // proxied A, so A queries never depend on CNAME flattening. Only this
+        // site's own names are touched.
+        let converted = sqlx::query(
+            r#"
+            UPDATE dns_records
+            SET rtype = 'A', content = '0.0.0.0', updated_at = NOW()
+            WHERE zone_id = $1 AND lower(name) = lower($2)
+              AND upper(rtype) = 'CNAME' AND cdn_proxied = TRUE AND enabled = TRUE
+            "#,
+        )
+        .bind(zone_id)
+        .bind(&relative)
+        .execute(pool)
+        .await?
+        .rows_affected();
+        if converted > 0 {
+            changed = true;
+        }
+        // Only address-type records (or a delegation) conflict with the proxied
+        // A. MX/TXT/CAA at the same name — always present at a real apex —
+        // must not keep the site from resolving.
+        let exists: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS(
+              SELECT 1 FROM dns_records
+              WHERE zone_id = $1 AND lower(name) = lower($2) AND enabled = TRUE
+                AND upper(rtype) IN ('A', 'AAAA', 'CNAME', 'NS')
+            )
+            "#,
+        )
+        .bind(zone_id)
+        .bind(&relative)
+        .fetch_one(pool)
+        .await?;
+        if exists {
+            continue;
+        }
+        // Always proxied A: NS access answers A/AAAA via GeoDNS, never an extra CNAME hop.
+        sqlx::query(
+            r#"
+            INSERT INTO dns_records (zone_id, name, rtype, content, ttl, priority, cdn_proxied, enabled)
+            VALUES ($1, $2, 'A', '0.0.0.0', 30, NULL, TRUE, TRUE)
+            ON CONFLICT DO NOTHING
+            "#,
+        )
+        .bind(zone_id)
+        .bind(&relative)
+        .execute(pool)
+        .await?;
+        changed = true;
+    }
+    if changed {
+        let _ = bump_dns_zone_serial(pool, zone_id).await;
+    }
+    Ok(())
+}
+
+/// Primary origin host for DNS-only answers (first enabled by priority/weight).
+fn primary_dns_origin_host(origins: &[DomainOrigin], fallback: &str) -> String {
+    let mut enabled: Vec<&DomainOrigin> = origins
+        .iter()
+        .filter(|o| o.enabled && !o.host.trim().is_empty())
+        .collect();
+    enabled.sort_by_key(|o| (o.priority, std::cmp::Reverse(o.weight)));
+    enabled
+        .first()
+        .map(|o| o.host.trim().to_string())
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| fallback.trim().to_string())
+}
+
+/// Map an origin host to a static DNS (rtype, content). IP → A/AAAA; name → CNAME.
+fn origin_to_dns_target(host: &str) -> Option<(String, String)> {
+    let host = host.trim().trim_end_matches('.');
+    if host.is_empty() {
+        return None;
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => Some(("A".into(), v4.to_string())),
+            std::net::IpAddr::V6(v6) => Some(("AAAA".into(), v6.to_string())),
+        };
+    }
+    Some(("CNAME".into(), host.to_ascii_lowercase()))
+}
+
+/// Apply the site's CDN switch to its managed DNS records (orange / grey cloud).
+///
+/// - `cdn_enabled = true`: proxied A placeholder → GeoDNS edge IPs
+/// - `cdn_enabled = false`: record stays; answers with origin IP or CNAME
+///
+/// No-op for CNAME-access sites (platform does not own their DNS).
+pub async fn sync_site_managed_dns(pool: &PgPool, domain_id: Uuid) -> sqlx::Result<()> {
+    let Some(domain) = get_domain(pool, domain_id).await? else {
+        return Ok(());
+    };
+    if !domain.access_mode.eq_ignore_ascii_case("ns") {
+        return Ok(());
+    }
+    let Some(zone_id) = domain.dns_zone_id else {
+        return Ok(());
+    };
+    let Some(zone) = get_dns_zone_meta(pool, zone_id).await? else {
+        return Ok(());
+    };
+    let apex = zone.name.clone();
+
+    let mut hostnames: Vec<String> = sqlx::query_scalar(
+        "SELECT hostname FROM domain_hostnames WHERE domain_id = $1 ORDER BY is_primary DESC, hostname",
+    )
+    .bind(domain_id)
+    .fetch_all(pool)
+    .await?;
+    if hostnames.is_empty() {
+        hostnames.push(domain.name.clone());
+    }
+
+    let origins = if domain.origins.0.is_empty() {
+        vec![DomainOrigin {
+            host: domain.origin_host.clone(),
+            port: domain.origin_port.max(0) as u16,
+            proto: if domain.origin_proto.is_empty() {
+                "http".into()
+            } else {
+                domain.origin_proto.clone()
+            },
+            weight: 100,
+            priority: 0,
+            enabled: true,
+            sni: None,
+            host_header: None,
+        }]
+    } else {
+        domain.origins.0.clone()
+    };
+    let primary = primary_dns_origin_host(&origins, &domain.origin_host);
+
+    let cdn_on = domain.cdn_enabled.unwrap_or(true);
+    let (rtype, content, proxied) = if cdn_on {
+        ("A".to_string(), "0.0.0.0".to_string(), true)
+    } else {
+        match origin_to_dns_target(&primary) {
+            Some((r, c)) => (r, c, false),
+            None => {
+                tracing::warn!(
+                    site = %domain.name,
+                    "cdn disabled but origin host empty; leaving DNS unchanged"
+                );
+                return Ok(());
+            }
+        }
+    };
+
+    let mut changed = false;
+    for host in &hostnames {
+        let Some(relative) = relative_owner(host, &apex) else {
+            continue;
+        };
+
+        // Drop this site's other managed rows for the name (rtype may change).
+        let deleted = sqlx::query(
+            r#"
+            DELETE FROM dns_records
+            WHERE zone_id = $1
+              AND lower(name) = lower($2)
+              AND managed_by_site_id = $3
+              AND NOT (upper(rtype) = upper($4) AND content = $5 AND cdn_proxied = $6)
+            "#,
+        )
+        .bind(zone_id)
+        .bind(&relative)
+        .bind(domain_id)
+        .bind(&rtype)
+        .bind(&content)
+        .bind(proxied)
+        .execute(pool)
+        .await?
+        .rows_affected();
+        if deleted > 0 {
+            changed = true;
+        }
+
+        // Claim legacy proxied rows for this hostname (pre-managed_by_site_id).
+        let claimed = sqlx::query(
+            r#"
+            UPDATE dns_records
+            SET managed_by_site_id = $3,
+                rtype = $4,
+                content = $5,
+                cdn_proxied = $6,
+                enabled = TRUE,
+                updated_at = NOW()
+            WHERE zone_id = $1
+              AND lower(name) = lower($2)
+              AND managed_by_site_id IS NULL
+              AND cdn_proxied = TRUE
+              AND upper(rtype) IN ('A', 'AAAA', 'CNAME')
+            "#,
+        )
+        .bind(zone_id)
+        .bind(&relative)
+        .bind(domain_id)
+        .bind(&rtype)
+        .bind(&content)
+        .bind(proxied)
+        .execute(pool)
+        .await?
+        .rows_affected();
+        if claimed > 0 {
+            changed = true;
+            continue;
+        }
+
+        let updated = sqlx::query(
+            r#"
+            UPDATE dns_records
+            SET rtype = $4,
+                content = $5,
+                cdn_proxied = $6,
+                enabled = TRUE,
+                ttl = CASE WHEN $6 THEN 30 ELSE GREATEST(ttl, 60) END,
+                updated_at = NOW()
+            WHERE zone_id = $1
+              AND lower(name) = lower($2)
+              AND managed_by_site_id = $3
+            "#,
+        )
+        .bind(zone_id)
+        .bind(&relative)
+        .bind(domain_id)
+        .bind(&rtype)
+        .bind(&content)
+        .bind(proxied)
+        .execute(pool)
+        .await?
+        .rows_affected();
+        if updated > 0 {
+            changed = true;
+            continue;
+        }
+
+        // No managed row yet. Do not overwrite a user's address record.
+        let conflict: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS(
+              SELECT 1 FROM dns_records
+              WHERE zone_id = $1 AND lower(name) = lower($2) AND enabled = TRUE
+                AND upper(rtype) IN ('A', 'AAAA', 'CNAME', 'NS')
+                AND managed_by_site_id IS DISTINCT FROM $3
+            )
+            "#,
+        )
+        .bind(zone_id)
+        .bind(&relative)
+        .bind(domain_id)
+        .fetch_one(pool)
+        .await?;
+        if conflict {
+            continue;
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO dns_records
+                (zone_id, name, rtype, content, ttl, priority, cdn_proxied, enabled, managed_by_site_id)
+            VALUES ($1, $2, $3, $4, $5, NULL, $6, TRUE, $7)
+            ON CONFLICT DO NOTHING
+            "#,
+        )
+        .bind(zone_id)
+        .bind(&relative)
+        .bind(&rtype)
+        .bind(&content)
+        .bind(if proxied { 30i32 } else { 60i32 })
+        .bind(proxied)
+        .bind(domain_id)
+        .execute(pool)
+        .await?;
+        changed = true;
+    }
+
+    if changed {
+        let _ = bump_dns_zone_serial(pool, zone_id).await;
+    }
+    Ok(())
+}
+
+pub async fn set_domain_cdn_enabled(
+    pool: &PgPool,
+    id: Uuid,
+    enabled: bool,
+) -> sqlx::Result<Option<DomainRow>> {
+    sqlx::query("UPDATE domains SET cdn_enabled = $2, updated_at = NOW() WHERE id = $1")
+        .bind(id)
+        .bind(enabled)
+        .execute(pool)
+        .await?;
+    sync_site_managed_dns(pool, id).await?;
+    get_domain(pool, id).await
+}
+
+/// Drop the auto-managed A/AAAA/CNAME records of hostnames that left the site
+/// (hostname removed, site deleted, or switched to CNAME access).
+/// User-created records (neither proxied nor `managed_by_site_id`) are kept.
+pub async fn remove_proxied_hostnames(
+    pool: &PgPool,
+    zone_id: Uuid,
+    zone: &str,
+    hostnames: &[String],
+) -> sqlx::Result<u64> {
+    let owners: Vec<String> = hostnames
+        .iter()
+        .filter_map(|h| relative_owner(h, zone))
+        .collect();
+    if owners.is_empty() {
+        return Ok(0);
+    }
+    let r = sqlx::query(
+        r#"
+        DELETE FROM dns_records
+        WHERE zone_id = $1
+          AND lower(name) = ANY($2)
+          AND upper(rtype) IN ('A', 'AAAA', 'CNAME')
+          AND (cdn_proxied = TRUE OR managed_by_site_id IS NOT NULL)
+        "#,
+    )
+    .bind(zone_id)
+    .bind(&owners)
+    .execute(pool)
+    .await?;
+    if r.rows_affected() > 0 {
+        bump_dns_zone_serial(pool, zone_id).await?;
+    }
+    Ok(r.rows_affected())
+}
+
+/// Remove a site's proxied records from its hosted zone (site delete / leaving NS).
+pub async fn detach_site_dns(pool: &PgPool, domain_id: Uuid) -> sqlx::Result<()> {
+    let row: Option<(Option<Uuid>, String)> = sqlx::query_as(
+        "SELECT dns_zone_id, COALESCE(access_mode, 'cname') FROM domains WHERE id = $1",
+    )
+    .bind(domain_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some((Some(zone_id), _)) = row else {
+        return Ok(());
+    };
+    let Some(zone) = get_dns_zone_meta(pool, zone_id).await? else {
+        return Ok(());
+    };
+    // The primary name too: sites created before domain_hostnames may lack its row.
+    let names: Vec<String> = sqlx::query_scalar(
+        r#"
+        SELECT lower(rtrim(btrim(name), '.')) FROM domains WHERE id = $1
+        UNION
+        SELECT lower(rtrim(btrim(hostname), '.')) FROM domain_hostnames WHERE domain_id = $1
+        "#,
+    )
+    .bind(domain_id)
+    .fetch_all(pool)
+    .await?;
+    remove_proxied_hostnames(pool, zone_id, &zone.name, &names).await?;
+    Ok(())
+}
+
+/// Apply access_mode DNS side-effects for a domain (NS zone ensure / CNAME detach).
+pub async fn sync_domain_access_dns(
+    pool: &PgPool,
+    domain_id: Uuid,
+    access_mode: &str,
+    primary_name: &str,
+    _schedule_cname: Option<&str>,
+) -> sqlx::Result<Option<Uuid>> {
+    let mode = access_mode.trim().to_ascii_lowercase();
+    let hostnames: Vec<String> = sqlx::query_scalar(
+        "SELECT hostname FROM domain_hostnames WHERE domain_id = $1 ORDER BY is_primary DESC, hostname",
+    )
+    .bind(domain_id)
+    .fetch_all(pool)
+    .await?;
+    let mut names = hostnames;
+    if names.is_empty() {
+        names.push(primary_name.to_string());
+    }
+    let project_id: Option<Uuid> = sqlx::query_scalar("SELECT project_id FROM domains WHERE id = $1")
+        .bind(domain_id)
+        .fetch_optional(pool)
+        .await?
+        .flatten();
+    if mode == "ns" {
+        let apex = crate::service::auto_https::site_apex(primary_name);
+        let zone_id = ensure_ns_hosted_zone(pool, &apex, &names, project_id).await?;
+        set_domain_dns_zone(pool, domain_id, Some(zone_id)).await?;
+        // Claim/refresh managed rows and honour cdn_enabled (grey cloud).
+        sync_site_managed_dns(pool, domain_id).await?;
+        return Ok(Some(zone_id));
+    }
+    // CNAME mode: the platform no longer answers for these names; drop the
+    // proxied records so they stop resolving to the CDN, keep the zone itself.
+    detach_site_dns(pool, domain_id).await?;
+    set_domain_dns_zone(pool, domain_id, None).await?;
+    Ok(None)
+}
