@@ -67,7 +67,12 @@ async fn sync_once(
                 // The bulk response is the complete active set, so it also tells us
                 // which certificates must be dropped. Without this a certificate
                 // deleted or disabled in the console stayed installed forever.
-                let mut active_domains: Vec<String> = Vec::with_capacity(list.len());
+                // Keep every DNS SAN (apex + `*.apex` + hostnames), not only
+                // `certificates.domain_name`. Upserting the row name alone then
+                // calling retain_only used to prune the wildcard aliases that
+                // ACME push installed, so a second site's subdomain fell back
+                // to the first site's default certificate.
+                let mut active_domains: Vec<String> = Vec::with_capacity(list.len() * 2);
                 for cert in list {
                     if cert.status != "active" && !cert.status.is_empty() {
                         continue;
@@ -75,19 +80,29 @@ async fn sync_once(
                     if cert.cert_pem.is_empty() || cert.key_pem.is_empty() {
                         continue;
                     }
+                    let names = crate::server::cert_store::index_names_for_cert(
+                        &cert.domain,
+                        cert.cert_pem.as_bytes(),
+                    );
+                    if names.is_empty() {
+                        tracing::warn!(domain = %cert.domain, "cert has no index names, skip");
+                        continue;
+                    }
                     match store.upsert(
-                        std::slice::from_ref(&cert.domain),
+                        &names,
                         cert.cert_pem.as_bytes(),
                         cert.key_pem.as_bytes(),
                     ) {
                         Ok(()) => {
                             applied += 1;
                             if !config.domain.is_empty()
-                                && cert.domain.eq_ignore_ascii_case(&config.domain)
+                                && names
+                                    .iter()
+                                    .any(|n| n.eq_ignore_ascii_case(&config.domain))
                             {
                                 covered_configured = true;
                             }
-                            active_domains.push(cert.domain.clone());
+                            active_domains.extend(names);
                             tracing::debug!(domain = %cert.domain, "cert applied from edge-sync");
                         }
                         Err(e) => {
@@ -131,13 +146,20 @@ async fn sync_once(
             if (cert.status == "active" || cert.status.is_empty())
                 && !cert.cert_pem.is_empty()
                 && !cert.key_pem.is_empty()
-                && store
-                    .upsert(
-                        std::slice::from_ref(&cert.domain),
+                && {
+                    let names = crate::server::cert_store::index_names_for_cert(
+                        &cert.domain,
                         cert.cert_pem.as_bytes(),
-                        cert.key_pem.as_bytes(),
-                    )
-                    .is_ok()
+                    );
+                    !names.is_empty()
+                        && store
+                            .upsert(
+                                &names,
+                                cert.cert_pem.as_bytes(),
+                                cert.key_pem.as_bytes(),
+                            )
+                            .is_ok()
+                }
             {
                 applied += 1;
             }

@@ -274,19 +274,29 @@ impl CertStore {
     }
 
     /// Parsed certificate/key for the OpenSSL-based Pingora TLS listener.
-    /// Exact SNI first, then `*.example.com`, then the first/default cert.
+    ///
+    /// Exact SNI first, then a one-label wildcard (`www.example.com` →
+    /// `*.example.com`). A named SNI that matches nothing returns `None` —
+    /// never the first/default certificate — so a missing second-site cert
+    /// cannot be silently replaced by the first site's leaf (browser name
+    /// mismatch). Empty SNI still uses the default, if any.
     pub fn certificate_for(&self, name: &str) -> Option<OpenSslKeyPair> {
         let guard = self.inner.read().ok()?;
         let key = name.trim().trim_end_matches('.').to_ascii_lowercase();
+        if key.is_empty() {
+            return guard.openssl_default.clone();
+        }
         if let Some(v) = guard.openssl.get(&key) {
             return Some(v.clone());
         }
         if let Some((_, rest)) = key.split_once('.') {
-            if let Some(v) = guard.openssl.get(&format!("*.{rest}")) {
-                return Some(v.clone());
+            if !rest.is_empty() {
+                if let Some(v) = guard.openssl.get(&format!("*.{rest}")) {
+                    return Some(v.clone());
+                }
             }
         }
-        guard.openssl_default.clone()
+        None
     }
 
     pub fn resolver(self: &Arc<Self>) -> Arc<DynResolver> {
@@ -311,14 +321,80 @@ impl std::fmt::Debug for DynResolver {
 impl ResolvesServerCert for DynResolver {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         let guard = self.store.inner.read().ok()?;
-        if let Some(name) = client_hello.server_name() {
-            let key = name.to_lowercase();
-            if let Some(ck) = guard.by_name.get(&key) {
-                return Some(ck.clone());
+        let Some(name) = client_hello.server_name() else {
+            return guard.default.clone();
+        };
+        let key = name.to_lowercase();
+        if let Some(ck) = guard.by_name.get(&key) {
+            return Some(ck.clone());
+        }
+        if let Some((_, rest)) = key.split_once('.') {
+            if !rest.is_empty() {
+                if let Some(ck) = guard.by_name.get(&format!("*.{rest}")) {
+                    return Some(ck.clone());
+                }
             }
         }
-        guard.default.clone()
+        // Named SNI with no match: refuse rather than serving another site's cert.
+        None
     }
+}
+
+/// Index names for a certificate: every DNS SAN on the leaf, plus `fallback`
+/// (usually `certificates.domain_name`) when the PEM has no usable names.
+///
+/// Edge sync used to upsert only `domain_name`, then `retain_only` pruned the
+/// `*.apex` / hostname aliases that ACME push had installed — so a second
+/// site's subdomain fell through to the first site's default certificate.
+pub fn index_names_for_cert(fallback: &str, cert_pem: &[u8]) -> Vec<String> {
+    let mut names = dns_names_from_pem(cert_pem);
+    let fb = normalize_cert_name(fallback);
+    if !fb.is_empty() && !names.iter().any(|n| n == &fb) {
+        names.push(fb);
+    }
+    if names.is_empty() {
+        // Unparseable PEM still needs a key so upsert can proceed; lookup by
+        // SAN will fail until a good cert replaces it.
+        let fb = normalize_cert_name(fallback);
+        if !fb.is_empty() {
+            names.push(fb);
+        }
+    }
+    names
+}
+
+fn dns_names_from_pem(cert_pem: &[u8]) -> Vec<String> {
+    let Ok(stack) = X509::stack_from_pem(cert_pem) else {
+        return Vec::new();
+    };
+    let Some(leaf) = stack.first() else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    if let Some(sans) = leaf.subject_alt_names() {
+        for san in sans {
+            if let Some(dns) = san.dnsname() {
+                let n = normalize_cert_name(dns);
+                if !n.is_empty() && !names.iter().any(|x| x == &n) {
+                    names.push(n);
+                }
+            }
+        }
+    }
+    // CN fallback when the leaf has no SAN (legacy / broken PEMs).
+    if names.is_empty() {
+        if let Some(entry) = leaf
+            .subject_name()
+            .entries_by_nid(openssl::nid::Nid::COMMONNAME)
+            .next()
+        {
+            let n = normalize_cert_name(&entry.data().to_string());
+            if !n.is_empty() {
+                names.push(n);
+            }
+        }
+    }
+    names
 }
 
 fn parse_certified_key(cert_pem: &[u8], key_pem: &[u8]) -> Result<CertifiedKey, String> {
@@ -624,8 +700,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Emptying the store must clear the default, or a removed certificate keeps
-    /// being served to clients whose SNI matches nothing.
+    /// Emptying the store must clear the default used for empty SNI.
     #[test]
     fn removing_the_last_certificate_clears_the_default() {
         let store = CertStore::new();
@@ -633,11 +708,71 @@ mod tests {
         store
             .upsert(&["only.example".to_string()], &cert, &key)
             .unwrap();
-        assert!(store.certificate_for("unmatched.example").is_some());
+        assert!(store.certificate_for("").is_some());
         store.remove("only.example");
         assert!(
-            store.certificate_for("unmatched.example").is_none(),
+            store.certificate_for("").is_none(),
             "default must not outlive the certificate it pointed at"
         );
+    }
+
+    /// A named SNI that matches nothing must not inherit the first site's cert.
+    #[test]
+    fn named_sni_miss_does_not_fall_back_to_default() {
+        let store = CertStore::new();
+        let (cert, key) = test_certificate();
+        store
+            .upsert(&["first.example".to_string()], &cert, &key)
+            .unwrap();
+        assert!(
+            store.certificate_for("second.example").is_none(),
+            "second site must not receive first site's certificate"
+        );
+        assert!(store.certificate_for("first.example").is_some());
+    }
+
+    /// Bulk sync must keep every DNS SAN (including wildcards), not only
+    /// `certificates.domain_name`.
+    #[test]
+    fn index_names_include_sans_and_wildcard() {
+        let ca_key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+        let mut ca_name = X509NameBuilder::new().unwrap();
+        ca_name.append_entry_by_text("CN", "Test CA").unwrap();
+        let ca_name = ca_name.build();
+
+        let leaf_key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+        let mut leaf_name = X509NameBuilder::new().unwrap();
+        leaf_name.append_entry_by_text("CN", "example.com").unwrap();
+        let leaf_name = leaf_name.build();
+        let mut leaf_builder = X509::builder().unwrap();
+        leaf_builder.set_version(2).unwrap();
+        leaf_builder.set_subject_name(&leaf_name).unwrap();
+        leaf_builder.set_issuer_name(&ca_name).unwrap();
+        leaf_builder.set_pubkey(&leaf_key).unwrap();
+        leaf_builder
+            .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        leaf_builder
+            .set_not_after(&Asn1Time::days_from_now(1).unwrap())
+            .unwrap();
+
+        let mut sans = openssl::x509::extension::SubjectAlternativeName::new();
+        sans.dns("example.com").dns("*.example.com");
+        let san_ext = sans.build(&leaf_builder.x509v3_context(None, None)).unwrap();
+        leaf_builder.append_extension(san_ext).unwrap();
+        leaf_builder.sign(&ca_key, MessageDigest::sha256()).unwrap();
+        let leaf = leaf_builder.build();
+        let pem = leaf.to_pem().unwrap();
+
+        let names = index_names_for_cert("example.com", &pem);
+        assert!(names.iter().any(|n| n == "example.com"));
+        assert!(names.iter().any(|n| n == "*.example.com"));
+
+        let store = CertStore::new();
+        let key_pem = leaf_key.private_key_to_pem_pkcs8().unwrap();
+        store.upsert(&names, &pem, &key_pem).unwrap();
+        // Subdomain resolves via wildcard, not via the first-cert default.
+        assert!(store.certificate_for("www.example.com").is_some());
+        assert!(store.certificate_for("other.test").is_none());
     }
 }
