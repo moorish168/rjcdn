@@ -388,7 +388,8 @@ fn dns_names_from_pem(cert_pem: &[u8]) -> Vec<String> {
             .entries_by_nid(openssl::nid::Nid::COMMONNAME)
             .next()
         {
-            let n = normalize_cert_name(&entry.data().to_string());
+            let cn = String::from_utf8_lossy(entry.data().as_slice());
+            let n = normalize_cert_name(&cn);
             if !n.is_empty() {
                 names.push(n);
             }
