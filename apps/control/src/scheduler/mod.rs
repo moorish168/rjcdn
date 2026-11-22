@@ -711,6 +711,45 @@ fn eq_ignore(a: &str, b: &str) -> bool {
     !a.is_empty() && a.eq_ignore_ascii_case(b)
 }
 
+/// Whether an online edge node may answer for the matched DNS line.
+///
+/// - `None`: last-resort pool (any online node with a public IP).
+/// - Default line: only nodes **not** bound to a dedicated line (`region_id`
+///   empty, or explicitly bound to this default row). A Europe-bound node must
+///   not steal default / non-Europe traffic.
+/// - Specific line: prefer `region_id == line.id`; unbound nodes may still
+///   match by the node's own country/ISP geo fields (legacy).
+fn node_eligible_for_line(
+    node: &repository::NodeRow,
+    line: Option<&crate::api::geo_region::GeoRegionDto>,
+) -> bool {
+    if node.status != "online" || node.public_ip.trim().is_empty() {
+        return false;
+    }
+    match line {
+        None => true,
+        Some(line) if line.is_default || line.kind.eq_ignore_ascii_case("default") => {
+            match node.region_id {
+                None => true,
+                Some(rid) => rid == line.id,
+            }
+        }
+        Some(line) => {
+            if let Some(rid) = node.region_id {
+                return rid == line.id;
+            }
+            crate::api::geo_region::region_matches(
+                line,
+                crate::geo_catalog::continent_for_country(&node.country).unwrap_or(""),
+                &node.country,
+                &node.province,
+                &node.city,
+                &node.isp,
+            )
+        }
+    }
+}
+
 fn score_node(node: &repository::NodeRow, geo: &GeoInfo) -> (i32, String) {
     let mut score = node.weight.clamp(0, 1000);
     let mut reasons = vec![format!("weight={}", node.weight)];
@@ -804,25 +843,7 @@ pub async fn resolve(
     let filter_for_line = |line: Option<&crate::api::geo_region::GeoRegionDto>| {
         nodes
             .iter()
-            .filter(|n| n.status == "online" && !n.public_ip.trim().is_empty())
-            .filter(|n| match line {
-                None => true,
-                Some(line) if line.is_default || line.kind == "default" => true,
-                Some(line) => {
-                    // Prefer explicit region_id binding when present.
-                    if let Some(rid) = n.region_id {
-                        return rid == line.id;
-                    }
-                    crate::api::geo_region::region_matches(
-                        line,
-                        crate::geo_catalog::continent_for_country(&n.country).unwrap_or(""),
-                        &n.country,
-                        &n.province,
-                        &n.city,
-                        &n.isp,
-                    )
-                }
-            })
+            .filter(|n| node_eligible_for_line(n, line))
             .cloned()
             .collect::<Vec<_>>()
     };
@@ -979,6 +1000,7 @@ pub async fn test(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
 
     fn varint(mut value: u64) -> Vec<u8> {
         let mut out = Vec::new();
@@ -1257,5 +1279,79 @@ mod tests {
         let scores = [100, 100, 95, 90];
         assert_eq!(rotated_primary_backup(&scores, 0), (Some(0), Some(1), 2));
         assert_eq!(rotated_primary_backup(&scores, 1), (Some(1), Some(0), 2));
+    }
+
+    fn test_node(name: &str, region_id: Option<Uuid>) -> repository::NodeRow {
+        repository::NodeRow {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            region: String::new(),
+            ip: "10.0.0.1".into(),
+            status: "online".into(),
+            last_heartbeat: None,
+            agent_url: String::new(),
+            auth_token: String::new(),
+            cpu_usage: None,
+            memory_usage: None,
+            active_connections: None,
+            version: String::new(),
+            created_at: chrono::Utc::now(),
+            public_ip: "203.0.113.10".into(),
+            isp: String::new(),
+            country: "CN".into(),
+            province: String::new(),
+            city: String::new(),
+            weight: 100,
+            max_bandwidth_mbps: 0,
+            edge_profile: String::new(),
+            region_id,
+            cache_policy_id: None,
+            cache_storage_policy_id: None,
+        }
+    }
+
+    fn test_line(id: Uuid, code: &str, is_default: bool) -> crate::api::geo_region::GeoRegionDto {
+        crate::api::geo_region::GeoRegionDto {
+            id,
+            code: code.into(),
+            name: code.into(),
+            kind: if is_default { "default".into() } else { "custom".into() },
+            country: String::new(),
+            province: String::new(),
+            city: String::new(),
+            isp: String::new(),
+            continent: if code == "area-eu" { "EU".into() } else { String::new() },
+            countries: String::new(),
+            is_default,
+            enabled: true,
+            sort_order: 0,
+            note: String::new(),
+        }
+    }
+
+    /// A Europe-bound node must not sit in the default catch-all pool, or every
+    /// non-Europe visitor can be scheduled onto the Europe edge.
+    #[test]
+    fn default_line_excludes_nodes_bound_to_a_dedicated_line() {
+        let default_id = Uuid::new_v4();
+        let europe_id = Uuid::new_v4();
+        let default_line = test_line(default_id, "default", true);
+        let europe_line = test_line(europe_id, "area-eu", false);
+
+        let unbound = test_node("cn-default", None);
+        let europe = test_node("eu-edge", Some(europe_id));
+        let explicit_default = test_node("explicit-default", Some(default_id));
+
+        assert!(node_eligible_for_line(&unbound, Some(&default_line)));
+        assert!(
+            !node_eligible_for_line(&europe, Some(&default_line)),
+            "Europe-bound node must not answer the default line"
+        );
+        assert!(node_eligible_for_line(&explicit_default, Some(&default_line)));
+
+        assert!(!node_eligible_for_line(&unbound, Some(&europe_line)));
+        assert!(node_eligible_for_line(&europe, Some(&europe_line)));
+        // Last resort still sees every online node.
+        assert!(node_eligible_for_line(&europe, None));
     }
 }
