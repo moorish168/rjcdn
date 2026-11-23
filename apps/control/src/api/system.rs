@@ -12,6 +12,8 @@ use std::time::Duration;
 
 const DEFAULT_REQUEST: &str = "/var/lib/lagran/update.request";
 const DEFAULT_STATUS: &str = "/var/lib/lagran/update.status";
+/// Public release repository used when the console setting and env are unset.
+const DEFAULT_UPDATE_REPO: &str = "moorish168/rjcdn";
 
 /// Console-managed release token (DB), refreshed on boot and branding save.
 static CONSOLE_UPDATE_TOKEN: RwLock<Option<String>> = RwLock::new(None);
@@ -35,16 +37,16 @@ pub struct BrandingDto {
     pub system_name: String,
     /// Release `owner/repo` saved in the console. Empty = unset.
     pub update_repo: String,
-    /// What remote installs and the node wizard actually use: the console
-    /// value, else `LAGRAN_UPDATE_REPO`. Empty = nothing configured.
+    /// What remote installs, node wizard, and update checks use: console
+    /// setting → `LAGRAN_UPDATE_REPO` → [`DEFAULT_UPDATE_REPO`].
     #[serde(default)]
     pub effective_update_repo: String,
     /// Repository this host's root updater downloads from
     /// (`LAGRAN_UPDATE_REPO`, written by install.sh). Self-upgrade uses it.
     #[serde(default)]
     pub host_update_repo: String,
-    /// Whether a release access token is configured (DB or env). Never returns
-    /// the secret itself.
+    /// Whether a release access token is configured (DB or env). Optional for
+    /// the public default repository; never returns the secret itself.
     #[serde(default)]
     pub update_token_configured: bool,
 }
@@ -114,10 +116,12 @@ pub async fn load_console_settings(pool: &sqlx::PgPool) -> BrandingDto {
     } else {
         Some(db_token)
     });
-    let effective = if update_repo.is_empty() {
+    let effective = if !update_repo.is_empty() {
+        update_repo.clone()
+    } else if !host.is_empty() {
         host.clone()
     } else {
-        update_repo.clone()
+        DEFAULT_UPDATE_REPO.to_string()
     };
     BrandingDto {
         system_name,
@@ -285,7 +289,7 @@ pub(crate) fn host_update_repo() -> Option<String> {
 
 /// Resolve the configured upgrade source.
 ///
-/// Order: console setting → `LAGRAN_UPDATE_REPO` env (ops override). No hardcoded default.
+/// Order: console setting → `LAGRAN_UPDATE_REPO` → built-in public default.
 pub async fn resolve_update_repo(pool: &sqlx::PgPool) -> Result<String, String> {
     let from_db = load_console_settings(pool).await.update_repo;
     if !from_db.is_empty() {
@@ -297,10 +301,11 @@ pub async fn resolve_update_repo(pool: &sqlx::PgPool) -> Result<String, String> 
             return normalize_update_repo(&env);
         }
     }
-    Err("未配置升级仓库：请在系统设置中填写 owner/repo".into())
+    Ok(DEFAULT_UPDATE_REPO.to_string())
 }
 
 /// Release access token: console setting first, then `LAGRAN_GITHUB_TOKEN`.
+/// Optional for the public default repository.
 pub(crate) fn github_token() -> Option<String> {
     if let Ok(guard) = CONSOLE_UPDATE_TOKEN.read() {
         if let Some(token) = guard.as_ref().filter(|t| !t.is_empty()) {
@@ -311,11 +316,6 @@ pub(crate) fn github_token() -> Option<String> {
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
-}
-
-/// Console update UI / check require both a saved repository and a token.
-pub(crate) fn update_credentials_ready(settings: &BrandingDto) -> bool {
-    !settings.update_repo.trim().is_empty() && settings.update_token_configured
 }
 
 fn request_path() -> PathBuf {
@@ -447,21 +447,6 @@ pub async fn check_update(
         return Err(forbidden());
     }
     let available = updater_available();
-    let settings = load_console_settings(&state.pool).await;
-    if !update_credentials_ready(&settings) {
-        return Ok(Json(UpdateCheckResponse {
-            current_version: crate::version::VERSION.to_string(),
-            latest_version: None,
-            update_available: false,
-            release_url: None,
-            published_at: None,
-            notes: None,
-            updater_available: available,
-            error: Some(
-                "请先在「品牌与升级源」填写升级仓库与访问令牌并保存".into(),
-            ),
-        }));
-    }
     let repo = match resolve_update_repo(&state.pool).await {
         Ok(r) => r,
         Err(error) => {
@@ -570,12 +555,6 @@ pub async fn apply_update(
     if !updater_available() {
         return Err(internal(
             "updater is not installed; reinstall control with install.sh control",
-        ));
-    }
-    let settings = load_console_settings(&state.pool).await;
-    if !update_credentials_ready(&settings) {
-        return Err(bad_request(
-            "请先在「品牌与升级源」填写升级仓库与访问令牌并保存",
         ));
     }
     let tag = if let Some(raw) = req.version {

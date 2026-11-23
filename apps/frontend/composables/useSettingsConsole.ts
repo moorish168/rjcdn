@@ -15,8 +15,9 @@ const updateRepoDraft = ref('')
 const updateRepoSaved = ref('')
 /** Repository the root updater of this host uses (self-upgrade). */
 const hostRepo = ref('')
-/** Repository remote installs and the node wizard use. */
-const effectiveRepo = ref('')
+/** Repository remote installs and the node wizard use (public default when unset). */
+const DEFAULT_UPDATE_REPO = 'moorish168/rjcdn'
+const effectiveRepo = ref(DEFAULT_UPDATE_REPO)
 const repoPassword = ref('')
 /** Draft for a new release token; empty means leave unchanged on save. */
 const updateTokenDraft = ref('')
@@ -25,10 +26,8 @@ const updateTokenConfigured = ref(false)
 /** Clear the stored console token on next save. */
 const clearUpdateToken = ref(false)
 const brandSaving = ref(false)
-/** Update UI only when both a saved repo and a token are present. */
-const updateRepoConfigured = computed(
-  () => !!updateRepoSaved.value.trim() && updateTokenConfigured.value,
-)
+/** Update UI is always available with the public default repository. */
+const updateRepoConfigured = computed(() => true)
 const repoChanged = computed(() => updateRepoDraft.value.trim() !== updateRepoSaved.value.trim())
 const tokenChanged = computed(
   () => clearUpdateToken.value || !!updateTokenDraft.value.trim(),
@@ -48,7 +47,12 @@ function applyBranding(cfg: BrandingResponse | null | undefined) {
   updateRepoDraft.value = repo
   updateRepoSaved.value = repo
   hostRepo.value = (cfg?.host_update_repo || '').trim()
-  effectiveRepo.value = (cfg?.effective_update_repo || repo || hostRepo.value).trim()
+  effectiveRepo.value = (
+    cfg?.effective_update_repo ||
+    repo ||
+    hostRepo.value ||
+    DEFAULT_UPDATE_REPO
+  ).trim()
   updateTokenConfigured.value = !!cfg?.update_token_configured
   updateTokenDraft.value = ''
   clearUpdateToken.value = false

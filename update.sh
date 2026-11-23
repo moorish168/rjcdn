@@ -8,7 +8,9 @@ umask 077
 
 PREFIX="${LAGRAN_PREFIX:-/opt/lagran}"
 CONF_DIR="/etc/lagran"
-REPO="${LAGRAN_UPDATE_REPO:-}"
+# Same public default as install.sh / control; update.env may override.
+DEFAULT_REPO="moorish168/rjcdn"
+REPO="${LAGRAN_UPDATE_REPO:-$DEFAULT_REPO}"
 REQUEST="${LAGRAN_UPDATE_REQUEST_PATH:-/var/lib/lagran/update.request}"
 STATUS="${LAGRAN_UPDATE_STATUS_PATH:-/var/lib/lagran/update.status}"
 DATA_DIR="${LAGRAN_DATA_DIR:-/var/lib/lagran}"
@@ -21,7 +23,7 @@ if [[ -f "${CONF_DIR}/update.env" ]]; then
 fi
 PREFIX="${LAGRAN_PREFIX:-$PREFIX}"
 DATA_DIR="${LAGRAN_DATA_DIR:-$DATA_DIR}"
-REPO="${LAGRAN_UPDATE_REPO:-$REPO}"
+REPO="${LAGRAN_UPDATE_REPO:-${REPO:-$DEFAULT_REPO}}"
 REQUEST="${LAGRAN_UPDATE_REQUEST_PATH:-$REQUEST}"
 STATUS="${LAGRAN_UPDATE_STATUS_PATH:-$STATUS}"
 

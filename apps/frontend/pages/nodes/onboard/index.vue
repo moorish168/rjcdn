@@ -382,7 +382,7 @@
               <div class="field-label">一键安装命令（拉取配置 + 安装 + 重启）</div>
               <div v-if="!installRepo" class="alert alert-warning" style="margin-bottom: 12px">
                 <AppIcon name="alert" :size="16" class="icon" />
-                <span>尚未配置升级仓库。请先在「系统设置 → 品牌与升级源」填写 owner/repo（安装脚本需要仓库地址）。</span>
+                <span>未能读取升级仓库，将无法生成安装命令；请刷新页面或检查控制面是否可用。</span>
               </div>
               <div v-else class="command-box">
                 <pre class="mono">{{ oneClickInstallScript }}</pre>
@@ -1037,11 +1037,10 @@ async function loadInstallRepo() {
     const cfg = await api.get<{ update_repo?: string; effective_update_repo?: string }>(
       '/api/v1/system/branding',
     )
-    // The effective repo falls back to control.env's LAGRAN_UPDATE_REPO, which
-    // install.sh always sets; the console field alone is empty on new installs.
-    installRepo.value = (cfg?.effective_update_repo || cfg?.update_repo || '').trim()
+    // Effective repo falls back to the public default when unset.
+    installRepo.value = (cfg?.effective_update_repo || cfg?.update_repo || 'moorish168/rjcdn').trim()
   } catch {
-    installRepo.value = ''
+    installRepo.value = 'moorish168/rjcdn'
   }
 }
 

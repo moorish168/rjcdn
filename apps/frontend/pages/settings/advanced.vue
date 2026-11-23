@@ -42,7 +42,7 @@ watchEffect(() => {
       <div class="card-head">
         <div>
           <div class="card-title">品牌与升级源</div>
-          <div class="card-desc">系统名称、升级仓库与访问令牌；未配置时系统升级不可用，安装脚本仍需仓库地址</div>
+          <div class="card-desc">系统名称与可选的升级源覆盖；默认公开仓库，可不填即可升级</div>
         </div>
       </div>
       <div class="card-body">
@@ -52,21 +52,20 @@ watchEffect(() => {
           <span class="field-hint">建议 2–20 字；用于侧栏、页脚与登录页。</span>
         </div>
         <div class="field mt-16" style="max-width: 520px">
-          <label class="field-label">升级仓库</label>
+          <label class="field-label">升级仓库（可选）</label>
           <input
             v-model="updateRepoDraft"
             class="input mono"
             maxlength="200"
-            placeholder="owner/repo"
+            placeholder="默认 moorish168/rjcdn，可不填"
             spellcheck="false"
           />
           <span class="field-hint">
-            格式 <span class="mono">owner/repo</span>，用于检测更新、远程安装与添加节点向导的安装命令。
-            当前生效：<span class="mono">{{ effectiveRepo || '未配置' }}</span>。
+            留空使用公开默认仓。当前生效：<span class="mono">{{ effectiveRepo || 'moorish168/rjcdn' }}</span>。
           </span>
         </div>
         <div class="field mt-16" style="max-width: 520px">
-          <label class="field-label">访问令牌</label>
+          <label class="field-label">访问令牌（可选）</label>
           <input
             v-model="updateTokenDraft"
             class="input mono"
@@ -74,12 +73,12 @@ watchEffect(() => {
             maxlength="200"
             autocomplete="new-password"
             :disabled="clearUpdateToken"
-            :placeholder="updateTokenConfigured && !clearUpdateToken ? '已配置，留空表示不修改' : '私有仓 / Release 读取令牌'"
+            :placeholder="updateTokenConfigured && !clearUpdateToken ? '已配置，留空表示不修改' : '公开仓可不填；仅私有仓需要'"
             spellcheck="false"
           />
           <div class="flex gap-8 mt-8" style="align-items: center; flex-wrap: wrap">
-            <StatusTag :tone="updateTokenConfigured && !clearUpdateToken ? 'success' : 'warning'" dot>
-              {{ updateTokenConfigured && !clearUpdateToken ? '已配置' : '未配置' }}
+            <StatusTag :tone="updateTokenConfigured && !clearUpdateToken ? 'success' : 'neutral'" dot>
+              {{ updateTokenConfigured && !clearUpdateToken ? '已配置' : '未配置（公开仓可用）' }}
             </StatusTag>
             <label v-if="updateTokenConfigured" class="check" style="margin: 0">
               <input v-model="clearUpdateToken" type="checkbox" />
@@ -87,8 +86,8 @@ watchEffect(() => {
             </label>
           </div>
           <span class="field-hint">
-            与升级仓库一并保存后，才可使用「系统升级」。也可由 control.env 的
-            <span class="mono">LAGRAN_GITHUB_TOKEN</span> 提供。
+            默认公开仓库无需令牌。若改用私有仓，再在此填写或配置
+            <span class="mono">LAGRAN_GITHUB_TOKEN</span>。
           </span>
         </div>
         <div v-if="credentialsChanged" class="field mt-12" style="max-width: 520px">
@@ -177,17 +176,17 @@ watchEffect(() => {
       <div class="card-head">
         <div>
           <div class="card-title">系统升级</div>
-          <div class="card-desc">从已配置的升级仓库检测并安装新版本</div>
+          <div class="card-desc">从公开默认仓库检测并安装新版本，无需填写仓库或令牌</div>
         </div>
         <StatusTag
-          v-if="updateRepoConfigured && updateInfo && !updateInfo.error"
+          v-if="updateInfo && !updateInfo.error"
           :tone="updateInfo.update_available ? 'warning' : 'success'"
           dot
         >
           {{ updateInfo.update_available ? '有新版本' : '已是最新' }}
         </StatusTag>
       </div>
-      <div class="card-body" :class="{ 'is-disabled': !updateRepoConfigured }">
+      <div class="card-body">
         <div class="update-grid">
           <div class="update-metric">
             <div class="info-label">当前版本</div>
@@ -195,7 +194,7 @@ watchEffect(() => {
           </div>
           <div class="update-metric">
             <div class="info-label">最新版本</div>
-            <div class="info-value mono">{{ updateRepoConfigured ? (updateInfo?.latest_version || '—') : '—' }}</div>
+            <div class="info-value mono">{{ updateInfo?.latest_version || '—' }}</div>
           </div>
           <div class="update-metric">
             <div class="info-label">更新组件</div>
@@ -203,39 +202,34 @@ watchEffect(() => {
           </div>
         </div>
 
-        <div v-if="!updateRepoConfigured" class="field-hint text-warning mt-12">
-          请先在上方填写并保存「升级仓库」与「访问令牌」，保存后才能检测与安装更新。安装脚本仍需要仓库地址。
+        <div class="field-hint mt-12">
+          升级源：<span class="mono">{{ effectiveRepo || 'moorish168/rjcdn' }}</span>
+          <template v-if="hostRepo">
+            · 本机助手：<span class="mono">{{ hostRepo }}</span>
+          </template>
         </div>
-        <template v-else>
-          <div v-if="hostRepo" class="field-hint mt-12">
-            本机升级助手仓库：<span class="mono">{{ hostRepo }}</span>（由 install.sh 写入 update.env）。
-          </div>
-          <div v-else class="field-hint text-warning mt-12">
-            本机升级助手尚未写入仓库；「立即更新」可能失败，请重新执行 install.sh control。
-          </div>
-          <div v-if="updateInfo?.update_available" class="update-banner">
-            <AppIcon name="upload" :size="16" />
-            <span>
-              检测到新版本 <b>{{ updateInfo.latest_version }}</b>，更新过程中控制面会短暂重启。
-            </span>
-          </div>
-          <div v-else-if="updateInfo?.error" class="field-hint text-danger mt-12">
-            {{ updateInfo.error }}
-          </div>
-        </template>
+        <div v-if="updateInfo?.update_available" class="update-banner">
+          <AppIcon name="upload" :size="16" />
+          <span>
+            检测到新版本 <b>{{ updateInfo.latest_version }}</b>，更新过程中控制面会短暂重启。
+          </span>
+        </div>
+        <div v-else-if="updateInfo?.error" class="field-hint text-danger mt-12">
+          {{ updateInfo.error }}
+        </div>
 
         <div class="flex gap-8 mt-16" style="flex-wrap: wrap">
           <button
             class="btn btn-default btn-sm"
             type="button"
-            :disabled="!updateRepoConfigured || updateChecking"
+            :disabled="updateChecking"
             @click="checkUpdate"
           >
             <AppIcon name="refresh" :size="15" />
             {{ updateChecking ? '检测中…' : '检测更新' }}
           </button>
           <button
-            v-if="updateRepoConfigured && updateInfo?.update_available"
+            v-if="updateInfo?.update_available"
             class="btn btn-primary btn-sm"
             type="button"
             :disabled="updateBusy || !updateInfo.updater_available"
@@ -245,7 +239,7 @@ watchEffect(() => {
             {{ updateBusy ? '更新中…' : '立即更新' }}
           </button>
           <a
-            v-if="updateRepoConfigured && releaseLink"
+            v-if="releaseLink"
             class="btn btn-default btn-sm"
             :href="releaseLink"
             target="_blank"
@@ -254,11 +248,11 @@ watchEffect(() => {
             查看发布说明
           </a>
         </div>
-        <p v-if="updateRepoConfigured && updateInfo && !updateInfo.updater_available" class="field-hint text-warning mt-12">
+        <p v-if="updateInfo && !updateInfo.updater_available" class="field-hint text-warning mt-12">
           当前安装未配置 root 更新助手，请重新执行 <code>install.sh control</code>。
         </p>
-        <p v-if="updateRepoConfigured && updateMessage" class="field-hint mt-12">{{ updateMessage }}</p>
-        <p v-if="updateRepoConfigured && updateStatusInfo?.message" class="field-hint mt-8">
+        <p v-if="updateMessage" class="field-hint mt-12">{{ updateMessage }}</p>
+        <p v-if="updateStatusInfo?.message" class="field-hint mt-8">
           更新状态：{{ updateStatusInfo.state }} · {{ updateStatusInfo.message }}
         </p>
       </div>
