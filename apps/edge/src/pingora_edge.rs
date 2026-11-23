@@ -1626,10 +1626,15 @@ impl ProxyHttp for DataPlaneProxy {
             Self::apply_browser_ttl(response, browser_ttl);
         }
         Self::apply_security_headers(response);
+        // Advertise H3 only when the site switch is on and the QUIC listener is
+        // up. When off, send `clear` so browsers drop a previously cached Alt-Svc
+        // (otherwise they keep retrying H3 for up to `ma`).
         if plan.domain.http3_enabled {
             if let Some(alt_svc) = crate::server::http3::alt_svc_value() {
                 let _ = response.insert_header("alt-svc", alt_svc);
             }
+        } else {
+            let _ = response.insert_header("alt-svc", crate::server::http3::ALT_SVC_CLEAR);
         }
         Self::apply_cors_and_custom(response, &plan.domain.response_headers);
 

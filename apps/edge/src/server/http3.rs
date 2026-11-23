@@ -92,6 +92,9 @@ pub fn alt_svc_value() -> Option<String> {
         .map(|port| format!("h3=\":{port}\"; ma=86400"))
 }
 
+/// Header value that tells clients to drop cached alternatives (RFC 7838).
+pub const ALT_SVC_CLEAR: &str = "clear";
+
 /// Request body fed from the QUIC stream through a channel.
 struct ChannelBody {
     rx: Option<mpsc::Receiver<Result<Bytes, std::io::Error>>>,
@@ -269,17 +272,13 @@ async fn handle_request(
         .unwrap_or_default();
 
     let (_, domain) = domains.lookup(&host).await;
+    // Site-level H3 off: do not send an HTTP response body (browsers treat that
+    // as a finished page and will not protocol-downgrade). Reset the stream with
+    // H3_VERSION_FALLBACK so the client retries over TCP (H1/H2). Pair with
+    // `Alt-Svc: clear` on TCP responses so cached advertisements are dropped.
     if domain.as_ref().is_some_and(|d| !d.http3_enabled) {
-        let resp = http::Response::builder()
-            .status(421)
-            .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
-            .body(())
-            .context("build 421")?;
-        send.send_response(resp).await.context("send 421")?;
-        send.send_data(Bytes::from_static(b"HTTP/3 is disabled for this site"))
-            .await
-            .ok();
-        send.finish().await.ok();
+        recv.stop_sending(h3::error::Code::H3_VERSION_FALLBACK);
+        send.stop_stream(h3::error::Code::H3_VERSION_FALLBACK);
         return Ok(());
     }
 
