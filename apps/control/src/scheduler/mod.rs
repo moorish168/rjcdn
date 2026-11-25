@@ -1293,6 +1293,8 @@ mod tests {
             auth_token: String::new(),
             cpu_usage: None,
             memory_usage: None,
+            disk_total_bytes: None,
+            disk_available_bytes: None,
             active_connections: None,
             version: String::new(),
             created_at: chrono::Utc::now(),
