@@ -119,6 +119,10 @@ pub struct NodeRow {
     pub auth_token: String,
     pub cpu_usage: Option<f64>,
     pub memory_usage: Option<f64>,
+    #[sqlx(default)]
+    pub disk_total_bytes: Option<i64>,
+    #[sqlx(default)]
+    pub disk_available_bytes: Option<i64>,
     pub active_connections: Option<i64>,
     pub version: String,
     pub created_at: DateTime<Utc>,
@@ -709,7 +713,7 @@ pub async fn list_nodes(pool: &PgPool) -> sqlx::Result<Vec<NodeRow>> {
         r#"
         SELECT id, name, region, ip, status, last_heartbeat,
                COALESCE(agent_url, '') AS agent_url, auth_token,
-               cpu_usage, memory_usage, active_connections,
+               cpu_usage, memory_usage, disk_total_bytes, disk_available_bytes, active_connections,
                COALESCE(version, '') AS version, created_at,
                COALESCE(public_ip, '') AS public_ip,
                COALESCE(isp, '') AS isp,
@@ -735,7 +739,7 @@ pub async fn get_node(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<NodeRow>> 
         r#"
         SELECT id, name, region, ip, status, last_heartbeat,
                COALESCE(agent_url, '') AS agent_url, auth_token,
-               cpu_usage, memory_usage, active_connections,
+               cpu_usage, memory_usage, disk_total_bytes, disk_available_bytes, active_connections,
                COALESCE(version, '') AS version, created_at,
                COALESCE(public_ip, '') AS public_ip,
                COALESCE(isp, '') AS isp,
@@ -761,7 +765,7 @@ pub async fn get_node_by_name(pool: &PgPool, name: &str) -> sqlx::Result<Option<
         r#"
         SELECT id, name, region, ip, status, last_heartbeat,
                COALESCE(agent_url, '') AS agent_url, auth_token,
-               cpu_usage, memory_usage, active_connections,
+               cpu_usage, memory_usage, disk_total_bytes, disk_available_bytes, active_connections,
                COALESCE(version, '') AS version, created_at,
                COALESCE(public_ip, '') AS public_ip,
                COALESCE(isp, '') AS isp,
@@ -787,7 +791,7 @@ pub async fn list_online_nodes_with_agent(pool: &PgPool) -> sqlx::Result<Vec<Nod
         r#"
         SELECT id, name, region, ip, status, last_heartbeat,
                COALESCE(agent_url, '') AS agent_url, auth_token,
-               cpu_usage, memory_usage, active_connections,
+               cpu_usage, memory_usage, disk_total_bytes, disk_available_bytes, active_connections,
                COALESCE(version, '') AS version, created_at,
                COALESCE(public_ip, '') AS public_ip,
                COALESCE(isp, '') AS isp,
@@ -824,7 +828,7 @@ pub async fn create_node(
         VALUES ($1, $2, $3, $4, 'pending', $5)
         RETURNING id, name, region, ip, status, last_heartbeat,
                   COALESCE(agent_url, '') AS agent_url, auth_token,
-                  cpu_usage, memory_usage, active_connections,
+                  cpu_usage, memory_usage, disk_total_bytes, disk_available_bytes, active_connections,
                   COALESCE(version, '') AS version, created_at,
                COALESCE(public_ip, '') AS public_ip,
                COALESCE(isp, '') AS isp,
@@ -862,7 +866,7 @@ pub async fn update_node(
         WHERE id = $1
         RETURNING id, name, region, ip, status, last_heartbeat,
                   COALESCE(agent_url, '') AS agent_url, auth_token,
-                  cpu_usage, memory_usage, active_connections,
+                  cpu_usage, memory_usage, disk_total_bytes, disk_available_bytes, active_connections,
                   COALESCE(version, '') AS version, created_at,
                COALESCE(public_ip, '') AS public_ip,
                COALESCE(isp, '') AS isp,
@@ -909,7 +913,7 @@ pub async fn update_node_meta(
         WHERE id = $1
         RETURNING id, name, region, ip, status, last_heartbeat,
                   COALESCE(agent_url, '') AS agent_url, auth_token,
-                  cpu_usage, memory_usage, active_connections,
+                  cpu_usage, memory_usage, disk_total_bytes, disk_available_bytes, active_connections,
                   COALESCE(version, '') AS version, created_at,
                   COALESCE(public_ip, '') AS public_ip,
                   COALESCE(isp, '') AS isp,
@@ -976,7 +980,7 @@ pub async fn set_node_status(
         WHERE id = $1
         RETURNING id, name, region, ip, status, last_heartbeat,
                   COALESCE(agent_url, '') AS agent_url, auth_token,
-                  cpu_usage, memory_usage, active_connections,
+                  cpu_usage, memory_usage, disk_total_bytes, disk_available_bytes, active_connections,
                   COALESCE(version, '') AS version, created_at,
                COALESCE(public_ip, '') AS public_ip,
                COALESCE(isp, '') AS isp,
@@ -993,6 +997,40 @@ pub async fn set_node_status(
     )
     .bind(id)
     .bind(status)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Mark a node offline after its Edge service was stopped over SSH.
+/// Keep an administratively disabled node disabled.
+pub async fn mark_node_offline_after_remote_stop(
+    pool: &PgPool,
+    id: Uuid,
+) -> sqlx::Result<Option<NodeRow>> {
+    sqlx::query_as::<_, NodeRow>(
+        r#"
+        UPDATE edge_nodes
+        SET status = CASE WHEN status = 'disabled' THEN status ELSE 'offline' END,
+            updated_at = NOW()
+        WHERE id = $1
+        RETURNING id, name, region, ip, status, last_heartbeat,
+                  COALESCE(agent_url, '') AS agent_url, auth_token,
+                  cpu_usage, memory_usage, disk_total_bytes, disk_available_bytes, active_connections,
+                  COALESCE(version, '') AS version, created_at,
+                  COALESCE(public_ip, '') AS public_ip,
+                  COALESCE(isp, '') AS isp,
+                  COALESCE(country, 'CN') AS country,
+                  COALESCE(province, '') AS province,
+                  COALESCE(city, '') AS city,
+                  COALESCE(weight, 100) AS weight,
+                  COALESCE(max_bandwidth_mbps, 0) AS max_bandwidth_mbps,
+                  COALESCE(edge_profile, '') AS edge_profile,
+                  region_id,
+                  cache_policy_id,
+                  cache_storage_policy_id
+        "#,
+    )
+    .bind(id)
     .fetch_optional(pool)
     .await
 }
@@ -1044,6 +1082,8 @@ pub async fn upsert_node_heartbeat(
     agent_url: &str,
     cpu_usage: Option<f64>,
     memory_usage: Option<f64>,
+    disk_total_bytes: Option<i64>,
+    disk_available_bytes: Option<i64>,
     active_connections: Option<i64>,
     version: &str,
 ) -> sqlx::Result<NodeRow> {
@@ -1051,7 +1091,7 @@ pub async fn upsert_node_heartbeat(
         r#"
         SELECT id, name, region, ip, status, last_heartbeat,
                COALESCE(agent_url, '') AS agent_url, auth_token,
-               cpu_usage, memory_usage, active_connections,
+               cpu_usage, memory_usage, disk_total_bytes, disk_available_bytes, active_connections,
                COALESCE(version, '') AS version, created_at,
                COALESCE(public_ip, '') AS public_ip,
                COALESCE(isp, '') AS isp,
@@ -1084,13 +1124,15 @@ pub async fn upsert_node_heartbeat(
                 last_heartbeat = NOW(),
                 cpu_usage = $5,
                 memory_usage = $6,
-                active_connections = $7,
-                version = $8,
+                disk_total_bytes = COALESCE($7, disk_total_bytes),
+                disk_available_bytes = COALESCE($8, disk_available_bytes),
+                active_connections = $9,
+                version = $10,
                 updated_at = NOW()
             WHERE id = $1
             RETURNING id, name, region, ip, status, last_heartbeat,
                       COALESCE(agent_url, '') AS agent_url, auth_token,
-                      cpu_usage, memory_usage, active_connections,
+                      cpu_usage, memory_usage, disk_total_bytes, disk_available_bytes, active_connections,
                       COALESCE(version, '') AS version, created_at,
                COALESCE(public_ip, '') AS public_ip,
                COALESCE(isp, '') AS isp,
@@ -1111,6 +1153,8 @@ pub async fn upsert_node_heartbeat(
     .bind(agent_url)
     .bind(cpu_usage)
     .bind(memory_usage)
+    .bind(disk_total_bytes)
+    .bind(disk_available_bytes)
     .bind(active_connections)
     .bind(version)
     .fetch_one(pool)
@@ -2558,9 +2602,9 @@ impl Default for DomainSettingsRow {
             hotlink_signature_enabled: false,
             websocket_enabled: true,
             http2_enabled: true,
-            http3_enabled: false,
+            http3_enabled: true,
             gzip_enabled: true,
-            image_webp_enabled: false,
+            image_webp_enabled: true,
             min_tls_version: "1.2".into(),
             access_mode: "cname".into(),
             dns_zone_id: None,
@@ -2596,9 +2640,9 @@ pub async fn get_domain_settings(
                COALESCE(hotlink_signature_enabled, FALSE) AS hotlink_signature_enabled,
                COALESCE(websocket_enabled, TRUE) AS websocket_enabled,
                COALESCE(http2_enabled, TRUE) AS http2_enabled,
-               COALESCE(http3_enabled, FALSE) AS http3_enabled,
+               COALESCE(http3_enabled, TRUE) AS http3_enabled,
                COALESCE(gzip_enabled, TRUE) AS gzip_enabled,
-               COALESCE(image_webp_enabled, FALSE) AS image_webp_enabled,
+               COALESCE(image_webp_enabled, TRUE) AS image_webp_enabled,
                COALESCE(min_tls_version, '1.2') AS min_tls_version,
                COALESCE(access_mode, 'cname') AS access_mode,
                dns_zone_id,
@@ -3560,9 +3604,9 @@ pub async fn list_domains_full(pool: &PgPool) -> sqlx::Result<Vec<DomainFullRow>
                published_version_id,
                COALESCE(websocket_enabled, TRUE) AS websocket_enabled,
                COALESCE(http2_enabled, TRUE) AS http2_enabled,
-               COALESCE(http3_enabled, FALSE) AS http3_enabled,
+               COALESCE(http3_enabled, TRUE) AS http3_enabled,
                COALESCE(gzip_enabled, TRUE) AS gzip_enabled,
-               COALESCE(image_webp_enabled, FALSE) AS image_webp_enabled,
+               COALESCE(image_webp_enabled, TRUE) AS image_webp_enabled,
                COALESCE(min_tls_version, '1.2') AS min_tls_version,
                COALESCE(access_log_enabled, TRUE) AS access_log_enabled,
                COALESCE(cache_enabled, TRUE) AS cache_enabled
@@ -3599,9 +3643,9 @@ pub async fn get_domain_full_by_name(
                published_version_id,
                COALESCE(websocket_enabled, TRUE) AS websocket_enabled,
                COALESCE(http2_enabled, TRUE) AS http2_enabled,
-               COALESCE(http3_enabled, FALSE) AS http3_enabled,
+               COALESCE(http3_enabled, TRUE) AS http3_enabled,
                COALESCE(gzip_enabled, TRUE) AS gzip_enabled,
-               COALESCE(image_webp_enabled, FALSE) AS image_webp_enabled,
+               COALESCE(image_webp_enabled, TRUE) AS image_webp_enabled,
                COALESCE(min_tls_version, '1.2') AS min_tls_version,
                COALESCE(access_log_enabled, TRUE) AS access_log_enabled,
                COALESCE(cache_enabled, TRUE) AS cache_enabled

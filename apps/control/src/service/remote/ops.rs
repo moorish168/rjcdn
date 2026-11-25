@@ -239,7 +239,34 @@ async fn run(state: &AppState, op_id: Uuid, log: &OpLog) -> Result<(), String> {
     let status = session.run_root_script(&script, &mut sink).await;
     session.close().await;
     match status? {
-        0 => Ok(()),
+        0 => {
+            if op.action == "stop" {
+                match repository::mark_node_offline_after_remote_stop(&state.pool, node.id).await {
+                    Ok(Some(stopped_node)) => {
+                        state.nodes.invalidate().await;
+                        if let Err(e) = crate::service::edge_schedule_dns::sync_node(
+                            &state.pool,
+                            &stopped_node,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                error = %e,
+                                node = %stopped_node.name,
+                                "sync edge schedule DNS after remote stop"
+                            );
+                        }
+                        log.line("==> 控制面已同步节点状态");
+                    }
+                    Ok(None) => log.line("==> 远程服务已停止，但节点记录已不存在"),
+                    Err(e) => {
+                        tracing::warn!(error = %e, node = %node.name, "mark remotely stopped node offline");
+                        log.line(&format!("==> 服务已停止，但同步节点状态失败：{e}"));
+                    }
+                }
+            }
+            Ok(())
+        }
         code => Err(format!("远程脚本退出码 {code}，详见日志")),
     }
 }

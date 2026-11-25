@@ -10,52 +10,10 @@ const route = useRoute()
 const section = computed(() => (route.path.includes('/settings/advanced') ? 'advanced' : 'basic'))
 const brand = useBrand()
 const brandNameDraft = ref(brand.systemName.value)
-const updateRepoDraft = ref('')
-/** Saved value from the server; draft edits do not enable updates until saved. */
-const updateRepoSaved = ref('')
-/** Repository the root updater of this host uses (self-upgrade). */
-const hostRepo = ref('')
-/** Repository remote installs and the node wizard use (public default when unset). */
-const DEFAULT_UPDATE_REPO = 'moorish168/rjcdn'
-const effectiveRepo = ref(DEFAULT_UPDATE_REPO)
-const repoPassword = ref('')
-/** Draft for a new release token; empty means leave unchanged on save. */
-const updateTokenDraft = ref('')
-/** Whether the server already has a token (DB or env). */
-const updateTokenConfigured = ref(false)
-/** Clear the stored console token on next save. */
-const clearUpdateToken = ref(false)
 const brandSaving = ref(false)
-/** Update UI is always available with the public default repository. */
-const updateRepoConfigured = computed(() => true)
-const repoChanged = computed(() => updateRepoDraft.value.trim() !== updateRepoSaved.value.trim())
-const tokenChanged = computed(
-  () => clearUpdateToken.value || !!updateTokenDraft.value.trim(),
-)
-const credentialsChanged = computed(() => repoChanged.value || tokenChanged.value)
 
 interface BrandingResponse {
   system_name?: string
-  update_repo?: string
-  effective_update_repo?: string
-  host_update_repo?: string
-  update_token_configured?: boolean
-}
-
-function applyBranding(cfg: BrandingResponse | null | undefined) {
-  const repo = (cfg?.update_repo || '').trim()
-  updateRepoDraft.value = repo
-  updateRepoSaved.value = repo
-  hostRepo.value = (cfg?.host_update_repo || '').trim()
-  effectiveRepo.value = (
-    cfg?.effective_update_repo ||
-    repo ||
-    hostRepo.value ||
-    DEFAULT_UPDATE_REPO
-  ).trim()
-  updateTokenConfigured.value = !!cfg?.update_token_configured
-  updateTokenDraft.value = ''
-  clearUpdateToken.value = false
 }
 
 async function loadBrandSettings() {
@@ -66,34 +24,19 @@ async function loadBrandSettings() {
       brandNameDraft.value = cfg.system_name.trim()
       brand.systemName.value = cfg.system_name.trim()
     }
-    applyBranding(cfg)
   } catch {
-    // Keep drafts; update section stays disabled until credentials are known.
+    // Keep the current brand name if settings could not be loaded.
   }
 }
 
 async function saveBrandSettings() {
   brandSaving.value = true
   try {
-    if (credentialsChanged.value && !repoPassword.value) {
-      toast.error('修改升级仓库或访问令牌需要输入当前登录密码')
-      return
-    }
-    const payload: Record<string, string | undefined> = {
+    const body = await api.put<BrandingResponse>('/api/v1/system/branding', {
       system_name: brandNameDraft.value.trim(),
-      update_repo: updateRepoDraft.value.trim(),
-      current_password: credentialsChanged.value ? repoPassword.value : undefined,
-    }
-    if (clearUpdateToken.value) {
-      payload.update_token = ''
-    } else if (updateTokenDraft.value.trim()) {
-      payload.update_token = updateTokenDraft.value.trim()
-    }
-    const body = await api.put<BrandingResponse>('/api/v1/system/branding', payload)
+    })
     brandNameDraft.value = (body?.system_name || brandNameDraft.value).trim()
     brand.systemName.value = brandNameDraft.value || '控制台'
-    applyBranding(body)
-    repoPassword.value = ''
     toast.success('设置已保存')
   } catch (e: any) {
     toast.error(e?.data?.error || '保存失败')
@@ -178,7 +121,7 @@ function scheduleUpdatePoll(delay = 5000) {
 }
 
 async function checkUpdate() {
-  if (!auth.isAdmin || !updateRepoConfigured.value) return
+  if (!auth.isAdmin) return
   updateChecking.value = true
   updateMessage.value = ''
   try {
@@ -228,7 +171,6 @@ async function loadUpdateStatus() {
 }
 
 async function applyUpdate() {
-  if (!updateRepoConfigured.value) return
   if (!updateInfo.value?.latest_version) return
   if (updateBusy.value) return
   const ok = await ask({
@@ -473,10 +415,8 @@ onMounted(async () => {
   if (auth.isAdmin) {
     await loadBrandSettings()
     loadGeoip()
-    if (updateRepoConfigured.value) {
-      checkUpdate()
-      loadUpdateStatus()
-    }
+    checkUpdate()
+    loadUpdateStatus()
   }
   fetch(`${effectiveApiBase.value}/health`)
     .then((res) => (res.ok ? res.json() : null))
@@ -489,7 +429,6 @@ onMounted(async () => {
 onUnmounted(clearUpdatePoll)
 
   return {
-    applyBranding,
     loadBrandSettings,
     saveBrandSettings,
     clearUpdatePoll,
@@ -510,19 +449,7 @@ onUnmounted(clearUpdatePoll)
     toast,
     brand,
     brandNameDraft,
-    updateRepoDraft,
-    updateRepoSaved,
-    hostRepo,
-    effectiveRepo,
-    repoPassword,
-    updateTokenDraft,
-    updateTokenConfigured,
-    clearUpdateToken,
     brandSaving,
-    updateRepoConfigured,
-    repoChanged,
-    tokenChanged,
-    credentialsChanged,
     config,
     apiBase,
     effectiveApiBase,

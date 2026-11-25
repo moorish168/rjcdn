@@ -73,7 +73,7 @@
               <th>区域 / 线路</th>
               <th>状态</th>
               <th class="num">版本</th>
-              <th style="min-width: 150px">资源</th>
+              <th style="min-width: 220px">资源</th>
               <th style="min-width: 190px">节点地址</th>
               <th style="min-width: 140px">最后心跳</th>
               <th style="min-width: 230px">操作</th>
@@ -114,6 +114,14 @@
                       :style="{ width: `${n.memory_usage ?? 0}%`, background: usageColor(n.memory_usage) }" />
                   </div>
                   <span class="res-val">{{ n.memory_usage != null ? `${n.memory_usage.toFixed(0)}%` : '—' }}</span>
+                </div>
+                <div class="resource">
+                  <span class="res-label">DISK</span>
+                  <div class="progress res-bar">
+                    <div class="progress-bar"
+                      :style="{ width: `${diskUsagePercent(n) ?? 0}%`, background: usageColor(diskUsagePercent(n)) }" />
+                  </div>
+                  <span class="res-val res-disk-val" :title="diskUsageTitle(n)">{{ diskUsageLabel(n) }}</span>
                 </div>
               </td>
               <td>
@@ -327,6 +335,7 @@
 
 <script setup lang="ts">
 import { friendlyErrorMessage } from '~/utils/friendlyError'
+import { humanBytes } from '~/utils/edgeSizing'
 
 const api = useApi()
 const toast = useToast()
@@ -377,6 +386,8 @@ function exportNodes() {
     { key: 'agent_url', label: '节点地址' },
     { key: 'cpu_usage', label: 'CPU%' },
     { key: 'memory_usage', label: '内存%' },
+    { key: 'disk_total_bytes', label: '磁盘总量(字节)' },
+    { key: 'disk_available_bytes', label: '磁盘可用(字节)' },
     { key: 'last_heartbeat', label: '最后心跳' },
   ])
 }
@@ -423,6 +434,30 @@ function usageColor(value?: number | null) {
   if (value >= 85) return 'var(--danger)'
   if (value >= 70) return 'var(--warning)'
   return 'var(--brand)'
+}
+
+function diskUsagePercent(node: any): number | null {
+  if (node.disk_total_bytes == null || node.disk_available_bytes == null) return null
+  const total = Number(node.disk_total_bytes)
+  const available = Number(node.disk_available_bytes)
+  if (!Number.isFinite(total) || total <= 0 || !Number.isFinite(available)) return null
+  return Math.max(0, Math.min(100, ((total - available) / total) * 100))
+}
+
+function diskUsageLabel(node: any): string {
+  if (node.disk_total_bytes == null || node.disk_available_bytes == null) return '—'
+  const total = Number(node.disk_total_bytes)
+  const available = Number(node.disk_available_bytes)
+  if (!Number.isFinite(total) || total <= 0 || !Number.isFinite(available)) return '—'
+  return `${humanBytes(Math.max(0, total - available))} / ${humanBytes(total)}`
+}
+
+function diskUsageTitle(node: any): string {
+  if (node.disk_total_bytes == null || node.disk_available_bytes == null) return '等待节点上报根分区容量'
+  const total = Number(node.disk_total_bytes)
+  const available = Number(node.disk_available_bytes)
+  if (!Number.isFinite(total) || total <= 0 || !Number.isFinite(available)) return '等待节点上报根分区容量'
+  return `根分区：已用 ${humanBytes(Math.max(0, total - available))}，可用 ${humanBytes(available)}，总计 ${humanBytes(total)}`
 }
 
 async function load() {
@@ -563,7 +598,7 @@ onUnmounted(() => {
 }
 
 .res-label {
-  width: 30px;
+  width: 36px;
   font-size: 11px;
   color: var(--text-3);
 }
@@ -602,6 +637,13 @@ onUnmounted(() => {
 .sched-label {
   font-size: 11.5px;
   color: var(--text-3);
+}
+
+.res-disk-val {
+  width: auto;
+  min-width: 112px;
+  white-space: nowrap;
+  font-size: 10px;
 }
 
 .sched-name {

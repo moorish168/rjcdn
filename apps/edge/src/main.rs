@@ -1,7 +1,7 @@
 use edge::agent::{self, access_report, cert_sync, config_sync, metrics_report, origin_health};
 use edge::cache::{self, policy::RuleSet};
-use edge::config::EdgeConfig;
 use edge::config::registry::DomainRegistry;
+use edge::config::EdgeConfig;
 use edge::metrics::EdgeMetrics;
 use edge::origin::OriginClient;
 use edge::server::access_log::AccessLog;
@@ -137,6 +137,10 @@ async fn main() -> anyhow::Result<()> {
         geo.clone(),
     );
     agent::geoip_sync::spawn_geoip_sync(config.clone(), control.clone(), geo.clone());
+    let compressed_cache = Arc::new(edge::cache::MemoryCache::with_max_bytes(
+        config.compressed_cache_entries,
+        config.compressed_cache_bytes,
+    ));
     config_sync::spawn_config_sync(
         config.clone(),
         control.clone(),
@@ -144,6 +148,7 @@ async fn main() -> anyhow::Result<()> {
         rules.clone(),
         domains.clone(),
         cache.clone(),
+        compressed_cache.clone(),
         large_cache.clone(),
     );
     metrics_report::spawn_metrics_report(config.clone(), control.clone(), metrics.clone());
@@ -305,10 +310,7 @@ async fn main() -> anyhow::Result<()> {
         node_control,
         https_redirect_port: config.https_redirect_port,
         max_cacheable_body: config.max_cacheable_body,
-        compressed: Arc::new(edge::cache::MemoryCache::with_max_bytes(
-            config.compressed_cache_entries,
-            config.compressed_cache_bytes,
-        )),
+        compressed: compressed_cache,
         cache_key_ignore_headers: config.cache_key_ignore_headers.clone(),
         origin_read_timeout_ms: config.origin_read_timeout_ms,
         origin_stream_read_timeout_ms: config.origin_stream_read_timeout_ms,

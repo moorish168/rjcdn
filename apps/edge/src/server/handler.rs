@@ -31,7 +31,7 @@ use crate::server::challenge;
 use crate::server::default_page::{self, OriginFailure};
 use crate::server::host_util;
 use crate::server::inflight::{self, Inflight, Slot};
-use crate::server::pipeline::{facts_from_request, RequestPipeline};
+use crate::server::pipeline::{apply_domain_cache_switch, facts_from_request, RequestPipeline};
 use crate::server::rate_limit::RateLimiter;
 use crate::server::response_headers::ResponseHeaderOverrides;
 use crate::server::waf_log::WafLog;
@@ -151,6 +151,7 @@ struct Effective {
     method: Method,
     ignore_query: bool,
     key_ignore: u8,
+    domain_version: String,
     key_ignore_headers: String,
     response_headers: Arc<ResponseHeaderOverrides>,
     origin_auth_header: String,
@@ -483,12 +484,13 @@ async fn proxy_handler_inner(State(state): State<Arc<AppState>>, req: Request<Bo
     // domains can never influence each other's TTL/action.
     let eff = match domain_entry {
         Some(ref e) => {
-            let policy = resolve_rule_policy(
+            let mut policy = resolve_rule_policy(
                 &e.rules,
                 &path_only,
                 method.as_str(),
                 req.uri().query().unwrap_or(""),
             );
+            apply_domain_cache_switch(&mut policy, e.cache_enabled);
             Effective {
                 origin_url: e.origin_url.clone(),
                 backup_url: e.backup_origin_url.clone(),
@@ -499,6 +501,7 @@ async fn proxy_handler_inner(State(state): State<Arc<AppState>>, req: Request<Bo
                 method: method.clone(),
                 ignore_query: policy.ignore_query.unwrap_or(e.ignore_query_string),
                 key_ignore: policy.key_ignore,
+                domain_version: e.version.clone(),
                 key_ignore_headers: e.cache_key_ignore_headers.clone(),
                 response_headers: e.response_headers.clone(),
                 origin_auth_header: e.origin_auth_header.clone(),
@@ -524,6 +527,7 @@ async fn proxy_handler_inner(State(state): State<Arc<AppState>>, req: Request<Bo
                 origins: Vec::new(),
                 ignore_query,
                 key_ignore: policy.key_ignore,
+                domain_version: String::new(),
                 key_ignore_headers: String::new(),
                 policy,
                 rules: Vec::new(),
@@ -677,6 +681,7 @@ async fn proxy_handler_inner(State(state): State<Arc<AppState>>, req: Request<Bo
         &headers,
         eff.ignore_query,
         eff.key_ignore,
+        &eff.domain_version,
     );
 
     if !request_cacheable {
@@ -1548,6 +1553,7 @@ fn spawn_revalidation(
             method: Method::GET,
             ignore_query: false,
             key_ignore: 0,
+            domain_version: String::new(),
             key_ignore_headers: String::new(),
             response_headers: ResponseHeaderOverrides::empty_arc(),
             // The revalidation request must carry the origin credentials. Leaving

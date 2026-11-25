@@ -6,16 +6,7 @@ const {
   applyUpdate,
   auth,
   brandNameDraft,
-  updateRepoDraft,
-  hostRepo,
-  effectiveRepo,
-  repoPassword,
-  updateTokenDraft,
-  updateTokenConfigured,
-  clearUpdateToken,
   brandSaving,
-  updateRepoConfigured,
-  credentialsChanged,
   controlVersion,
   updateInfo,
   releaseLink,
@@ -41,8 +32,8 @@ watchEffect(() => {
     <div v-if="auth.isAdmin" class="card mt-16">
       <div class="card-head">
         <div>
-          <div class="card-title">品牌与升级源</div>
-          <div class="card-desc">系统名称与可选的升级源覆盖；默认公开仓库，可不填即可升级</div>
+          <div class="card-title">品牌设置</div>
+          <div class="card-desc">自定义管理控制台显示名称</div>
         </div>
       </div>
       <div class="card-body">
@@ -50,56 +41,6 @@ watchEffect(() => {
           <label class="field-label">系统名称</label>
           <input v-model="brandNameDraft" class="input" maxlength="64" placeholder="例如 我的 CDN" />
           <span class="field-hint">建议 2–20 字；用于侧栏、页脚与登录页。</span>
-        </div>
-        <div class="field mt-16" style="max-width: 520px">
-          <label class="field-label">升级仓库（可选）</label>
-          <input
-            v-model="updateRepoDraft"
-            class="input mono"
-            maxlength="200"
-            placeholder="默认 moorish168/rjcdn，可不填"
-            spellcheck="false"
-          />
-          <span class="field-hint">
-            留空使用公开默认仓。当前生效：<span class="mono">{{ effectiveRepo || 'moorish168/rjcdn' }}</span>。
-          </span>
-        </div>
-        <div class="field mt-16" style="max-width: 520px">
-          <label class="field-label">访问令牌（可选）</label>
-          <input
-            v-model="updateTokenDraft"
-            class="input mono"
-            type="password"
-            maxlength="200"
-            autocomplete="new-password"
-            :disabled="clearUpdateToken"
-            :placeholder="updateTokenConfigured && !clearUpdateToken ? '已配置，留空表示不修改' : '公开仓可不填；仅私有仓需要'"
-            spellcheck="false"
-          />
-          <div class="flex gap-8 mt-8" style="align-items: center; flex-wrap: wrap">
-            <StatusTag :tone="updateTokenConfigured && !clearUpdateToken ? 'success' : 'neutral'" dot>
-              {{ updateTokenConfigured && !clearUpdateToken ? '已配置' : '未配置（公开仓可用）' }}
-            </StatusTag>
-            <label v-if="updateTokenConfigured" class="check" style="margin: 0">
-              <input v-model="clearUpdateToken" type="checkbox" />
-              清除已保存的令牌
-            </label>
-          </div>
-          <span class="field-hint">
-            默认公开仓库无需令牌。若改用私有仓，再在此填写或配置
-            <span class="mono">LAGRAN_GITHUB_TOKEN</span>。
-          </span>
-        </div>
-        <div v-if="credentialsChanged" class="field mt-12" style="max-width: 520px">
-          <label class="field-label">当前登录密码</label>
-          <input
-            v-model="repoPassword"
-            class="input"
-            type="password"
-            autocomplete="current-password"
-            placeholder="修改升级仓库或令牌需要验证密码"
-          />
-          <span class="field-hint">该仓库的安装脚本会以 root 身份在远程安装的节点上运行。</span>
         </div>
         <div class="flex gap-8 mt-16">
           <button
@@ -176,7 +117,7 @@ watchEffect(() => {
       <div class="card-head">
         <div>
           <div class="card-title">系统升级</div>
-          <div class="card-desc">从公开默认仓库检测并安装新版本，无需填写仓库或令牌</div>
+          <div class="card-desc">检查可用版本并升级当前系统组件</div>
         </div>
         <StatusTag
           v-if="updateInfo && !updateInfo.error"
@@ -202,12 +143,6 @@ watchEffect(() => {
           </div>
         </div>
 
-        <div class="field-hint mt-12">
-          升级源：<span class="mono">{{ effectiveRepo || 'moorish168/rjcdn' }}</span>
-          <template v-if="hostRepo">
-            · 本机助手：<span class="mono">{{ hostRepo }}</span>
-          </template>
-        </div>
         <div v-if="updateInfo?.update_available" class="update-banner">
           <AppIcon name="upload" :size="16" />
           <span>

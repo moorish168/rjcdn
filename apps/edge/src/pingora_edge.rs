@@ -1672,16 +1672,24 @@ impl ProxyHttp for DataPlaneProxy {
             ) {
                 // Both variants depend on Accept.
                 vary_on_accept(response)?;
-                let etag = response
+                let validator = response
                     .headers
                     .get(header::ETAG)
                     .and_then(|v| v.to_str().ok())
                     .filter(|v| !v.is_empty())
-                    .map(str::to_string);
-                if let (Some(etag), true) =
-                    (etag.as_deref(), plan.cacheable && ctx.identity_ttl_secs.is_some())
+                    .map(|v| format!("etag:{v}"))
+                    .or_else(|| {
+                        response
+                            .headers
+                            .get(header::LAST_MODIFIED)
+                            .and_then(|v| v.to_str().ok())
+                            .filter(|v| !v.is_empty())
+                            .map(|v| format!("last-modified:{v}"))
+                    });
+                if let (Some(validator), true) =
+                    (validator.as_deref(), plan.cacheable && ctx.identity_ttl_secs.is_some())
                 {
-                    let key = webp_variant_key(&plan.key, etag);
+                    let key = webp_variant_key(&plan.key, validator);
                     if let Some(cached) = self.state.compressed.get(&key).await {
                         if !cached.body.is_empty() {
                             response.insert_header(header::CONTENT_TYPE, "image/webp")?;
@@ -5112,8 +5120,8 @@ fn compressed_variant_key(cache_key: &str, etag: &str) -> String {
     format!("{cache_key}\u{0}gzip\u{0}{etag}")
 }
 
-fn webp_variant_key(cache_key: &str, etag: &str) -> String {
-    format!("{cache_key}\u{0}webp\u{0}{etag}")
+fn webp_variant_key(cache_key: &str, validator: &str) -> String {
+    format!("{cache_key}\u{0}webp\u{0}{validator}")
 }
 
 /// Add `Accept` to `Vary` without discarding existing values.

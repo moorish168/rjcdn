@@ -83,9 +83,7 @@ impl<'a> RequestPipeline<'a> {
     ) -> ResolvedPolicy {
         let mut policy = resolve_rule_policy(&domain.rules, path_only, method.as_str(), query);
         apply_key_ignore_default(&mut policy, &domain.cache_key_ignore_headers);
-        if !domain.cache_enabled {
-            policy.action = crate::cache::policy::RuleAction::Bypass;
-        }
+        apply_domain_cache_switch(&mut policy, domain.cache_enabled);
         policy
     }
 
@@ -165,6 +163,7 @@ impl<'a> RequestPipeline<'a> {
             headers,
             ignore_query,
             policy.key_ignore,
+            &domain.version,
         )
     }
 
@@ -178,6 +177,7 @@ impl<'a> RequestPipeline<'a> {
         headers: &HeaderMap,
         ignore_query: bool,
         key_ignore: u8,
+        domain_version: &str,
     ) -> String {
         let lookup_path = if ignore_query {
             path_only
@@ -189,14 +189,21 @@ impl<'a> RequestPipeline<'a> {
         } else {
             method.as_str()
         };
-        cache_key_for_normalized_request(
+        let mut key = cache_key_for_normalized_request(
             method,
             host,
             lookup_path,
             headers,
             key_ignore,
             &self.state.cache_key_ignore_headers,
-        )
+        );
+        // Persisted disk/L2 entries can outlive an edge process, so the
+        // in-memory registry comparison alone cannot invalidate them after a
+        // restart. A stable per-domain config suffix makes old entries
+        // unreachable as soon as any effective domain setting changes.
+        key.push_str("|cfg=");
+        key.push_str(&domain_version_hash(domain_version));
+        key
     }
 
     /// HTTPS redirect, bot challenge, CC, rate limit, WAF and hotlink checks.
@@ -220,6 +227,44 @@ impl<'a> RequestPipeline<'a> {
             facts.start,
         )
         .await
+    }
+}
+
+pub(crate) fn apply_domain_cache_switch(policy: &mut ResolvedPolicy, cache_enabled: bool) {
+    if !cache_enabled {
+        policy.action = RuleAction::Bypass;
+    }
+}
+
+fn domain_version_hash(version: &str) -> String {
+    // FNV-1a keeps the key suffix stable across process and compiler restarts.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in version.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disabled_domain_cache_forces_bypass() {
+        let mut policy = ResolvedPolicy::default();
+        apply_domain_cache_switch(&mut policy, false);
+        assert_eq!(policy.action, RuleAction::Bypass);
+
+        let mut enabled_policy = ResolvedPolicy::default();
+        apply_domain_cache_switch(&mut enabled_policy, true);
+        assert_eq!(enabled_policy.action, RuleAction::Cache);
+    }
+
+    #[test]
+    fn domain_version_hash_is_stable_and_changes_with_config() {
+        assert_eq!(domain_version_hash("v1"), domain_version_hash("v1"));
+        assert_ne!(domain_version_hash("v1"), domain_version_hash("v2"));
     }
 }
 

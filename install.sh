@@ -607,7 +607,9 @@ port_owners() {
   [[ "$proto" == "udp" ]] && flag=-lnu
   command -v ss >/dev/null 2>&1 || return 0
   ss -Hp "$flag" "sport = :${port}" 2>/dev/null \
-    | { grep -o 'users:(("[^"]*"' || true; } | sed 's/users:(("//' | sort -u | tr '\n' ' '
+    | { grep -o 'users:(("[^"]*"' || true; } \
+    | sed -e 's/^users:(("//' -e 's/"$//' \
+    | sort -u | tr '\n' ' '
 }
 
 # require_port <port> <proto> <allowed-owner-regex> <purpose>
@@ -835,15 +837,27 @@ install_env_example() {
 
 install_binary() {
   local name=$1
-  local src
+  local src dest tmp
   src="$(find "$STAGE" -maxdepth 3 -type f -name "$name" -print -quit 2>/dev/null || true)"
   if [[ -z "$src" ]]; then
     local entries
     entries="$(find "$STAGE" -maxdepth 2 -type f -printf '%P ' 2>/dev/null | cut -c1-400)"
     die "release does not contain $name${entries:+ (found: $entries)}"
   fi
+  # Stage beside the destination and rename atomically. This permits an
+  # in-place installer rerun while the old service is still executing the
+  # previous inode; enable_service restarts it after configuration is ready.
   # GitHub artifact downloads may lose the executable bit; force 0755 here.
-  install -m 0755 "$src" "$BIN_DIR/$name"
+  dest="$BIN_DIR/$name"
+  tmp="$BIN_DIR/.${name}.new.$$"
+  if ! install -m 0755 "$src" "$tmp"; then
+    rm -f "$tmp"
+    die "could not stage $name"
+  fi
+  if ! mv -f "$tmp" "$dest"; then
+    rm -f "$tmp"
+    die "could not replace $name"
+  fi
 }
 
 # --------------------------------------------------------------------------

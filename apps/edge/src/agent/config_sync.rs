@@ -17,16 +17,17 @@ pub fn request_config_reload() {
 // aggregate version so unchanged config is not re-applied.
 
 use crate::agent::ControlClient;
-use crate::cache::SharedCache;
 use crate::cache::large::LargeCache;
 use crate::cache::policy::{CacheRule, RuleSet};
-use crate::config::EdgeConfig;
+use crate::cache::SharedCache;
 use crate::config::registry::{DomainEntry, DomainRegistry};
+use crate::config::EdgeConfig;
 use crate::origin::OriginClient;
-    use crate::waf::{
-    IpNet, ManagedRules, RegionMatch, SecurityLevel, WafAction, WafConfig, WafField, WafMode, WafOp,
-    WafRule,
+use crate::waf::{
+    IpNet, ManagedRules, RegionMatch, SecurityLevel, WafAction, WafConfig, WafField, WafMode,
+    WafOp, WafRule,
 };
+use lagran_cache::CacheBackend;
 use serde::Deserialize;
 use std::time::Duration;
 
@@ -680,6 +681,7 @@ pub fn spawn_config_sync(
     rules: RuleSet,
     registry: DomainRegistry,
     cache: SharedCache,
+    compressed_cache: std::sync::Arc<lagran_cache::MemoryCache>,
     large_cache: Option<std::sync::Arc<LargeCache>>,
 ) {
     // Supervised: if this loop panics, the edge would keep serving its startup
@@ -691,6 +693,7 @@ pub fn spawn_config_sync(
         let rules = rules.clone();
         let registry = registry.clone();
         let cache = cache.clone();
+        let compressed_cache = compressed_cache.clone();
         let large_cache = large_cache.clone();
         async move {
             tracing::info!(url = %control.endpoint("/api/v1/config"), "domain registry sync started");
@@ -762,15 +765,18 @@ pub fn spawn_config_sync(
                                             .into_iter()
                                             .collect();
                                     let purged = cache.purge_matching(&targets).await;
+                                    let compressed_purged =
+                                        compressed_cache.purge_matching(&targets).await;
                                     let large_purged = if let Some(large) = large_cache.as_ref() {
                                         large.purge_targets(&targets).await
                                     } else {
                                         0
                                     };
-                                    if purged > 0 || large_purged > 0 {
+                                    if purged > 0 || compressed_purged > 0 || large_purged > 0 {
                                         tracing::info!(
                                             domain = %domain,
                                             purged,
+                                            compressed_purged,
                                             large_purged,
                                             "domain config changed; cache invalidated"
                                         );

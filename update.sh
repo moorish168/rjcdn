@@ -79,6 +79,25 @@ status() {
   chmod 0644 "${STATUS}" 2>/dev/null || true
 }
 
+wait_control_health() {
+  local bind addr port
+  bind="$(sed -n 's/^CONTROL_BIND=//p' "${CONF_DIR}/control.env" 2>/dev/null | tail -1)"
+  bind="${bind:-0.0.0.0:8080}"
+  addr="${bind%:*}"
+  port="${bind##*:}"
+  [[ "${port}" =~ ^[0-9]+$ ]] || port=8080
+  case "${addr}" in
+    ""|0.0.0.0|::|\[::\]) addr=127.0.0.1 ;;
+    *:*) [[ "${addr}" == \[*\] ]] || addr="[${addr}]" ;;
+  esac
+  local _
+  for _ in $(seq 1 60); do
+    curl -fsS --max-time 2 "http://${addr}:${port}/health" >/dev/null 2>&1 && return 0
+    sleep 2
+  done
+  return 1
+}
+
 # Extract a release tarball, rejecting entries that would escape the target.
 #
 # `tar -xzf` honours absolute paths and `../` components, so a tampered archive
@@ -249,6 +268,9 @@ for service in lagran-control lagran-edge lagran-dns; do
     fi
     if ! timeout 30 systemctl is-active --quiet "${service}.service"; then
       fail "${service} is not active after restart"
+    fi
+    if [[ "${service}" == "lagran-control" ]] && ! wait_control_health; then
+      fail "control health check failed after restart; database migrations may not have completed"
     fi
   fi
 done

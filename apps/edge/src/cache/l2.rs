@@ -253,6 +253,15 @@ impl RedisL2Cache {
         out
     }
 
+    fn host_scan_pattern(host: &str) -> String {
+        if let Some(suffix) = host.strip_prefix("*.") {
+            let suffix = Self::glob_escape(suffix);
+            format!("*:*.{suffix}:*")
+        } else {
+            format!("*:{}:*", Self::glob_escape(host))
+        }
+    }
+
     fn tag_index_key(&self, tag: &str) -> String {
         format!("{}tagidx:{}", self.namespace(), tag.to_ascii_lowercase())
     }
@@ -534,7 +543,9 @@ impl CacheBackend for RedisL2Cache {
         for target in targets {
             // Scan a host-scoped glob, then filter structurally: a substring
             // glob would treat `myexample.com` as a match for `example.com`.
-            let pattern = format!("*:{}:*", Self::glob_escape(&target.host));
+            // Redis glob `*` may include dots; cache_key_matches below
+            // narrows wildcard matches to the registry's one-label rule.
+            let pattern = Self::host_scan_pattern(&target.host);
             for full in self.redis_scan_keys(&pattern).await {
                 if let Some(raw) = full.strip_prefix(&namespace) {
                     if lagran_cache::cache_key_matches(raw, target) {
@@ -580,7 +591,7 @@ impl CacheBackend for RedisL2Cache {
             // rest of this function works with bare cache keys.
             let namespace = self.namespace();
             for full in self
-                .redis_scan_keys(&format!("*:{}:*", Self::glob_escape(domain)))
+                .redis_scan_keys(&Self::host_scan_pattern(&domain))
                 .await
             {
                 if let Some(raw) = full.strip_prefix(&namespace) {
@@ -593,7 +604,7 @@ impl CacheBackend for RedisL2Cache {
         for key in candidates {
             if !domain.is_empty()
                 && !lagran_cache::cache_key_host(&key)
-                    .is_some_and(|host| host.eq_ignore_ascii_case(&domain))
+                    .is_some_and(|host| lagran_cache::cache_host_matches(host, &domain))
             {
                 continue;
             }

@@ -153,6 +153,7 @@ pub fn spawn_heartbeat(
             );
 
             loop {
+                let disk = disk_capacity_bytes().await;
                 let body = json!({
                     "node_id": config.node_id,
                     "region": config.region,
@@ -162,6 +163,8 @@ pub fn spawn_heartbeat(
                     "version": crate::version::VERSION,
                     "cpu_usage": cpu_usage().await,
                     "memory_usage": memory_usage().await,
+                    "disk_total_bytes": disk.map(|(total, _)| total),
+                    "disk_available_bytes": disk.map(|(_, available)| available),
                 });
                 match control
                     .post_json_for::<_, HeartbeatReply>("/api/v1/nodes/heartbeat", &body)
@@ -234,6 +237,42 @@ async fn memory_usage() -> Option<f64> {
         return None;
     }
     Some(((((total - available) / total) * 100.0 * 10.0).round() / 10.0).clamp(0.0, 100.0))
+}
+
+async fn disk_capacity_bytes() -> Option<(i64, i64)> {
+    tokio::task::spawn_blocking(|| {
+        #[cfg(unix)]
+        {
+            let path = std::ffi::CString::new("/").ok()?;
+            let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+            if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
+                return None;
+            }
+            let block_size = if stat.f_frsize != 0 {
+                stat.f_frsize as u64
+            } else {
+                stat.f_bsize as u64
+            };
+            if block_size == 0 {
+                return None;
+            }
+            let total = (stat.f_blocks as u64).saturating_mul(block_size);
+            let available = (stat.f_bavail as u64)
+                .saturating_mul(block_size)
+                .min(total);
+            Some((
+                total.min(i64::MAX as u64) as i64,
+                available.min(i64::MAX as u64) as i64,
+            ))
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 #[cfg(test)]

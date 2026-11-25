@@ -27,6 +27,8 @@ pub struct NodeDto {
     pub version: String,
     pub cpu_usage: Option<f64>,
     pub memory_usage: Option<f64>,
+    pub disk_total_bytes: Option<i64>,
+    pub disk_available_bytes: Option<i64>,
     pub active_connections: Option<i64>,
     pub created_at: String,
     pub has_token: bool,
@@ -60,6 +62,8 @@ fn to_dto(r: repository::NodeRow) -> NodeDto {
         version: r.version,
         cpu_usage: r.cpu_usage,
         memory_usage: r.memory_usage,
+        disk_total_bytes: r.disk_total_bytes,
+        disk_available_bytes: r.disk_available_bytes,
         active_connections: r.active_connections,
         created_at: r.created_at.to_rfc3339(),
         has_token: !r.auth_token.is_empty(),
@@ -279,6 +283,10 @@ pub struct HeartbeatRequest {
     pub agent_url: Option<String>,
     pub cpu_usage: Option<f64>,
     pub memory_usage: Option<f64>,
+    #[serde(default)]
+    pub disk_total_bytes: Option<i64>,
+    #[serde(default)]
+    pub disk_available_bytes: Option<i64>,
     pub active_connections: Option<u64>,
     pub version: Option<String>,
     pub public_ip: Option<String>,
@@ -1149,6 +1157,8 @@ async fn apply_heartbeat(
         &agent_url,
         req.cpu_usage,
         req.memory_usage,
+        req.disk_total_bytes,
+        req.disk_available_bytes,
         active,
         &version,
     )

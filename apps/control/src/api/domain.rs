@@ -167,9 +167,9 @@ pub(crate) fn to_dto_with_hostnames(
         // Protocol flags come from settings; list views use safe defaults.
         websocket_enabled: true,
         http2_enabled: true,
-        http3_enabled: false,
+        http3_enabled: true,
         gzip_enabled: true,
-        image_webp_enabled: false,
+        image_webp_enabled: true,
     }
 }
 
@@ -1337,7 +1337,7 @@ pub struct CacheEnabledRequest {
 }
 
 /// POST /api/v1/domains/{id}/cache — enable/disable site caching.
-/// Turning off also purges that site's cache on all online edges.
+/// Turning off also dispatches a domain-scoped purge to configured edge agents.
 pub async fn set_cache_enabled(
     State(state): State<AppState>,
     actor: Actor,
@@ -1379,7 +1379,11 @@ pub async fn set_cache_enabled(
         };
         match crate::api::purge::run_purge(&state, &actor, purge_req).await {
             Ok(resp) => {
-                purge_note = format!("；已清理缓存 {} 条", resp.purged_count);
+                purge_note = if resp.success {
+                    format!("；已清理缓存 {} 条", resp.purged_count)
+                } else {
+                    format!("；部分节点清理未确认（{}）", resp.message)
+                };
             }
             Err((_, body)) => {
                 tracing::warn!(

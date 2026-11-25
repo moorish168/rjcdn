@@ -2,6 +2,7 @@
 
 use crate::server::handler::AppState;
 use axum::{extract::State, Json};
+use lagran_cache::CacheBackend;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -27,12 +28,14 @@ pub async fn purge_handler(
 ) -> Json<EdgePurgeResponse> {
     if req.purge_all.unwrap_or(false) {
         let before = state.cache.len().await
+            + state.compressed.len().await
             + state
                 .large_cache
                 .as_ref()
                 .map(|cache| cache.len())
                 .unwrap_or(0);
         state.cache.clear().await;
+        state.compressed.clear().await;
         if let Some(large) = state.large_cache.as_ref() {
             large.clear().await;
         }
@@ -97,12 +100,18 @@ pub async fn purge_handler(
     let mut n = 0u64;
     if !targets.is_empty() {
         n += state.cache.purge_matching(&targets).await;
+        n += state.compressed.purge_matching(&targets).await;
         if let Some(large) = state.large_cache.as_ref() {
             n += large.purge_targets(&targets).await;
         }
     }
     if !tags.is_empty() {
         n += state.cache.purge_tags(&tags, &req.domain).await;
+        // Compressed sidecars carry no origin tags. Purge this site's sidecars
+        // so a later request cannot replay an older encoding after a tag purge.
+        if let Some(target) = lagran_cache::PurgeTarget::for_domain(domain) {
+            n += state.compressed.purge_matching(&[target]).await;
+        }
     }
     tracing::info!(domain = %domain, purged = n, targets = ?targets, tags = ?tags, "purge applied");
 

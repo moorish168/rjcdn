@@ -62,7 +62,8 @@ impl CacheSource {
 /// Purge used to be a raw `key.contains(pattern)` check, so refreshing one URL
 /// (or the domain appended to every pattern) deleted whole domains, and a
 /// domain string matched other tenants whose names merely contained it. Targets
-/// are scoped to one host and match the key structure `METHOD:host:path`.
+/// are scoped to one host (or one-label wildcard) and match the key structure
+/// `METHOD:host:path`, including derived compressed sidecars.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PurgeTarget {
     pub host: String,
@@ -97,7 +98,7 @@ pub fn cache_key_matches(key: &str, target: &PurgeTarget) -> bool {
     let Some((host, path)) = split_cache_key(key) else {
         return false;
     };
-    if !host.eq_ignore_ascii_case(&target.host) {
+    if !cache_host_matches(host, &target.host) {
         return false;
     }
     if target.prefix {
@@ -105,6 +106,19 @@ pub fn cache_key_matches(key: &str, target: &PurgeTarget) -> bool {
     } else {
         path == target.path
     }
+}
+
+pub fn cache_host_matches(host: &str, target: &str) -> bool {
+    if host.eq_ignore_ascii_case(target) {
+        return true;
+    }
+    let Some(suffix) = target.strip_prefix('*') else {
+        return false;
+    };
+    let Some(label) = host.strip_suffix(suffix) else {
+        return false;
+    };
+    !label.is_empty() && !label.contains('.')
 }
 
 /// Host portion of a cache key, for tag purges.
@@ -122,7 +136,10 @@ fn split_cache_key(key: &str) -> Option<(&str, &str)> {
     if host.is_empty() {
         return None;
     }
-    Some((host, strip_vary(&rest[slash..])))
+    // Compressed sidecars extend the identity cache key with a NUL-delimited
+    // representation and validator. Treat them as the same URL for purging.
+    let path = rest[slash..].split('\0').next().unwrap_or(&rest[slash..]);
+    Some((host, strip_vary(path)))
 }
 
 /// Drop trailing `|label=<16 hex chars>` vary components from the path.
@@ -679,7 +696,8 @@ impl CacheBackend for MemoryCache {
             .iter()
             .filter(|e| {
                 (domain.is_empty()
-                    || cache_key_host(e.key()).is_some_and(|h| h.eq_ignore_ascii_case(&domain)))
+                    || cache_key_host(e.key())
+                        .is_some_and(|host| cache_host_matches(host, &domain)))
                     && e.value()
                         .entry
                         .tags()
@@ -896,6 +914,26 @@ mod tests {
         assert_eq!(c.len().await, 1);
     }
 
+    #[tokio::test]
+    async fn wildcard_tag_purge_matches_only_one_subdomain_label() {
+        let c = MemoryCache::new(10);
+        let tagged = CacheEntry::new(
+            200,
+            vec![("cache-tag".into(), "release-1".into())],
+            Bytes::from_static(b"asset"),
+        );
+        c.set("GET:img.example.com:/x", tagged.clone(), 60).await;
+        c.set("GET:cdn.example.com:/x", tagged.clone(), 60).await;
+        c.set("GET:a.img.example.com:/x", tagged, 60).await;
+
+        assert_eq!(
+            c.purge_tags(&["release-1".into()], "*.example.com")
+                .await,
+            2
+        );
+        assert_eq!(c.len().await, 1);
+    }
+
     #[test]
     fn purge_target_is_host_and_path_scoped() {
         let key = "GET:example.com:/small";
@@ -922,6 +960,23 @@ mod tests {
         // A bare "/" URL must not become a cross-tenant purge.
         let root = PurgeTarget::new("example.com", "/", false).unwrap();
         assert!(!cache_key_matches("GET:other.com:/", &root));
+
+        // Wildcard domains own one subdomain label, and URL/config purges
+        // also cover derived gzip/WebP sidecars.
+        let wildcard_url =
+            PurgeTarget::new("*.example.com", "/small?q=1", false).unwrap();
+        assert!(cache_key_matches(
+            "GET:img.example.com:/small?q=1|cfg=0123456789abcdef",
+            &wildcard_url
+        ));
+        assert!(cache_key_matches(
+            "GET:img.example.com:/small?q=1|cfg=0123456789abcdef\0webp\0etag:v1",
+            &wildcard_url
+        ));
+        assert!(!cache_key_matches(
+            "GET:a.img.example.com:/small?q=1|cfg=0123456789abcdef",
+            &wildcard_url
+        ));
     }
 
     #[tokio::test]

@@ -508,7 +508,7 @@ impl CacheBackend for DiskCache {
                 };
                 if !domain.is_empty()
                     && !lagran_cache::cache_key_host(&meta.key)
-                        .is_some_and(|host| host.eq_ignore_ascii_case(&domain))
+                        .is_some_and(|host| lagran_cache::cache_host_matches(host, &domain))
                 {
                     continue;
                 }

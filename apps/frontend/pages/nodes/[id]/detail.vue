@@ -10,6 +10,7 @@ const {
   detailListenerWarning,
   detailCallbackWarning,
   detailPlan,
+  humanBytes,
   copy,
   downloadDetailEnv,
   statusLabel,
@@ -87,6 +88,9 @@ const {
           <div class="detail-value">
             CPU {{ detail.node.cpu_usage != null ? `${detail.node.cpu_usage.toFixed(0)}%` : '—' }}
             · MEM {{ detail.node.memory_usage != null ? `${detail.node.memory_usage.toFixed(0)}%` : '—' }}
+            · DISK {{ detail.node.disk_total_bytes != null && detail.node.disk_available_bytes != null
+              ? `${humanBytes(Math.max(0, detail.node.disk_total_bytes - detail.node.disk_available_bytes))} / ${humanBytes(detail.node.disk_total_bytes)}`
+              : '—' }}
           </div>
         </div>
       </div>
