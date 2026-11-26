@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { displayVersion } from '~/utils/version'
 const dns = inject('dns') as ReturnType<typeof useDnsConsole>
 const {
   dnsActionLabel,
@@ -143,7 +144,7 @@ const {
                       <template v-if="n.ssh_host">{{ n.ssh_host }}:{{ n.ssh_port }}</template>
                       <span v-else class="text-muted">未配置</span>
                     </td>
-                    <td class="mono">{{ n.version || '—' }}</td>
+                    <td class="mono">{{ displayVersion(n.version) || '—' }}</td>
                     <td>
                       <button
                         v-if="n.last_op"

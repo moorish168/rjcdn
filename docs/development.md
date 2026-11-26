@@ -256,7 +256,7 @@ curl -X POST http://127.0.0.1:8080/api/v1/certs/issue \
 
 当边缘需要回源、但源站不可用时（且没有可用的缓存副本），返回本地 HTML 提示页：
 
-| 场景 | 状态码 | `X-Lagran-Error` |
+| 场景 | 状态码 | `X-CDN-Error` |
 |---|---|---|
 | 连接被拒绝 / DNS / TLS 失败 | 502 | `ORIGIN_UNREACHABLE` |
 | 回源超时 | 504 | `ORIGIN_TIMEOUT` |
@@ -537,7 +537,7 @@ bash tests/integration/cache-rules.sh
 2. **接入**：节点启动后每 15 秒（`HEARTBEAT_INTERVAL`）上报心跳，首次心跳把状态从 `pending` 置为 `online`，
    并上报版本、CPU、内存。
 3. **启停**：停用 → 控制面把状态置为 `disabled`；下一次心跳响应 `enabled=false`，边缘本地开关关闭，
-   代理请求统一返回 **503 节点已停用**页（`X-Lagran-Error: NODE_DISABLED`）。
+   代理请求统一返回 **503 节点已停用**页（`X-CDN-Error: NODE_DISABLED`）。
    健康检查、心跳、刷新、证书等管理接口不受影响，所以节点仍可被重新启用。
 4. **编辑**：可改名称/区域/Agent 地址；区域与 Agent 地址一旦非空，心跳不会覆盖（以控制台为准）。
 5. **删除**：删除记录并吊销令牌；节点若仍在运行，心跳会被 401 拒绝，不会自动重新注册。
@@ -588,7 +588,7 @@ bash tests/integration/nodes.sh
   （默认难度 4、有效期 1800 秒）。只有 **GET/HEAD 且 Accept 包含 text/html** 的文档导航才会质询；
   API/XHR/POST（如 `POST /api/v1/login`）会跳过质询直接放行，避免登录接口返回 403。
 - **模式**：`monitor` 只记录事件不拦截（灰度验证，质询规则也只记录）；`block` 返回 403 拦截页
-  （`X-Lagran-WAF: blocked`）或质询页（`X-Lagran-Challenge: 1`），均为 `no-store`
+  （`X-CDN-WAF: blocked`）或质询页（`X-CDN-Challenge: 1`），均为 `no-store`
 
 执行顺序：域名解析 → CC 防御 → 限流 → WAF（白名单 → 黑名单 → 托管规则 → 自定义规则）→ 缓存/回源。
 被拦截的请求不会到达源站，也不会进入缓存。
@@ -618,7 +618,7 @@ bash tests/integration/waf-advanced.sh
 
 - 每 IP 每秒请求数 `cc_rps` + 突发额度 `cc_burst`，1 秒固定窗口
 - 连续 `cc_ban_after` 个窗口超限后，自动封禁该 IP `cc_ban_seconds` 秒
-- 封禁期间返回 `429 Too Many Requests`，带 `Retry-After` 和 `X-Lagran-CC: banned`
+- 封禁期间返回 `429 Too Many Requests`，带 `Retry-After` 和 `X-CDN-CC: banned`
 - `cc_mode=monitor` 只记录事件、不返回 429，适合先观察
 - `cc_allow_ips` 支持 IPv4/IPv6 与 CIDR，白名单 IP 不计数、不受已有封禁影响
 - 配置随 `/api/v1/config` 下发，约 15 秒生效；限速计数在边缘内存中，自动封禁通过控制面跨节点共享
@@ -630,7 +630,7 @@ bash tests/integration/waf-advanced.sh
 bash tests/integration/cc.sh
 ```
 
-覆盖：首请求放行、超限自动封禁、429/`X-Lagran-CC`/`Retry-After`、封禁持续、
+覆盖：首请求放行、超限自动封禁、429/`X-CDN-CC`/`Retry-After`、封禁持续、
 白名单绕过封禁、monitor 模式只记录不拦截，以及 **跨节点共享封禁**。
 
 ### 跨节点共享封禁

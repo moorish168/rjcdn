@@ -304,6 +304,8 @@ WAF 值班组：domain:read, waf:read, waf:write
 ```
 
 Edge 会用 SNI 建立 TLS 并校验证书，用回源 Host 访问虚拟主机；回源 Host 留空时回退到 SNI，再回退到源站主机。
+
+回源协议无需配置，按 HTTP/2 优先、HTTP/1.1 兜底：HTTPS 源站在 TLS 握手中协商，不支持 HTTP/2 的源站直接用 HTTP/1.1；HTTP 源站由 Edge 在后台探测是否支持明文 HTTP/2（h2c），确认后才使用。HTTP/2 回源出现协议错误时，Edge 自动改用 HTTP/1.1 重试，并在 30 分钟内对该源站保持 HTTP/1.1，日志记录 `origin HTTP/2 failed; using HTTP/1.1`。只支持 HTTP/1.1 的 HTTP 源站，访问日志中每个边缘节点大约每小时会出现一条 `PRI * HTTP/2.0` 的 400 记录，这是探测请求，可以忽略。
 2. 配置 DNS：
    - 客户域名 CNAME 到统一边缘接入域名，或
    - 直接 A/AAAA 记录到 Edge 公网 IP。
@@ -1017,7 +1019,7 @@ DSL 仍然只检查 path/query/UA/Referer/Method/Header/IP，不读取请求体�
 - 自动续期（默认到期前 45 天，可用 `ACME_RENEW_BEFORE_DAYS` 调整）
 - NS / CNAME 就绪后可自动 HTTPS（`auto_https` + 后台任务）
 - 推送到 Edge，SNI 热加载
-- 站点级协议开关：WebSocket / HTTP/2 / HTTP/3 / GZIP / WebP（高级设置 → 协议与优化）；新站点的 HTTP/3 默认关闭，启用前需确保边缘 UDP 端口已放行
+- 站点级协议开关：WebSocket / HTTP/2 / GZIP / WebP（高级设置 → 协议与优化）。HTTP/3 暂未开放：控制台不显示开关，控制面下发给边缘的配置一律关闭 HTTP/3（站点已存的值保留，重新开放时恢复）
 
 ### 3.8 节点管理
 
@@ -1061,6 +1063,7 @@ PUBLIC_IP=<公网IP>
 ### 3.10 统计、监控、告警
 
 - 仪表盘：请求、命中率、流量、节点数。
+- 命中率 = HIT ÷（HIT + MISS），只统计缓存规则允许缓存、且源站响应可以存储的请求：缓存返回的 200、Range 的 206、浏览器再验证的 304 都算命中；BYPASS、POST 等动态请求、不可存储的响应（404/5xx、no-store、带 Set-Cookie）和源站故障（ERROR/TIMEOUT）不计入分子分母。
 - 按域名统计。
 - 大屏监控：独立布局，10 秒刷新。
 - 告警中心：源站健康、证书到期、节点离线、命中率、WAF 突增。
@@ -1846,7 +1849,7 @@ Pragma: no-cache
 原因：缓存多久由站长通过缓存规则决定，不由访客决定。否则每次浏览器刷新都会回源，任何客户端
 带上这个头就能绕过 CDN 直接打到源站。源站内容更新后请用「缓存刷新」清掉旧缓存。
 
-`Cache-Control: no-store` 仍然不读不写缓存（`X-Lagran-Cache-Reason: no-store`）。
+`Cache-Control: no-store` 仍然不读不写缓存（`X-Cache-Reason: no-store`）。
 
 ### 5.6 响应头语义
 
@@ -2327,8 +2330,8 @@ HTTP/1.1 206 Partial Content
 Content-Type: multipart/byteranges; boundary=lagran-...
 Content-Length: ...
 X-Cache: HIT
-X-Lagran-Cache-Source: l3
-X-Lagran-Cache-Reason: range-multipart
+X-Cache-Source: l3
+X-Cache-Reason: range-multipart
 ```
 
 每个 part 包含：
@@ -2387,7 +2390,7 @@ Range: bytes=0-
 
 ```http
 X-Cache: HIT
-X-Lagran-Cache-Source: l3
+X-Cache-Source: l3
 ```
 
 如果客户端只读了 32 MiB 就断开：
@@ -2445,16 +2448,16 @@ Range: bytes=4194304-5242879
 HTTP/1.1 206 Partial Content
 Content-Range: bytes 0-104857599/104857600
 X-Cache: HIT
-X-Lagran-Cache-Source: l3+origin
-X-Lagran-Cache-Reason: range-chunks
+X-Cache-Source: l3+origin
+X-Cache-Reason: range-chunks
 ```
 
 全部缺失分片补齐后：
 
 ```http
 X-Cache: HIT
-X-Lagran-Cache-Source: l3
-X-Lagran-Cache-Reason: range-large-cache
+X-Cache-Source: l3
+X-Cache-Reason: range-large-cache
 ```
 
 特点：
@@ -2605,8 +2608,8 @@ Pingora 仍使用域名的 `origin_timeout_ms` 建立连接；连接建立后使
 500/504 响应头：
 
 ```http
-x-lagran-error: ORIGIN_TIMEOUT
-x-lagran-datapath: pingora
+x-cdn-error: ORIGIN_TIMEOUT
+x-cdn-datapath: pingora
 ```
 
 说明 Edge 到源站超时。
@@ -2698,7 +2701,7 @@ X-Cache: STALE
 ```text
 Age <= TTL      → X-Cache: HIT
 Age > TTL       → X-Cache: STALE
-                 X-Lagran-Cache-Reason: stale-range
+                 X-Cache-Reason: stale-range
 ```
 
 旧版本可能把 stale 的大对象 Range 也标成 `HIT`，此时只能通过 `Age` 和 `TTL` 判断。
@@ -2812,7 +2815,7 @@ CACHE_KEY_IGNORE_HEADERS=accept-language,origin
 
 1. 优先让在线 Edge 真正执行一次请求。
 2. 对下载/大文件路径自动使用 `Range: bytes=0-0`。
-3. 返回状态、`X-Cache`、`X-Lagran-Cache-Reason`、preview。
+3. 返回状态、`X-Cache`、`X-Cache-Reason`、preview。
 4. Edge 内部 10 秒超时，Control 回调 20 秒超时。
 
 注意：
@@ -3067,18 +3070,17 @@ status=304 + cache_status=REVALIDATED
 
 | 头 | 含义 |
 |---|---|
-| `X-Powered-By: lagran-edge` | 确认请求由 Lagran Edge 处理 |
 | `X-Cache` | `HIT` / `MISS` / `BYPASS` / `STALE` / `DYNAMIC` / `REVALIDATED` |
 | `X-Cache-Status` | 同 `X-Cache` |
-| `X-Lagran-Cache-Reason` | 未命中/绕过/填充原因 |
-| `X-Lagran-Cache-Source` | 缓存来源：`l1` 本地内存、`l2` Redis、`l3` 大对象磁盘、`origin` 回源 |
-| `X-Lagran-Cache-Lookup-MS` | 缓存查找耗时（毫秒）；回源 miss 记录为 0 |
+| `X-Cache-Reason` | 未命中/绕过/填充原因 |
+| `X-Cache-Source` | 缓存来源：`l1` 本地内存、`l2` Redis、`l3` 大对象磁盘、`origin` 回源 |
+| `X-Cache-Lookup-MS` | 缓存查找耗时（毫秒）；回源 miss 记录为 0 |
 | `Server-Timing` | `cache;dur=<毫秒>`，与缓存查找耗时对应 |
 | `Age` | 缓存对象年龄 |
-| `X-Lagran-Cache-TTL` | 缓存对象剩余新鲜寿命（秒）；`Age` 是已存活时间，两者互补 |
-| `X-Lagran-Datapath` | `pingora` / `legacy`，标识本次请求实际走的数据面 |
+| `X-Cache-TTL` | 缓存对象剩余新鲜寿命（秒）；`Age` 是已存活时间，两者互补 |
+| `X-CDN-Datapath` | `pingora` / `legacy`，标识本次请求实际走的数据面；带这个头即说明请求经过边缘。边缘不发送 `X-Powered-By`，源站发的也会去掉 |
 | `ETag` | 源站或 Edge 生成 |
-| `X-Lagran-Error` | 源站错误类型 |
+| `X-CDN-Error` | 源站错误类型 |
 
 常见 reason：
 
@@ -3195,7 +3197,7 @@ find /var/lib/lagran/large-cache -name '*.meta.json' | wc -l
 ```text
 1. DNS 是否解析到预期 Edge
 2. TCP/TLS 是否能连接
-3. 请求是否到达 Edge（X-Powered-By）
+3. 请求是否到达 Edge（X-CDN-Datapath）
 4. Host 是否命中已接入域名
 5. 是否 HTTPS 301
 6. WAF/CC 是否拦截
@@ -3208,10 +3210,10 @@ find /var/lib/lagran/large-cache -name '*.meta.json' | wc -l
 
 ```bash
 curl -sS -D - -o /dev/null https://cdn.example.com/test \
-  | grep -Ei 'HTTP/|server|x-powered-by|x-cache|x-lagran-cache-reason|age|content-length'
+  | grep -Ei 'HTTP/|server|x-cdn-datapath|x-cache|x-cache-reason|age|content-length'
 ```
 
-如果 `X-Powered-By` 不是 `lagran-edge`：
+如果响应里没有 `X-CDN-Datapath`：
 
 - DNS 可能仍指向旧 CDN/源站
 - 请求打到了前置 Caddy/Nginx
@@ -3227,7 +3229,7 @@ curl -sS -D - -o /dev/null https://cdn.example.com/file
 
 ```text
 X-Cache
-X-Lagran-Cache-Reason
+X-Cache-Reason
 Cache-Control
 Vary
 Set-Cookie
@@ -3294,7 +3296,7 @@ vary: origin, access-control-request-method, access-control-request-headers
 
 ```text
 每次 X-Cache: BYPASS
-X-Lagran-Cache-Reason: range-fill
+X-Cache-Reason: range-fill
 但 large-cache 目录没有文件
 ```
 
@@ -3342,14 +3344,14 @@ Accept-Ranges: bytes
 请求带 `Cache-Control: no-cache`、`max-age=0` 或 `Pragma: no-cache`：
 
 - 有 `ETag`/`Last-Modified` 时向源站发条件请求
-- 源站 `304`：复用缓存 body，`X-Lagran-Cache: REVALIDATED`，`X-Lagran-Cache-Reason: origin-304`
+- 源站 `304`：复用缓存 body，`X-Cache: REVALIDATED`，`X-Cache-Reason: origin-304`
 - 源站 `200`：新响应覆盖缓存
 - 没有 validator 时退回普通全量回源
 
 响应带 `Cache-Control: no-cache`：
 
 - 不写入共享缓存，即使命中路径规则也不覆盖
-- 日志中的 `X-Lagran-Cache-Reason` 为 `no-cache`
+- 日志中的 `X-Cache-Reason` 为 `no-cache`
 
 如果要求“保存后每次条件请求 304 复用”，当前已由独立的条件校验路径处理；304 时不会重新下载 body。
 
@@ -3736,7 +3738,7 @@ URL='https://cdn.example.com/file.mp4'
 curl -sS -D /tmp/r1.h -o /dev/null \
   -H 'Range: bytes=0-1023' \
   -H 'Accept-Encoding: identity' "$URL"
-grep -Ei 'HTTP/|content-range|x-cache|x-lagran-cache-reason' /tmp/r1.h
+grep -Ei 'HTTP/|content-range|x-cache|x-cache-reason' /tmp/r1.h
 
 sleep 2
 

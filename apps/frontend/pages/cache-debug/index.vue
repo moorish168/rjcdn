@@ -3,7 +3,7 @@
     <div class="page-head">
       <div>
         <div class="page-title">缓存诊断</div>
-        <div class="page-desc">模拟一次真实请求，读取边缘返回的 X-Lagran-Cache-Reason，定位“为什么没有缓存”</div>
+        <div class="page-desc">模拟一次真实请求，读取边缘返回的 X-Cache-Reason，定位“为什么没有缓存”</div>
       </div>
     </div>
 
@@ -77,7 +77,7 @@
         <div class="card-body tips">
           <div class="tip-row">
             <span class="tip-index">1</span>
-            <span>响应头 `X-Lagran-Cache-Reason` 会给出具体绕过原因。</span>
+            <span>响应头 `X-Cache-Reason` 会给出具体绕过原因。</span>
           </div>
           <div class="tip-row">
             <span class="tip-index">2</span>

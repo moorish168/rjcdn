@@ -100,7 +100,7 @@ Range 仍由各数据面解析，因为小范围切片和流式 Range 使用不�
 
 - 小范围 Range 切片：完整 SharedCache 对象直接切 206；未命中时 Pingora 原生流式回源
 - WebSocket：显式 legacy-only 路由
-- `X-Lagran-Datapath`：响应标识 `pingora` / `legacy`，集成测试断言普通 GET、Range、浏览器刷新均走 Pingora
+- `X-CDN-Datapath`：响应标识 `pingora` / `legacy`，集成测试断言普通 GET、Range、浏览器刷新均走 Pingora
 - Prometheus：`lagran_edge_datapath_pingora_total` / `lagran_edge_datapath_legacy_total`
 
 尚未迁移：

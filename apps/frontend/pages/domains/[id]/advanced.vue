@@ -20,6 +20,9 @@ const showOriginAuthInput = ref(false)
 const rotatedSecret = ref('')
 const rotatedSecretOpen = ref(false)
 const cacheBusy = ref(false)
+// HTTP/3 is not offered yet: the switch stays hidden and a site's stored value
+// is saved back unchanged. Set to true to show it again.
+const HTTP3_OFFERED = false
 
 interface ShieldNode {
   id: string
@@ -544,7 +547,7 @@ watch(id, loadSettings, { immediate: true })
         <section class="settings-group">
           <h4 class="settings-group-title">协议与优化</h4>
           <p class="field-hint" style="margin-top: 0">
-            按站点开关；新站点的 HTTP/3 默认关闭，启用前需确认边缘 UDP 监听和防火墙已配置。图片 WebP 只转换可缓存且源站带 ETag 的 JPEG/PNG，
+            按站点开关<template v-if="HTTP3_OFFERED">；新站点的 HTTP/3 默认关闭，启用前需确认边缘 UDP 监听和防火墙已配置</template>。图片 WebP 只转换可缓存且源站带 ETag 的 JPEG/PNG，
             只发给 Accept 含 image/webp 的客户端：首次请求返回原图并在后台转码，之后返回 WebP。
             边缘需为含 WebP 的版本（<code>lagran-edge version</code> 显示 image-webp）。
           </p>
@@ -556,7 +559,7 @@ watch(id, loadSettings, { immediate: true })
             <input v-model="settings.http2_enabled" type="checkbox" />
             HTTP/2
           </label>
-          <label class="check">
+          <label v-if="HTTP3_OFFERED" class="check">
             <input v-model="settings.http3_enabled" type="checkbox" />
             HTTP/3（QUIC）
           </label>

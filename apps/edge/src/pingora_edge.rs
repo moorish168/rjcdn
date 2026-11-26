@@ -10,12 +10,13 @@
 use crate::cache::large::{ChunkPlan, FillBudget, LargeEntry, RangeWriter};
 use crate::cache::policy::{
     apply_key_ignore_default, compute_etag, decide_storage_reason, decide_storage_reason_map,
-    request_bypass_reason_headers, resolve_rule_policy_for_response, ResolvedPolicy, RuleAction,
-    VALIDATOR_SOURCE_HEADER,
+    is_legacy_diagnostic_header, request_bypass_reason_headers, resolve_rule_policy_for_response,
+    ResolvedPolicy, RuleAction, LEGACY_DIAGNOSTIC_HEADERS, VALIDATOR_SOURCE_HEADER,
 };
 use crate::cache::{CacheBackend, CacheSource};
 use crate::config::registry::{DomainEntry, OriginTarget};
 use crate::config::EdgeConfig;
+use crate::origin::protocol::{self as origin_protocol, H2Failure, OriginHttp, ProbeTarget};
 use crate::origin_dns::OriginDnsCache;
 use crate::security::header_guard;
 use crate::security::origin_auth;
@@ -69,6 +70,18 @@ const MAX_CHUNK_ORIGIN_RUNS: usize = 16;
 /// Bound multipart Range parts so one request cannot create unbounded origin
 /// work or response overhead.
 const MAX_MULTI_RANGES: usize = 16;
+/// Requests multiplexed on one HTTP/2 origin connection. Pingora opens
+/// another connection once every slot is busy, and honours a lower
+/// SETTINGS_MAX_CONCURRENT_STREAMS from the origin.
+const ORIGIN_H2_MAX_STREAMS: usize = 8;
+/// Connection receive window for HTTP/2 origin connections: one full 8 MiB
+/// stream window (Pingora's default) per stream slot. With Pingora's default
+/// 8 MiB for the whole connection, a single slow client could hold the shared
+/// window and stall every other request multiplexed on it.
+const ORIGIN_H2_CONNECTION_WINDOW: u32 = 8 * 1024 * 1024 * ORIGIN_H2_MAX_STREAMS as u32;
+/// Same-address resends of one request for HTTP/2 protocol recovery
+/// (HTTP/1.1 fallback, refused or drained streams).
+const MAX_PROTOCOL_RETRIES: u8 = 2;
 
 #[derive(Debug)]
 struct Sni(String);
@@ -347,6 +360,15 @@ struct ReqCtx {
     current_address_index: usize,
     current_origin: String,
     current_host_header: String,
+    /// `origin::protocol` key of the origin the current attempt targets.
+    origin_protocol_key: String,
+    /// Wire protocol requested for the current attempt.
+    upstream_http: OriginHttp,
+    /// HTTP/2 to the origin failed: later attempts of this request use
+    /// HTTP/1.1.
+    force_http1: bool,
+    /// Same-address resends spent on HTTP/2 protocol recovery.
+    protocol_retries: u8,
     response_bypass: bool,
     /// Response policy computed by the cache filter, reused by the response
     /// filter for the same Content-Type.
@@ -401,6 +423,10 @@ impl Default for ReqCtx {
             current_address_index: 0,
             current_origin: String::new(),
             current_host_header: String::new(),
+            origin_protocol_key: String::new(),
+            upstream_http: OriginHttp::Http1,
+            force_http1: false,
+            protocol_retries: 0,
             response_bypass: false,
             response_policy: None,
             head_body: BytesMut::new(),
@@ -1288,6 +1314,22 @@ impl ProxyHttp for DataPlaneProxy {
             }
 
             let addr = ctx.current_addresses[ctx.current_address_index];
+            // HTTP/2 first (ALPN for https, a probed h2c for http), HTTP/1.1
+            // as the fallback; see `origin::protocol`.
+            ctx.origin_protocol_key = origin_protocol::origin_key(tls, &host, port, Some(&sni));
+            ctx.upstream_http = if ctx.force_http1
+                // HTTP/1 Upgrade (WebSocket, RFC 6455) exists only in HTTP/1.1.
+                || requires_http1_upgrade(&session.req_header().headers)
+            {
+                OriginHttp::Http1
+            } else if tls {
+                self.state.origin.protocols().tls(&ctx.origin_protocol_key)
+            } else {
+                self.state
+                    .origin
+                    .protocols()
+                    .cleartext(&ctx.origin_protocol_key, ProbeTarget::Addr(addr))
+            };
             return self
                 .peer_for(
                     addr,
@@ -1300,6 +1342,7 @@ impl ProxyHttp for DataPlaneProxy {
                         read_timeout_ms
                     },
                     if sni.is_empty() { None } else { Some(&sni) },
+                    ctx.upstream_http,
                 )
                 .await;
         }
@@ -1313,6 +1356,34 @@ impl ProxyHttp for DataPlaneProxy {
         e: Box<pingora::Error>,
     ) -> Box<pingora::Error> {
         let mut e = e;
+        // TCP/TLS succeeded but HTTP/2 did not: the h2 handshake failed or the
+        // connection could not open a stream. Nothing reached the origin
+        // application, so any method can go again over HTTP/1.1, to the same
+        // address.
+        if ctx.upstream_http.is_http2()
+            && ctx.protocol_retries < MAX_PROTOCOL_RETRIES
+            && matches!(
+                e.etype(),
+                pingora::ErrorType::HandshakeError | pingora::ErrorType::H2Error
+            )
+        {
+            // A failed handshake, or h2c failing at all, says the origin does
+            // not speak HTTP/2. A stream that would not open on a negotiated
+            // (possibly pooled) connection can be a one-off: only this
+            // request moves to HTTP/1.1.
+            if ctx.upstream_http == OriginHttp::H2c
+                || e.etype() == &pingora::ErrorType::HandshakeError
+            {
+                self.state
+                    .origin
+                    .protocols()
+                    .downgrade(&ctx.origin_protocol_key, &e.to_string());
+            }
+            ctx.force_http1 = true;
+            ctx.protocol_retries += 1;
+            e.set_retry(true);
+            return e;
+        }
         if Self::advance_peer(ctx) {
             e.set_retry(true);
         }
@@ -1325,9 +1396,46 @@ impl ProxyHttp for DataPlaneProxy {
         session: &mut Session,
         e: Box<pingora::Error>,
         ctx: &mut Self::CTX,
-        _client_reused: bool,
+        client_reused: bool,
     ) -> Box<pingora::Error> {
         let mut e = e;
+        // A request can go again only while the client has no response
+        // header yet and the body still fits Pingora's retry buffer. A resend
+        // after that would splice a second response into the first.
+        let replayable =
+            session.response_written().is_none() && !session.as_ref().retry_buffer_truncated();
+        let idempotent = session.req_header().method.is_idempotent();
+
+        if let Some(failure) = origin_h2_failure(&e, ctx.upstream_http, client_reused) {
+            if failure.downgrades() {
+                // This request's next attempt, and this origin for a while,
+                // use HTTP/1.1.
+                self.state
+                    .origin
+                    .protocols()
+                    .downgrade(&ctx.origin_protocol_key, &e.to_string());
+                ctx.force_http1 = true;
+            }
+            // A protocol event on a healthy origin: resend to the same
+            // address, without failover or a health penalty.
+            if replayable
+                && failure.may_resend(idempotent)
+                && ctx.protocol_retries < MAX_PROTOCOL_RETRIES
+            {
+                ctx.protocol_retries += 1;
+                tracing::debug!(
+                    domain = %ctx.host,
+                    origin = %ctx.current_origin,
+                    ?failure,
+                    http1 = ctx.force_http1,
+                    error = %e,
+                    "resending origin request after HTTP/2 failure"
+                );
+                e.set_retry(true);
+                return e;
+            }
+        }
+
         match e.etype() {
             pingora::ErrorType::ConnectTimedout
             | pingora::ErrorType::TLSHandshakeTimedout
@@ -1362,7 +1470,6 @@ impl ProxyHttp for DataPlaneProxy {
                 });
             }
         }
-        let idempotent = session.req_header().method.is_idempotent();
         let safe_to_retry = ctx
             .plan
             .as_ref()
@@ -1378,11 +1485,7 @@ impl ProxyHttp for DataPlaneProxy {
             error = %e,
             "proxy error while reading upstream"
         );
-        if idempotent
-            && safe_to_retry
-            && !session.as_ref().retry_buffer_truncated()
-            && Self::advance_peer(ctx)
-        {
+        if idempotent && safe_to_retry && replayable && Self::advance_peer(ctx) {
             e.set_retry(true);
         } else {
             e.set_retry(false);
@@ -1592,36 +1695,42 @@ impl ProxyHttp for DataPlaneProxy {
         }
         response.remove_header(META_HEADER);
         response.remove_header(VALIDATOR_SOURCE_HEADER);
-        response.remove_header("x-lagran-cache-reason");
-        if !response.headers.contains_key("x-lagran-datapath") {
-            response.insert_header("x-lagran-datapath", "pingora")?;
+        response.remove_header("x-cache-reason");
+        // An older shield in front of this edge still sends the old names.
+        for legacy in LEGACY_DIAGNOSTIC_HEADERS {
+            response.remove_header(legacy);
+        }
+        if !response.headers.contains_key("x-cdn-datapath") {
+            response.insert_header("x-cdn-datapath", "pingora")?;
         }
         if matches!(label, "HIT" | "STALE" | "REVALIDATED") {
             if let Some(ttl) = ctx.cache_ttl_secs {
-                response.insert_header("x-lagran-cache-ttl", ttl.to_string())?;
+                response.insert_header("x-cache-ttl", ttl.to_string())?;
             }
         }
         response.insert_header("x-cache", label)?;
         response.insert_header("x-cache-status", label)?;
-        response.insert_header("x-powered-by", "lagran-edge")?;
+        // No product name on visitor responses; the origin's value never
+        // reached visitors either.
+        response.remove_header("x-powered-by");
         if let Some(reason) = ctx.cache_reason {
-            response.insert_header("x-lagran-cache-reason", reason)?;
+            response.insert_header("x-cache-reason", reason)?;
         }
         let cache_source = resolve_cache_source(
             label,
             response
                 .headers
-                .get("x-lagran-cache-source")
+                .get("x-cache-source")
                 .and_then(|v| v.to_str().ok()),
         );
         let lookup_ms = response
             .headers
-            .get("x-lagran-cache-lookup-ms")
+            .get("x-cache-lookup-ms")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("0")
             .to_string();
-        response.insert_header("x-lagran-cache-source", cache_source)?;
-        response.insert_header("x-lagran-cache-lookup-ms", lookup_ms.clone())?;
+        response.insert_header("x-cache-source", cache_source)?;
+        response.insert_header("x-cache-lookup-ms", lookup_ms.clone())?;
         response.insert_header("server-timing", format!("cache;dur={lookup_ms}"))?;
 
         if plan.cacheable || plan.is_head {
@@ -1631,16 +1740,9 @@ impl ProxyHttp for DataPlaneProxy {
             Self::apply_browser_ttl(response, browser_ttl);
         }
         Self::apply_security_headers(response);
-        // Advertise H3 only when the site switch is on and the QUIC listener is
-        // up. When off, send `clear` so browsers drop a previously cached Alt-Svc
-        // (otherwise they keep retrying H3 for up to `ma`).
-        if plan.domain.http3_enabled {
-            if let Some(alt_svc) = crate::server::http3::alt_svc_value() {
-                let _ = response.insert_header("alt-svc", alt_svc);
-            }
-        } else {
-            let _ = response.insert_header("alt-svc", crate::server::http3::ALT_SVC_CLEAR);
-        }
+        // Always update the client's cached alternative: advertise only when
+        // both the site switch and the live QUIC listener are available.
+        apply_http3_alt_svc(response, plan.domain.http3_enabled);
         Self::apply_cors_and_custom(response, &plan.domain.response_headers);
 
         // WebP. Headers go out before the body is seen, so a response may be
@@ -1816,7 +1918,8 @@ impl ProxyHttp for DataPlaneProxy {
                                 && !name.eq_ignore_ascii_case("connection")
                                 && !name.eq_ignore_ascii_case("x-cache")
                                 && !name.eq_ignore_ascii_case("x-cache-status")
-                                && !name.eq_ignore_ascii_case("x-lagran-cache-reason")
+                                && !name.eq_ignore_ascii_case("x-cache-reason")
+                                && !is_legacy_diagnostic_header(name)
                                 && !name.eq_ignore_ascii_case("x-powered-by")
                         });
                         let present = large
@@ -2173,7 +2276,15 @@ impl ProxyHttp for DataPlaneProxy {
         } else {
             OriginFailure::Unreachable
         };
-        let code = if ctx.plan.is_some() {
+        // An origin failure is logged and counted as such (ERROR/TIMEOUT), not
+        // as a cache MISS, as the in-process engine already does: the hit
+        // ratio covers requests the cache could serve or store.
+        if e.esource() == &pingora::ErrorSource::Upstream {
+            ctx.cache_label = failure.log_label();
+        }
+        // Once the client has a response header, a second page would be
+        // spliced into that response; the connection just closes.
+        let code = if ctx.plan.is_some() && session.response_written().is_none() {
             let status = failure.status().as_u16();
             let page = default_page::origin_error_page(&ctx.host, &ctx.path, failure);
             write_axum_response(
@@ -2262,6 +2373,7 @@ impl DataPlaneProxy {
                 || name.eq_ignore_ascii_case("age")
                 || name.eq_ignore_ascii_case(META_HEADER)
                 || name.eq_ignore_ascii_case(VALIDATOR_SOURCE_HEADER)
+                || is_legacy_diagnostic_header(name)
                 || is_hop_by_hop(name)
             {
                 continue;
@@ -2278,18 +2390,18 @@ impl DataPlaneProxy {
         let _ = response.insert_header("accept-ranges", "bytes");
         let _ = response.insert_header("x-cache", "HIT");
         let _ = response.insert_header("x-cache-status", "HIT");
-        let _ = response.insert_header("x-lagran-cache-source", source.as_str());
-        let _ = response.insert_header("x-lagran-cache-reason", "range-shared-cache");
-        let _ = response.insert_header("x-powered-by", "lagran-edge");
-        let _ = response.insert_header("x-lagran-datapath", "pingora");
+        let _ = response.insert_header("x-cache-source", source.as_str());
+        let _ = response.insert_header("x-cache-reason", "range-shared-cache");
+        let _ = response.insert_header("x-cdn-datapath", "pingora");
         if let Some(age) = entry.ttl_secs() {
             let _ = age;
         }
         let _ = response.insert_header("age", entry.age_secs().to_string());
         if let Some(ttl) = entry.ttl_secs() {
-            let _ = response.insert_header("x-lagran-cache-ttl", ttl.to_string());
+            let _ = response.insert_header("x-cache-ttl", ttl.to_string());
         }
         Self::apply_security_headers(&mut response);
+        apply_http3_alt_svc(&mut response, plan.domain.http3_enabled);
         Self::apply_cors_and_custom(&mut response, &plan.domain.response_headers);
         if session
             .write_response_header(Box::new(response), false)
@@ -2427,6 +2539,7 @@ impl DataPlaneProxy {
         for (name, value) in &entry.meta.headers {
             if name.eq_ignore_ascii_case(META_HEADER)
                 || name.eq_ignore_ascii_case(VALIDATOR_SOURCE_HEADER)
+                || is_legacy_diagnostic_header(name)
                 || name.eq_ignore_ascii_case("content-length")
                 || name.eq_ignore_ascii_case("content-range")
                 || name.eq_ignore_ascii_case("cache-status")
@@ -2455,12 +2568,10 @@ impl DataPlaneProxy {
             || response
                 .insert_header("x-cache-status", cache_label)
                 .is_err()
-            || response
-                .insert_header("x-lagran-cache-source", "l3")
-                .is_err()
+            || response.insert_header("x-cache-source", "l3").is_err()
             || response
                 .insert_header(
-                    "x-lagran-cache-reason",
+                    "x-cache-reason",
                     if fresh {
                         "range-large-cache"
                     } else {
@@ -2472,8 +2583,8 @@ impl DataPlaneProxy {
             return false;
         }
         Self::apply_security_headers(&mut response);
+        apply_http3_alt_svc(&mut response, plan.domain.http3_enabled);
         Self::apply_cors_and_custom(&mut response, &plan.domain.response_headers);
-        let _ = response.insert_header("x-powered-by", "lagran-edge");
         if entry.meta.stored_at > 0 {
             let age = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -2486,7 +2597,7 @@ impl DataPlaneProxy {
                     .map(|d| d.as_secs())
                     .unwrap_or(0),
             );
-            let _ = response.insert_header("x-lagran-cache-ttl", ttl.to_string());
+            let _ = response.insert_header("x-cache-ttl", ttl.to_string());
         }
         if session
             .write_response_header(Box::new(response), false)
@@ -2624,7 +2735,8 @@ impl DataPlaneProxy {
                 && !name.eq_ignore_ascii_case("age")
                 && !name.eq_ignore_ascii_case("x-cache")
                 && !name.eq_ignore_ascii_case("x-cache-status")
-                && !name.eq_ignore_ascii_case("x-lagran-cache-reason")
+                && !name.eq_ignore_ascii_case("x-cache-reason")
+                && !is_legacy_diagnostic_header(name)
                 && !name.eq_ignore_ascii_case("x-powered-by")
         });
         let cache_headers = crate::cache::large::LargeCache::prune_uncacheable(&cache_headers);
@@ -2771,6 +2883,7 @@ impl DataPlaneProxy {
         for (name, value) in &entry.meta.headers {
             if name.eq_ignore_ascii_case(META_HEADER)
                 || name.eq_ignore_ascii_case(VALIDATOR_SOURCE_HEADER)
+                || is_legacy_diagnostic_header(name)
                 || name.eq_ignore_ascii_case("content-length")
                 || name.eq_ignore_ascii_case("content-range")
                 || name.eq_ignore_ascii_case("content-type")
@@ -2803,18 +2916,16 @@ impl DataPlaneProxy {
             || response.insert_header("accept-ranges", "bytes").is_err()
             || response.insert_header("x-cache", "HIT").is_err()
             || response.insert_header("x-cache-status", "HIT").is_err()
+            || response.insert_header("x-cache-source", "l3").is_err()
             || response
-                .insert_header("x-lagran-cache-source", "l3")
-                .is_err()
-            || response
-                .insert_header("x-lagran-cache-reason", "range-multipart")
+                .insert_header("x-cache-reason", "range-multipart")
                 .is_err()
         {
             return false;
         }
         Self::apply_security_headers(&mut response);
+        apply_http3_alt_svc(&mut response, native_plan.domain.http3_enabled);
         Self::apply_cors_and_custom(&mut response, &native_plan.domain.response_headers);
-        let _ = response.insert_header("x-powered-by", "lagran-edge");
         if entry.meta.stored_at > 0 {
             let now = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -2823,7 +2934,7 @@ impl DataPlaneProxy {
             let _ =
                 response.insert_header("age", now.saturating_sub(entry.meta.stored_at).to_string());
             let _ = response.insert_header(
-                "x-lagran-cache-ttl",
+                "x-cache-ttl",
                 entry.meta.fresh_until.saturating_sub(now).to_string(),
             );
         }
@@ -3455,7 +3566,8 @@ impl DataPlaneProxy {
                 && !name.eq_ignore_ascii_case("age")
                 && !name.eq_ignore_ascii_case("x-cache")
                 && !name.eq_ignore_ascii_case("x-cache-status")
-                && !name.eq_ignore_ascii_case("x-lagran-cache-reason")
+                && !name.eq_ignore_ascii_case("x-cache-reason")
+                && !is_legacy_diagnostic_header(name)
                 && !name.eq_ignore_ascii_case("x-powered-by")
         });
         let cache_headers = crate::cache::large::LargeCache::prune_uncacheable(&cache_headers);
@@ -3537,6 +3649,7 @@ impl DataPlaneProxy {
         for (name, value) in &cache_headers {
             if name.eq_ignore_ascii_case(META_HEADER)
                 || name.eq_ignore_ascii_case(VALIDATOR_SOURCE_HEADER)
+                || is_legacy_diagnostic_header(name)
                 || name.eq_ignore_ascii_case("content-length")
                 || name.eq_ignore_ascii_case("content-range")
                 || name.eq_ignore_ascii_case("cache-status")
@@ -3566,18 +3679,16 @@ impl DataPlaneProxy {
             || response.insert_header("accept-ranges", "bytes").is_err()
             || response.insert_header("x-cache", "MISS").is_err()
             || response.insert_header("x-cache-status", "MISS").is_err()
+            || response.insert_header("x-cache-source", "origin").is_err()
             || response
-                .insert_header("x-lagran-cache-source", "origin")
-                .is_err()
-            || response
-                .insert_header("x-lagran-cache-reason", "range-chunk-fill")
+                .insert_header("x-cache-reason", "range-chunk-fill")
                 .is_err()
         {
             return false;
         }
         Self::apply_security_headers(&mut response);
+        apply_http3_alt_svc(&mut response, native_plan.domain.http3_enabled);
         Self::apply_cors_and_custom(&mut response, &native_plan.domain.response_headers);
-        let _ = response.insert_header("x-powered-by", "lagran-edge");
         if session
             .write_response_header(Box::new(response), false)
             .await
@@ -3718,6 +3829,7 @@ impl DataPlaneProxy {
         for (name, value) in &entry.meta.headers {
             if name.eq_ignore_ascii_case(META_HEADER)
                 || name.eq_ignore_ascii_case(VALIDATOR_SOURCE_HEADER)
+                || is_legacy_diagnostic_header(name)
                 || name.eq_ignore_ascii_case("content-length")
                 || name.eq_ignore_ascii_case("content-range")
                 || name.eq_ignore_ascii_case("cache-status")
@@ -3745,17 +3857,17 @@ impl DataPlaneProxy {
             || response.insert_header("x-cache", "HIT").is_err()
             || response.insert_header("x-cache-status", "HIT").is_err()
             || response
-                .insert_header("x-lagran-cache-source", "l3+origin")
+                .insert_header("x-cache-source", "l3+origin")
                 .is_err()
             || response
-                .insert_header("x-lagran-cache-reason", "range-chunks")
+                .insert_header("x-cache-reason", "range-chunks")
                 .is_err()
         {
             return false;
         }
         Self::apply_security_headers(&mut response);
+        apply_http3_alt_svc(&mut response, native_plan.domain.http3_enabled);
         Self::apply_cors_and_custom(&mut response, &native_plan.domain.response_headers);
-        let _ = response.insert_header("x-powered-by", "lagran-edge");
         if entry.meta.stored_at > 0 {
             let now = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -3764,7 +3876,7 @@ impl DataPlaneProxy {
             let _ =
                 response.insert_header("age", now.saturating_sub(entry.meta.stored_at).to_string());
             let _ = response.insert_header(
-                "x-lagran-cache-ttl",
+                "x-cache-ttl",
                 entry.meta.fresh_until.saturating_sub(now).to_string(),
             );
         }
@@ -4269,6 +4381,7 @@ impl DataPlaneProxy {
         for (name, value) in &entry.headers {
             if name.eq_ignore_ascii_case(META_HEADER)
                 || name.eq_ignore_ascii_case(VALIDATOR_SOURCE_HEADER)
+                || is_legacy_diagnostic_header(name)
                 || name.eq_ignore_ascii_case("content-length")
                 || is_hop_by_hop(name)
             {
@@ -4294,15 +4407,12 @@ impl DataPlaneProxy {
             HeaderValue::from_str(&entry.age_secs().to_string())
                 .unwrap_or_else(|_| HeaderValue::from_static("0")),
         );
-        headers.insert(
-            HeaderName::from_static("x-powered-by"),
-            HeaderValue::from_static("lagran-edge"),
-        );
         if let Ok(value) = HeaderValue::from_str(&etag) {
             headers.insert(HeaderName::from_static("etag"), value);
         }
         apply_browser_ttl(&mut headers, policy_browser_ttl(&plan.policy));
         apply_security_headers(&mut headers);
+        apply_http3_alt_svc_map(&mut headers, plan.domain.http3_enabled);
         apply_cors_and_custom(&mut headers, &plan.domain.response_headers);
         headers.insert(
             HeaderName::from_static("content-length"),
@@ -4456,6 +4566,7 @@ impl DataPlaneProxy {
             .collect()
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn peer_for(
         &self,
         addr: SocketAddr,
@@ -4464,10 +4575,12 @@ impl DataPlaneProxy {
         connect_timeout_ms: u64,
         read_timeout_ms: u64,
         sni: Option<&str>,
+        http: OriginHttp,
     ) -> Result<Box<HttpPeer>> {
         // Pass a resolved address to avoid Pingora's panicking DNS path.
         let server_name = sni.filter(|s| !s.is_empty()).unwrap_or(host);
         let mut peer = HttpPeer::new(addr, tls, server_name.to_string());
+        apply_origin_http(&mut peer, http);
         peer.options.connection_timeout = Some(Duration::from_millis(connect_timeout_ms));
         peer.options.read_timeout = Some(Duration::from_millis(read_timeout_ms));
         Ok(Box::new(peer))
@@ -4484,12 +4597,12 @@ impl DataPlaneProxy {
         let mut body = BytesMut::new();
         while let Some(chunk) = session.read_request_body().await? {
             if body.len() + chunk.len() > MAX_PROXY_BODY {
-                session
-                    .respond_error_with_body(
-                        StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
-                        Bytes::from_static(b"request body too large"),
-                    )
-                    .await?;
+                write_plain_error(
+                    session,
+                    StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
+                    Bytes::from_static(b"request body too large"),
+                )
+                .await;
                 return Ok(true);
             }
             body.extend_from_slice(&chunk);
@@ -4503,9 +4616,8 @@ impl DataPlaneProxy {
             Ok(req) => req,
             Err(e) => {
                 tracing::warn!(error = %e, "build internal request failed");
-                session
-                    .respond_error_with_body(500, Bytes::from_static(b"internal request error"))
-                    .await?;
+                write_plain_error(session, 500, Bytes::from_static(b"internal request error"))
+                    .await;
                 return Ok(true);
             }
         };
@@ -4622,18 +4734,57 @@ async fn write_json<T: serde::Serialize>(session: &mut Session, status: u16, val
     write_plain(session, status, "application/json", Bytes::from(body)).await;
 }
 
+fn http3_alt_svc_value(site_enabled: bool) -> String {
+    if site_enabled {
+        crate::server::http3::alt_svc_value()
+            .unwrap_or_else(|| crate::server::http3::ALT_SVC_CLEAR.to_string())
+    } else {
+        crate::server::http3::ALT_SVC_CLEAR.to_string()
+    }
+}
+
+fn apply_http3_alt_svc(response: &mut ResponseHeader, site_enabled: bool) {
+    let _ = response.insert_header("alt-svc", http3_alt_svc_value(site_enabled));
+}
+
+fn apply_http3_alt_svc_map(headers: &mut HeaderMap, site_enabled: bool) {
+    if let Ok(value) = HeaderValue::from_str(&http3_alt_svc_value(site_enabled)) {
+        headers.insert(HeaderName::from_static("alt-svc"), value);
+    }
+}
+
+fn request_http3_enabled(session: &Session) -> bool {
+    let req = session.req_header();
+    let host = normalized_authority_host(
+        req.uri.authority().map(|authority| authority.as_str()),
+        req.headers
+            .get("host")
+            .and_then(|value| value.to_str().ok()),
+    );
+    crate::config::registry::http3_allowed(&host)
+}
+
 async fn write_plain(session: &mut Session, status: u16, content_type: &str, body: Bytes) {
     let Ok(mut response) = ResponseHeader::build(status, Some(body.len())) else {
         return;
     };
     let _ = response.insert_header("content-type", content_type);
     let _ = response.insert_header("content-length", body.len().to_string());
+    apply_http3_alt_svc(&mut response, request_http3_enabled(session));
     let _ = session
         .write_response_header(Box::new(response), body.is_empty())
         .await;
     if !body.is_empty() {
         let _ = session.write_response_body(Some(body), true).await;
     }
+}
+
+/// Plain-text error that also ends the HTTP/1.1 connection, as Pingora's
+/// `respond_error_with_body` does: after a 413 the rest of the request body
+/// is still unread, and keeping the connection would mean draining it all.
+async fn write_plain_error(session: &mut Session, status: u16, body: Bytes) {
+    session.set_keepalive(None);
+    write_plain(session, status, "text/plain; charset=utf-8", body).await;
 }
 
 fn percent_decode(input: &str) -> String {
@@ -4729,9 +4880,9 @@ async fn write_axum_response(
 ) {
     let is_h2 = session.downstream_session.is_http2();
     let (mut parts, body) = resp.into_parts();
-    if !parts.headers.contains_key("x-lagran-datapath") {
+    if !parts.headers.contains_key("x-cdn-datapath") {
         parts.headers.insert(
-            HeaderName::from_static("x-lagran-datapath"),
+            HeaderName::from_static("x-cdn-datapath"),
             HeaderValue::from_static("pingora"),
         );
     }
@@ -4739,9 +4890,7 @@ async fn write_axum_response(
         Ok(collected) => collected.to_bytes(),
         Err(e) => {
             tracing::warn!(error = %e, "collect engine response failed");
-            let _ = session
-                .respond_error_with_body(502, Bytes::from_static(b"engine response error"))
-                .await;
+            write_plain_error(session, 502, Bytes::from_static(b"engine response error")).await;
             return;
         }
     };
@@ -4833,6 +4982,7 @@ async fn write_axum_response(
     {
         return;
     }
+    apply_http3_alt_svc(&mut response, request_http3_enabled(session));
     let _ = session
         .write_response_header(Box::new(response), end_of_stream)
         .await;
@@ -5048,7 +5198,7 @@ fn range_is_small_bounded(headers: &HeaderMap) -> bool {
     end >= start && end - start < MAX_SLICE
 }
 
-/// Decide the `x-lagran-cache-source` value for a finished response.
+/// Decide the `x-cache-source` value for a finished response.
 ///
 /// A hit labelled without a source must say "unknown", not "l1". The previous
 /// fallback claimed a local memory hit even when the storage layer was never
@@ -5257,6 +5407,86 @@ fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
         .map(|v| v.to_ascii_lowercase().contains("upgrade"))
         .unwrap_or(false);
     upgrade && connection_upgrade
+}
+
+/// HTTP version settings of an origin peer.
+///
+/// The HTTP/2 options go on every peer, HTTP/1.1 ones included:
+/// `max_h2_streams` is part of Pingora's connection-reuse hash, so equal
+/// values keep HTTP/1.1 and HTTP/2 attempts to one origin on the same pools
+/// and on Pingora's own per-origin HTTP/1.1 preference.
+fn apply_origin_http(peer: &mut HttpPeer, http: OriginHttp) {
+    peer.options.max_h2_streams = ORIGIN_H2_MAX_STREAMS;
+    peer.options.h2_connection_window_size = Some(ORIGIN_H2_CONNECTION_WINDOW);
+    match http {
+        // ALPN `h2, http/1.1`. Pingora runs HTTP/1.1 when the origin picks
+        // it, and after `HTTP_1_1_REQUIRED` or an invalid HTTP/2 response it
+        // offers only http/1.1 to that origin for the rest of the process.
+        OriginHttp::Alpn => peer.options.set_http_version(2, 1),
+        // Cleartext has nothing to negotiate: HTTP/2 with prior knowledge.
+        OriginHttp::H2c => peer.options.set_http_version(2, 2),
+        OriginHttp::Http1 => {}
+    }
+}
+
+/// An origin HTTP/2 failure that calls for a resend or for HTTP/1.1.
+fn origin_h2_failure(
+    e: &pingora::Error,
+    http: OriginHttp,
+    client_reused: bool,
+) -> Option<H2Failure> {
+    if !http.is_http2() {
+        return None;
+    }
+    let fresh_h2c = http == OriginHttp::H2c && !client_reused;
+    let classified = origin_protocol::find_h2_error(e.root_cause())
+        .and_then(origin_protocol::classify_h2)
+        .or(match e.etype() {
+            pingora::ErrorType::H2Downgrade => Some(H2Failure::Http11Required),
+            pingora::ErrorType::InvalidH2 => Some(H2Failure::Malformed),
+            // Pingora marks REFUSED_STREAM and GOAWAY(NO_ERROR) before the
+            // response as retryable; without the h2 error, assume the weaker.
+            pingora::ErrorType::H2Error if e.retry == pingora::RetryType::Decided(true) => {
+                Some(H2Failure::Draining)
+            }
+            _ => None,
+        });
+    match classified {
+        // A fresh h2c connection that drew bytes our HTTP/2 stack rejects
+        // never reached an HTTP/2 server (an HTTP/1.1 server answers the
+        // preface with a 400), so nothing was processed, whatever the method.
+        Some(H2Failure::Malformed) if fresh_h2c => Some(H2Failure::Http11Required),
+        Some(failure) => Some(failure),
+        // h2c has no negotiation: a fresh prior-knowledge connection that
+        // breaks before a response means the origin does not speak it.
+        None if fresh_h2c
+            && matches!(
+                e.etype(),
+                pingora::ErrorType::H2Error
+                    | pingora::ErrorType::ReadError
+                    | pingora::ErrorType::ConnectionClosed
+            ) =>
+        {
+            Some(H2Failure::Malformed)
+        }
+        None => None,
+    }
+}
+
+fn requires_http1_upgrade(headers: &HeaderMap) -> bool {
+    let has_upgrade_protocol = headers
+        .get(header::UPGRADE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| !value.trim().is_empty());
+    let connection_requests_upgrade = headers
+        .get(header::CONNECTION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+        });
+    has_upgrade_protocol && connection_requests_upgrade
 }
 
 fn is_hop_by_hop(name: &str) -> bool {
@@ -5503,13 +5733,134 @@ pub fn run(config: EdgeConfig, certs: Arc<CertStore>, state: Arc<AppState>) -> a
 #[cfg(test)]
 mod tests {
     use super::{
-        cached_response_policy, compressed_variant_key, effective_connect_timeout_ms, fill_window,
-        gzip_engine_body, head_content_length_for_protocol, is_websocket_upgrade,
-        parse_multi_ranges, parse_single_range, range_fill_is_candidate, tls_version_meets_min,
-        upstream_host, valid_release_tag, vary_on_accept_encoding, weaken_etag, DataPlaneProxy,
-        ResponsePolicySlot,
+        apply_origin_http, cached_response_policy, compressed_variant_key,
+        effective_connect_timeout_ms, fill_window, gzip_engine_body,
+        head_content_length_for_protocol, is_websocket_upgrade, origin_h2_failure,
+        parse_multi_ranges, parse_single_range, range_fill_is_candidate, requires_http1_upgrade,
+        tls_version_meets_min, upstream_host, valid_release_tag, vary_on_accept_encoding,
+        weaken_etag, DataPlaneProxy, ResponsePolicySlot, ORIGIN_H2_MAX_STREAMS,
     };
+    use crate::origin::protocol::{H2Failure, OriginHttp};
     use http::{HeaderMap, HeaderValue};
+    use pingora::upstreams::peer::{HttpPeer, Peer};
+
+    fn origin_peer(tls: bool, http: OriginHttp) -> HttpPeer {
+        let mut peer = HttpPeer::new(
+            "192.0.2.10:443".parse::<std::net::SocketAddr>().unwrap(),
+            tls,
+            "origin.example".to_string(),
+        );
+        apply_origin_http(&mut peer, http);
+        peer
+    }
+
+    #[test]
+    fn origin_peers_prefer_http2_and_keep_one_pool_per_origin() {
+        let alpn = origin_peer(true, OriginHttp::Alpn);
+        let alpn_versions = alpn.get_alpn().unwrap();
+        assert_eq!(
+            (
+                alpn_versions.get_max_http_version(),
+                alpn_versions.get_min_http_version()
+            ),
+            (2, 1),
+            "https offers h2 with http/1.1 as the fallback"
+        );
+        let h1 = origin_peer(true, OriginHttp::Http1);
+        assert_eq!(h1.get_alpn().unwrap().get_max_http_version(), 1);
+        // HTTP/1.1 and HTTP/2 attempts share Pingora's pools for the origin.
+        assert_eq!(alpn.reuse_hash(), h1.reuse_hash());
+        assert_eq!(alpn.options.max_h2_streams, ORIGIN_H2_MAX_STREAMS);
+        assert_eq!(h1.options.max_h2_streams, ORIGIN_H2_MAX_STREAMS);
+
+        let h2c = origin_peer(false, OriginHttp::H2c);
+        let h2c_versions = h2c.get_alpn().unwrap();
+        assert_eq!(
+            (
+                h2c_versions.get_max_http_version(),
+                h2c_versions.get_min_http_version()
+            ),
+            (2, 2),
+            "cleartext HTTP/2 is prior knowledge"
+        );
+        assert_eq!(
+            h2c.reuse_hash(),
+            origin_peer(false, OriginHttp::Http1).reuse_hash()
+        );
+    }
+
+    #[test]
+    fn websocket_and_other_upgrades_stay_on_http1() {
+        let mut websocket = HeaderMap::new();
+        websocket.insert("upgrade", HeaderValue::from_static("websocket"));
+        websocket.insert(
+            "connection",
+            HeaderValue::from_static("keep-alive, Upgrade"),
+        );
+        assert!(requires_http1_upgrade(&websocket));
+        let mut connection_only = HeaderMap::new();
+        connection_only.insert("connection", HeaderValue::from_static("Upgrade"));
+        assert!(!requires_http1_upgrade(&connection_only));
+        let mut token_substring = HeaderMap::new();
+        token_substring.insert("upgrade", HeaderValue::from_static("websocket"));
+        token_substring.insert("connection", HeaderValue::from_static("x-upgraded"));
+        assert!(!requires_http1_upgrade(&token_substring));
+    }
+
+    #[test]
+    fn origin_http2_failures_are_classified_for_fallback() {
+        use pingora::ErrorType;
+
+        let error = |etype: ErrorType| pingora::Error::new(etype);
+        assert_eq!(
+            origin_h2_failure(&error(ErrorType::H2Downgrade), OriginHttp::Alpn, true),
+            Some(H2Failure::Http11Required)
+        );
+        assert_eq!(
+            origin_h2_failure(&error(ErrorType::InvalidH2), OriginHttp::Alpn, false),
+            Some(H2Failure::Malformed)
+        );
+        let mut refused = error(ErrorType::H2Error);
+        refused.set_retry(true);
+        assert_eq!(
+            origin_h2_failure(&refused, OriginHttp::Alpn, true),
+            Some(H2Failure::Draining)
+        );
+        // A plain stream error over negotiated h2 is the origin's answer.
+        assert_eq!(
+            origin_h2_failure(&error(ErrorType::H2Error), OriginHttp::Alpn, false),
+            None
+        );
+        // h2c: a fresh prior-knowledge connection answered with non-HTTP/2
+        // bytes reached no HTTP/2 server; any method can go again.
+        assert_eq!(
+            origin_h2_failure(&error(ErrorType::InvalidH2), OriginHttp::H2c, false),
+            Some(H2Failure::Http11Required)
+        );
+        assert_eq!(
+            origin_h2_failure(&error(ErrorType::InvalidH2), OriginHttp::H2c, true),
+            Some(H2Failure::Malformed)
+        );
+        // A fresh one that just breaks means no h2c, but the request may
+        // have been read.
+        assert_eq!(
+            origin_h2_failure(&error(ErrorType::ReadError), OriginHttp::H2c, false),
+            Some(H2Failure::Malformed)
+        );
+        assert_eq!(
+            origin_h2_failure(&error(ErrorType::ReadError), OriginHttp::H2c, true),
+            None
+        );
+        assert_eq!(
+            origin_h2_failure(&error(ErrorType::ConnectRefused), OriginHttp::H2c, false),
+            None
+        );
+        // HTTP/1.1 attempts never take the HTTP/2 recovery path.
+        assert_eq!(
+            origin_h2_failure(&error(ErrorType::InvalidH2), OriginHttp::Http1, false),
+            None
+        );
+    }
 
     #[test]
     fn websocket_upgrade_requires_both_headers() {

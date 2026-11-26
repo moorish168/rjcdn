@@ -1,5 +1,5 @@
 //! Live cache diagnostics: make a request through the edge and return the
-//! X-Lagran-Cache-Reason / cache status headers with a human explanation.
+//! X-Cache-Reason / cache status headers with a human explanation.
 
 use crate::middleware::authz::Actor;
 use crate::repository;
@@ -204,11 +204,15 @@ struct EdgeDiagReply {
     body_preview: String,
 }
 
+/// Name edges used for `x-cache-reason` before the diagnostic headers were
+/// renamed; read as a fallback while a fleet is mid-upgrade.
+pub(crate) const LEGACY_CACHE_REASON_HEADER: &str = "x-lagran-cache-reason";
+
 fn selected_header_names() -> [&'static str; 9] {
     [
         "x-cache",
         "x-cache-status",
-        "x-lagran-cache-reason",
+        "x-cache-reason",
         "age",
         "etag",
         "cache-control",
@@ -244,7 +248,11 @@ fn build_response(
             value
         }
     };
-    let mut cache_reason = get("x-lagran-cache-reason");
+    let mut cache_reason = get("x-cache-reason");
+    if cache_reason.is_empty() {
+        // Edges not yet upgraded still report the pre-rename header.
+        cache_reason = get(LEGACY_CACHE_REASON_HEADER);
+    }
     if cache_reason.is_empty() && (status == 301 || status == 308) {
         cache_reason = "https-redirect".into();
     }
@@ -325,7 +333,34 @@ fn advice_for(reason: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::is_stream_path;
+    use super::{build_response, is_stream_path, LEGACY_CACHE_REASON_HEADER};
+
+    fn reason(headers: &[(&str, &str)]) -> String {
+        let headers = headers
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        build_response("https://a.test/".into(), 200, headers, String::new()).cache_reason
+    }
+
+    #[test]
+    fn cache_reason_reads_new_name_then_pre_rename_name() {
+        let miss = ("x-cache-status", "BYPASS");
+        assert_eq!(reason(&[miss, ("x-cache-reason", "cookie")]), "cookie");
+        // An edge that has not been upgraded yet.
+        assert_eq!(
+            reason(&[miss, (LEGACY_CACHE_REASON_HEADER, "cookie")]),
+            "cookie"
+        );
+        assert_eq!(
+            reason(&[
+                miss,
+                ("X-Cache-Reason", "no-store"),
+                (LEGACY_CACHE_REASON_HEADER, "cookie"),
+            ]),
+            "no-store"
+        );
+    }
 
     #[test]
     fn detects_download_and_large_file_paths() {

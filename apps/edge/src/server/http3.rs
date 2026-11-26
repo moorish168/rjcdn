@@ -28,6 +28,7 @@ use quinn::crypto::rustls::QuicServerConfig;
 use rustls::ServerConfig;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
@@ -84,12 +85,16 @@ pub fn bridge_client(peer: Option<&SocketAddr>, headers: &http::HeaderMap) -> Op
 }
 
 static ADVERTISED_PORT: OnceLock<u16> = OnceLock::new();
+static LISTENER_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// `Alt-Svc` value for responses, only when the QUIC listener is running.
 pub fn alt_svc_value() -> Option<String> {
+    if !LISTENER_ACTIVE.load(Ordering::Acquire) {
+        return None;
+    }
     ADVERTISED_PORT
         .get()
-        .map(|port| format!("h3=\":{port}\"; ma=86400"))
+        .map(|port| format!("h3=\":{port}\"; ma=300"))
 }
 
 /// Header value that tells clients to drop cached alternatives (RFC 7838).
@@ -156,11 +161,19 @@ pub fn spawn(
     let endpoint = quinn::Endpoint::server(server_config, listen)
         .with_context(|| format!("bind H3 UDP {listen}"))?;
     let _ = ADVERTISED_PORT.set(listen.port());
+    LISTENER_ACTIVE.store(true, Ordering::Release);
     info!(listen = %listen, upstream = %upstream, "HTTP/3 QUIC listener started");
 
     let http: UpstreamClient = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
 
     tokio::spawn(async move {
+        struct ActiveListenerGuard;
+        impl Drop for ActiveListenerGuard {
+            fn drop(&mut self) {
+                LISTENER_ACTIVE.store(false, Ordering::Release);
+            }
+        }
+        let _active_guard = ActiveListenerGuard;
         loop {
             let incoming = endpoint.accept().await;
             let Some(connecting) = incoming else {
@@ -274,8 +287,10 @@ async fn handle_request(
     let (_, domain) = domains.lookup(&host).await;
     // Site-level H3 off: do not send an HTTP response body (browsers treat that
     // as a finished page and will not protocol-downgrade). Reset the stream with
-    // H3_VERSION_FALLBACK so the client retries over TCP (H1/H2). Pair with
-    // `Alt-Svc: clear` on TCP responses so cached advertisements are dropped.
+    // H3_VERSION_FALLBACK; RFC 9114 tells the peer to retry over HTTP/1.1. The
+    // edge's TCP listener also offers h2, but the client controls whether it
+    // reconnects and which TCP protocol it negotiates. TCP responses clear the
+    // cached Alt-Svc advertisement.
     if domain.as_ref().is_some_and(|d| !d.http3_enabled) {
         recv.stop_sending(h3::error::Code::H3_VERSION_FALLBACK);
         send.stop_stream(h3::error::Code::H3_VERSION_FALLBACK);

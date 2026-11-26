@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Cache diagnostics: X-Lagran-Cache-Reason, tag purge, range cache.
+# Cache diagnostics: X-Cache-Reason, tag purge, range cache.
 set -uo pipefail
 source "$HOME/.cargo/env" 2>/dev/null || true
 
@@ -114,7 +114,7 @@ get "/cached" >/dev/null
 check "miss is MISS" "$(hdr x-cache)" "MISS"
 get "/cached" >/dev/null
 check "second is HIT" "$(hdr x-cache)" "HIT"
-check "normal GET uses Pingora" "$(hdr x-lagran-datapath)" "pingora"
+check "normal GET uses Pingora" "$(hdr x-cdn-datapath)" "pingora"
 
 # Browser reload (max-age=0) and hard reload (no-cache, Pragma) are served
 # from the shared cache like any other request.
@@ -122,10 +122,10 @@ get "/assets/app.css" >/dev/null
 CODE=$(get "/assets/app.css" -H 'Cache-Control: max-age=0')
 check "reload max-age=0 returns 200" "$CODE" "200"
 check "reload max-age=0 is a HIT" "$(hdr x-cache)" "HIT"
-check "reload GET uses Pingora" "$(hdr x-lagran-datapath)" "pingora"
+check "reload GET uses Pingora" "$(hdr x-cdn-datapath)" "pingora"
 get "/assets/app.css" -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' >/dev/null
 check "hard reload no-cache is a HIT" "$(hdr x-cache)" "HIT"
-check "hard reload GET uses Pingora" "$(hdr x-lagran-datapath)" "pingora"
+check "hard reload GET uses Pingora" "$(hdr x-cdn-datapath)" "pingora"
 get "/assets/app.css" -H 'Cache-Control: no-store' >/dev/null
 check "client no-store still bypasses" "$(hdr x-cache)" "BYPASS"
 
@@ -164,25 +164,25 @@ check "stream diagnose does not fail" "$(printf '%s' "$STREAM_DIAG" | jq -r '.st
 
 echo "== request reasons =="
 get "/cached" -H 'Cookie: session=1' >/dev/null
-check "cookie reason" "$(hdr x-lagran-cache-reason)" "cookie"
+check "cookie reason" "$(hdr x-cache-reason)" "cookie"
 get "/cached" -H 'Authorization: Bearer x' >/dev/null
-check "authorization reason" "$(hdr x-lagran-cache-reason)" "authorization"
+check "authorization reason" "$(hdr x-cache-reason)" "authorization"
 get "/cached" -H 'Cache-Control: no-store' >/dev/null
-check "request no-store reason" "$(hdr x-lagran-cache-reason)" "no-store"
+check "request no-store reason" "$(hdr x-cache-reason)" "no-store"
 get "/api/x" >/dev/null
-check "rule bypass reason" "$(hdr x-lagran-cache-reason)" "rule-bypass"
+check "rule bypass reason" "$(hdr x-cache-reason)" "rule-bypass"
 get "/html" >/dev/null
-check "content-type bypass reason" "$(hdr x-lagran-cache-reason)" "content-type-bypass"
+check "content-type bypass reason" "$(hdr x-cache-reason)" "content-type-bypass"
 
 echo "== response reasons =="
 get "/nostore" >/dev/null
-check "origin no-store reason" "$(hdr x-lagran-cache-reason)" "no-store"
+check "origin no-store reason" "$(hdr x-cache-reason)" "no-store"
 get "/private" >/dev/null
-check "origin private reason" "$(hdr x-lagran-cache-reason)" "private"
+check "origin private reason" "$(hdr x-cache-reason)" "private"
 get "/nocache" >/dev/null
-check "origin no-cache reason" "$(hdr x-lagran-cache-reason)" "no-cache"
+check "origin no-cache reason" "$(hdr x-cache-reason)" "no-cache"
 get "/vary-ua" >/dev/null
-check "vary user-agent reason" "$(hdr x-lagran-cache-reason)" "vary:user-agent"
+check "vary user-agent reason" "$(hdr x-cache-reason)" "vary:user-agent"
 
 echo "== tag purge =="
 get "/tagged" >/dev/null
@@ -205,8 +205,8 @@ CODE=$(get "/range-cached" -H 'Range: bytes=0-3')
 check "range status 206" "$CODE" "206"
 contains "range content-range" "$(hdr content-range)" "bytes 0-3/1024"
 check "range served from cache" "$(hdr x-cache)" "HIT"
-check "range source is L1" "$(hdr x-lagran-cache-source)" "l1"
-check "range cache uses Pingora" "$(hdr x-lagran-datapath)" "pingora"
+check "range source is L1" "$(hdr x-cache-source)" "l1"
+check "range cache uses Pingora" "$(hdr x-cdn-datapath)" "pingora"
 check "range body" "$(cat "$LOG_DIR/b")" "0123"
 
 echo "== range miss streams from origin =="
@@ -214,7 +214,7 @@ CODE=$(get "/range-stream" -H 'Range: bytes=2-5')
 check "range miss status 206" "$CODE" "206"
 check "range miss body" "$(cat "$LOG_DIR/b")" "2345"
 check "range miss is BYPASS" "$(hdr x-cache)" "BYPASS"
-check "range miss reason" "$(hdr x-lagran-cache-reason)" "range-bypass"
+check "range miss reason" "$(hdr x-cache-reason)" "range-bypass"
 contains "range miss content-range" "$(hdr content-range)" "bytes 2-5/10"
 
 echo "== open-ended range streams through Pingora =="
@@ -222,7 +222,7 @@ CODE=$(get "/range-stream" -H 'Range: bytes=0-')
 check "open range status 206" "$CODE" "206"
 check "open range body" "$(cat "$LOG_DIR/b")" "0123456789"
 check "open range is BYPASS" "$(hdr x-cache)" "BYPASS"
-check "open range reason" "$(hdr x-lagran-cache-reason)" "range-bypass"
+check "open range reason" "$(hdr x-cache-reason)" "range-bypass"
 
 echo "== edge prefetch =="
 PREFETCH=$(curl -s -X POST "http://127.0.0.1:$EDGE_PORT/__lagran/prefetch" \

@@ -128,7 +128,7 @@ done
 check "ssl_enabled redirects HTTP" "$REDIRECTED" "1"
 check "redirect status is 301" "$CODE" "301"
 check "redirect location uses HTTPS port" "$(hdr location)" "https://$DOMAIN:$HTTPS_REDIRECT_PORT/page?x=1"
-check "redirect marker header" "$(hdr x-lagran-redirect)" "https"
+check "redirect marker header" "$(hdr x-cdn-redirect)" "https"
 
 CODE=$(get "/submit" -X POST -d 'a=1')
 check "POST uses 308 redirect" "$CODE" "308"

@@ -59,7 +59,7 @@ const visibleTabs = computed(() =>
     <NuxtPage />
 
 
-    <div class="alert alert-warning mt-16">
+    <div v-if="section !== 'advanced'" class="alert alert-warning mt-16">
       <AppIcon name="shield" :size="16" class="icon" />
       <span>如遇访问异常，请联系系统管理员。</span>
     </div>

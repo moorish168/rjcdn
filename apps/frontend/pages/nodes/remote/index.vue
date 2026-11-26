@@ -95,7 +95,7 @@
                     <span v-else class="text-muted">未配置</span>
                   </td>
                   <td>{{ n.grant_name || '—' }}</td>
-                  <td class="mono">{{ n.version || '—' }}</td>
+                  <td class="mono">{{ displayVersion(n.version) || '—' }}</td>
                   <td>
                     <button
                       v-if="n.last_op"
@@ -159,7 +159,7 @@
                 <tr v-for="o in ops" :key="o.id" style="cursor: pointer" @click="openLog(o.id)">
                   <td class="mono" style="font-size: 12px">{{ formatTime(o.created_at) }}</td>
                   <td>{{ o.node_name }}</td>
-                  <td>{{ actionLabel(o.action) }}{{ o.params?.version ? ` ${o.params.version}` : '' }}</td>
+                  <td>{{ actionLabel(o.action) }}{{ o.params?.version ? ` ${displayVersion(o.params.version)}` : '' }}</td>
                   <td><StatusTag :tone="opTone(o.status)">{{ opStatusLabel(o.status) }}</StatusTag></td>
                   <td class="text-muted" style="max-width: 360px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis">
                     {{ o.error || '—' }}
@@ -278,7 +278,7 @@
       <div class="form-col">
         <div class="field">
           <label class="field-label">版本</label>
-          <input v-model="versionInput" class="input mono" placeholder="留空 = 最新版本，例如 v0.1.12" />
+          <input v-model="versionInput" class="input mono" placeholder="留空 = 最新版本，例如 1.0.6" />
           <span class="field-hint">批量升级时所有节点使用同一个版本。</span>
         </div>
       </div>
@@ -307,6 +307,7 @@
 
 <script setup lang="ts">
 import { friendlyErrorMessage } from '~/utils/friendlyError'
+import { displayVersion } from '~/utils/version'
 
 const api = useApi()
 const auth = useAuthStore()

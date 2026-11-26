@@ -357,8 +357,8 @@ fn now_epoch_secs() -> u64 {
 
 fn add_cache_headers(meta: &mut CacheMeta, source: CacheSource, lookup_ms: u128) {
     let headers = meta.response_header_mut();
-    let _ = headers.insert_header("x-lagran-cache-source", source.as_str());
-    let _ = headers.insert_header("x-lagran-cache-lookup-ms", lookup_ms.to_string());
+    let _ = headers.insert_header("x-cache-source", source.as_str());
+    let _ = headers.insert_header("x-cache-lookup-ms", lookup_ms.to_string());
 }
 
 fn headers_vec(headers: &pingora::http::ResponseHeader) -> Vec<(String, String)> {

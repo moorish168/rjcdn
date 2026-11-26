@@ -688,7 +688,7 @@ HTTP/3 / WebP（边缘）：
 | `EDGE_COMPRESSION` | 全局 GZIP 总开关；与站点 `gzip_enabled` 取 AND |
 | Cargo feature `image-webp` | JPEG/PNG→WebP，默认编译进边缘（发布包已包含；`--no-default-features` 可去掉）。`lagran-edge version` 输出 `features: image-webp` 即可转码；运行时仍受站点 `image_webp_enabled` 控制 |
 
-新站点的 HTTP/3 默认关闭。开启前，防火墙需放行 UDP/443（或你配置的 H3 端口）；站点高级设置可开关 WebSocket / HTTP2 / HTTP3 / GZIP / WebP。
+HTTP/3 暂未开放：站点高级设置只提供 WebSocket / HTTP2 / GZIP / WebP 开关，控制面下发的配置一律关闭 HTTP/3，边缘不会通告 `Alt-Svc: h3`。重新开放后，开启前防火墙需放行 UDP/443（或你配置的 H3 端口）。
 
 调试建议：
 

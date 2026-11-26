@@ -297,7 +297,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
     }
     let mut response = proxy_handler_inner(State(state), req).await;
     response.headers_mut().insert(
-        HeaderName::from_static("x-lagran-datapath"),
+        HeaderName::from_static("x-cdn-datapath"),
         HeaderValue::from_static("legacy"),
     );
     response
@@ -1270,17 +1270,15 @@ async fn bypass_to_origin_streaming(
             strip_response_headers(&mut out_headers);
             out_headers.remove(HeaderName::from_static("x-lagran-pingora-meta"));
             out_headers.remove(HeaderName::from_static(VALIDATOR_SOURCE_HEADER));
-            out_headers.remove(HeaderName::from_static("x-lagran-cache-reason"));
+            out_headers.remove(HeaderName::from_static("x-cache-reason"));
             if content_length > 0 {
                 if let Ok(value) = HeaderValue::from_str(&content_length.to_string()) {
                     out_headers.insert(header::CONTENT_LENGTH, value);
                 }
             }
             cache_status_headers(&mut out_headers, label.as_str());
-            out_headers.insert(
-                HeaderName::from_static("x-powered-by"),
-                HeaderValue::from_static("lagran-edge"),
-            );
+            // No product name on visitor responses (the origin's never reached them).
+            out_headers.remove(HeaderName::from_static("x-powered-by"));
             apply_security_headers(&mut out_headers);
             apply_cors_and_custom(&mut out_headers, &eff.response_headers);
 
@@ -2820,13 +2818,11 @@ fn entry_to_response(
     );
     if let Some(ttl) = entry.ttl_secs() {
         if let Ok(v) = HeaderValue::from_str(&ttl.to_string()) {
-            headers.insert(HeaderName::from_static("x-lagran-cache-ttl"), v);
+            headers.insert(HeaderName::from_static("x-cache-ttl"), v);
         }
     }
-    headers.insert(
-        HeaderName::from_static("x-powered-by"),
-        HeaderValue::from_static("lagran-edge"),
-    );
+    // No product name on visitor responses (the origin's never reached them).
+    headers.remove(HeaderName::from_static("x-powered-by"));
     if !headers.contains_key(header::DATE) {
         if let Ok(date) =
             HeaderValue::from_str(&httpdate::fmt_http_date(std::time::SystemTime::now()))
@@ -2858,10 +2854,8 @@ fn origin_response(
     strip_response_headers(&mut headers);
     headers.remove(HeaderName::from_static("x-lagran-pingora-meta"));
     cache_status_headers(&mut headers, cache_status);
-    headers.insert(
-        HeaderName::from_static("x-powered-by"),
-        HeaderValue::from_static("lagran-edge"),
-    );
+    // No product name on visitor responses (the origin's never reached them).
+    headers.remove(HeaderName::from_static("x-powered-by"));
     if !headers.contains_key(header::ETAG) {
         if let Ok(v) = HeaderValue::from_str(etag) {
             headers.insert(header::ETAG, v);
@@ -2882,7 +2876,7 @@ fn set_cache_reason(response: &mut Response, reason: Option<&'static str>) {
         if let Ok(value) = HeaderValue::from_str(reason) {
             response
                 .headers_mut()
-                .insert(HeaderName::from_static("x-lagran-cache-reason"), value);
+                .insert(HeaderName::from_static("x-cache-reason"), value);
         }
     }
 }
@@ -2924,7 +2918,7 @@ fn not_modified_response(etag: &str, entry: &CacheEntry) -> Response {
     );
     if let Some(ttl) = entry.ttl_secs() {
         if let Ok(v) = HeaderValue::from_str(&ttl.to_string()) {
-            headers.insert(HeaderName::from_static("x-lagran-cache-ttl"), v);
+            headers.insert(HeaderName::from_static("x-cache-ttl"), v);
         }
     }
     cache_status_headers(&mut headers, CacheStatus::Revalidated.as_str());
@@ -2972,7 +2966,7 @@ pub(crate) fn https_redirect_response(
     }
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     headers.insert(
-        HeaderName::from_static("x-lagran-redirect"),
+        HeaderName::from_static("x-cdn-redirect"),
         HeaderValue::from_static("https"),
     );
     response

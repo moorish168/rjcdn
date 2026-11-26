@@ -446,7 +446,7 @@
               </div>
               <div class="status-meta">
                 <span>{{ form.public_ip || '未填公网 IP' }}</span>
-                <span v-if="liveNode?.version">版本 {{ liveNode.version }}</span>
+                <span v-if="liveNode?.version">版本 {{ displayVersion(liveNode.version) }}</span>
                 <span v-if="liveNode?.last_heartbeat">最后心跳 {{ fromNow(liveNode.last_heartbeat) }}</span>
                 <span v-else>尚未收到心跳</span>
               </div>
@@ -578,6 +578,7 @@ import {
   type EdgeWorkload,
 } from '~/utils/edgeSizing'
 import { copyText } from '~/utils/clipboard'
+import { displayVersion } from '~/utils/version'
 import { friendlyErrorMessage } from '~/utils/friendlyError'
 import type { GeoRegionDto } from '~/composables/useDnsConsole'
 import { resolveDnsLineId } from '~/composables/ensureDnsLine'

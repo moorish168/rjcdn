@@ -1133,15 +1133,15 @@ curl --resolve cdn.example.com:443:<普通EdgeIP> -k \
 
 ```text
 x-cache: MISS
-x-lagran-cache-source: origin
-x-lagran-cache-reason: range-chunk-fill
+x-cache-source: origin
+x-cache-reason: range-chunk-fill
 ```
 
 第二次预期：
 
 ```text
 x-cache: HIT
-x-lagran-cache-source: l3
+x-cache-source: l3
 ```
 
 ### 7.2 Shield 本地缓存

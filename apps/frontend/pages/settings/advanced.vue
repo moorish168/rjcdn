@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { displayVersion } from '~/utils/version'
 const settings = inject('settingsConsole') as ReturnType<typeof useSettingsConsole>
 const {
   saveBrandSettings,
@@ -9,7 +10,6 @@ const {
   brandSaving,
   controlVersion,
   updateInfo,
-  releaseLink,
   updateChecking,
   updateBusy,
   updateMessage,
@@ -131,11 +131,13 @@ watchEffect(() => {
         <div class="update-grid">
           <div class="update-metric">
             <div class="info-label">当前版本</div>
-            <div class="info-value mono">{{ updateInfo?.current_version || controlVersion || '—' }}</div>
+            <div class="info-value mono">
+              {{ displayVersion(updateInfo?.current_version || controlVersion) || '—' }}
+            </div>
           </div>
           <div class="update-metric">
             <div class="info-label">最新版本</div>
-            <div class="info-value mono">{{ updateInfo?.latest_version || '—' }}</div>
+            <div class="info-value mono">{{ displayVersion(updateInfo?.latest_version) || '—' }}</div>
           </div>
           <div class="update-metric">
             <div class="info-label">更新组件</div>
@@ -146,7 +148,7 @@ watchEffect(() => {
         <div v-if="updateInfo?.update_available" class="update-banner">
           <AppIcon name="upload" :size="16" />
           <span>
-            检测到新版本 <b>{{ updateInfo.latest_version }}</b>，更新过程中控制面会短暂重启。
+            检测到新版本 <b>{{ displayVersion(updateInfo.latest_version) }}</b>，更新过程中控制面会短暂重启。
           </span>
         </div>
         <div v-else-if="updateInfo?.error" class="field-hint text-danger mt-12">
@@ -173,15 +175,6 @@ watchEffect(() => {
             <AppIcon name="upload" :size="15" />
             {{ updateBusy ? '更新中…' : '立即更新' }}
           </button>
-          <a
-            v-if="releaseLink"
-            class="btn btn-default btn-sm"
-            :href="releaseLink"
-            target="_blank"
-            rel="noopener"
-          >
-            查看发布说明
-          </a>
         </div>
         <p v-if="updateInfo && !updateInfo.updater_available" class="field-hint text-warning mt-12">
           当前安装未配置 root 更新助手，请重新执行 <code>install.sh control</code>。

@@ -45,7 +45,7 @@
 7. 决定是否走缓存：仅 GET/HEAD，且无 Authorization、客户端未要求 no-store；Cookie 默认绕过，
    规则显式 `ignore_cookie` 时放行；`Vary: Cookie` 仍拒绝缓存，因为 Cookie 不在 cache key 中。Range GET 在完整对象已缓存时切片返回；
    未命中时透传 Range，避免视频等大文件整包回源。
-   所有绕过/未存储响应带 `X-Lagran-Cache-Reason`（cookie / authorization / no-store / no-cache /
+   所有绕过/未存储响应带 `X-Cache-Reason`（cookie / authorization / no-store / no-cache /
    vary:user-agent / rule-bypass / content-type-bypass / set-cookie 等）。
 8. 命中：`HIT` / 条件请求 `304`；过期但在 SWR 窗口：先回 `STALE` 再后台单飞刷新
 9. 未命中：single-flight 合并并发回源（多源站池：按优先级分组、同组按权重加权轮询；
@@ -57,8 +57,8 @@
 12. Range：小段 Range 命中完整对象时切片；开放/大范围 Range 由 Pingora 流式透传，避免视频整包下载；
     多段 Range 透传源站
 
-响应统一带 `X-Cache` / `X-Cache-Status` / `X-Lagran-Cache-Reason`（仅未命中缓存时）/ `Age` /
-`X-Lagran-Cache-TTL`（剩余新鲜寿命，区别于已存活时间 `Age`）/ `ETag`
+响应统一带 `X-Cache` / `X-Cache-Status` / `X-Cache-Reason`（仅未命中缓存时）/ `Age` /
+`X-Cache-TTL`（剩余新鲜寿命，区别于已存活时间 `Age`）/ `ETag`
 （源站 ETag 优先，否则按内容计算）。
 
 ## 数据模型（PostgreSQL）
@@ -115,6 +115,15 @@ Internet
   单次超时和一次重试；DNS → Control 的 schedule 客户端使用持久 HTTP/1.1 连接池。
 - BYPASS、POST/PUT 等动态请求和 WebSocket 直接走 `upstream_peer`，请求/响应 body
   流式转发；开放/大范围 Range GET 由 Pingora 直接流式回源，小段命中完整对象时由旧引擎切片返回 206。
+- 回源协议 HTTP/2 优先、HTTP/1.1 兜底，Pingora 回源与旧引擎/分片/健康探测共用
+  `origin::protocol` 的源站状态：HTTPS 源站以 ALPN 提供 `h2, http/1.1`，由源站选择；
+  HTTP 源站无法协商，后台探测（发送 HTTP/2 连接前言、等待 SETTINGS）确认支持 h2c
+  后才用明文 HTTP/2，确认前直接走 HTTP/1.1，探测不阻塞请求。HTTP/2 协议级失败
+  （`HTTP_1_1_REQUIRED`、源站发来非法帧、握手失败）使该源站 30 分钟内改用 HTTP/1.1；
+  当次请求在客户端尚未收到响应头、请求体可重放时同地址重发——非幂等请求只在能确认源站
+  未处理时重发。`REFUSED_STREAM`/`GOAWAY` 未处理的流同样重发。WebSocket 等 HTTP/1
+  Upgrade 始终走 HTTP/1.1；HTTP/2 下 `Host` 以 `:authority` 发送。每条源站 HTTP/2
+  连接最多 8 个并发流。
 - 配置 `shield_url` 时，边缘把 Shield 作为优先级 -1 的回源目标，仍发送公开域名 Host；
   Shield 失败后按普通源站池顺序回退。Shield 节点自身设置
   `EDGE_SHIELD_DISABLED=true`，忽略域名上的 `shield_url`，避免 miss 自环。

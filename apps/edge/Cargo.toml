@@ -54,6 +54,9 @@ anyhow = { workspace = true }
 bytes = { workspace = true }
 libc = "0.2"
 http = { workspace = true }
+# Classify origin HTTP/2 failures (RST/GOAWAY reasons) for the HTTP/1.1
+# fallback. Same 0.4 release Pingora and hyper already link.
+h2 = "0.4"
 async-trait = { workspace = true }
 async-stream = "0.3"
 dotenvy = { workspace = true }

@@ -4,7 +4,10 @@
 //!   usable cache entry to fall back to.
 //!
 //! Every page is `no-store` so browsers and upstream caches never keep an error
-//! response, and carries a stable `X-Lagran-Error` code for support/debugging.
+//! response, and carries a stable `X-CDN-Error` code for support/debugging.
+//!
+//! Visitors of the sites behind this edge see these pages, so they carry no
+//! product brand, slogan or support link.
 
 use axum::http::{header, HeaderName, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
@@ -29,20 +32,6 @@ const CARD_CSS: &str = r#"
     }
     .landscape svg { width: 100%; height: 100%; display: block; }
     .wrap { width: min(660px, 100%); position: relative; z-index: 2; }
-    .brand { display: flex; align-items: center; gap: 12px; margin: 0 0 18px 4px; }
-    .seal {
-      width: 46px; height: 46px; border-radius: 10px; display: grid; place-items: center;
-      background: linear-gradient(145deg, #b33a30, #8f2a22); color: #fff8ee;
-      font-family: "Songti SC", "Noto Serif SC", "STSong", serif;
-      font-size: 24px; font-weight: 700; border: 1px solid rgba(255,255,255,.22);
-      box-shadow: 0 8px 20px rgba(143,42,34,.22);
-    }
-    .brand-text { display: flex; flex-direction: column; line-height: 1.2; }
-    .brand-text b {
-      font-family: "Songti SC", "Noto Serif SC", "STSong", serif;
-      font-size: 15px; letter-spacing: .08em; color: #4a4036;
-    }
-    .brand-text small { margin-top: 3px; font-size: 10px; color: #9b8d7a; letter-spacing: .18em; }
     .card {
       background: rgba(255,253,248,.96); border: 1px solid #eadfce; border-radius: 22px;
       padding: clamp(26px, 5vw, 44px);
@@ -96,12 +85,6 @@ const CARD_CSS: &str = r#"
       margin-top: 24px; padding-top: 16px; border-top: 1px solid #eee3d4;
       font-size: 12px; color: #9a8b78; position: relative; z-index: 1;
     }
-    .foot { margin: 18px 0 0; text-align: center; font-size: 12px; color: #a29380; letter-spacing: .06em; }
-    .foot a {
-      color: #9c3b31; text-decoration: none; border-bottom: 1px solid rgba(156,59,49,.35);
-      margin-left: 6px; font-weight: 600;
-    }
-    .foot a:hover { color: #7f2d25; border-bottom-color: currentColor; }
     @media (min-width: 1920px) {
       .wrap { width: min(820px, 100%); }
       .card { padding: 52px 56px; }
@@ -116,7 +99,6 @@ const CARD_CSS: &str = r#"
     }
     @media (max-width: 520px) {
       body { padding: 18px 12px 28px; }
-      .brand { margin-left: 2px; }
       .card { padding: 22px; border-radius: 18px; }
       p { font-size: 14px; }
       .meta { font-size: 11px; }
@@ -196,7 +178,7 @@ pub fn origin_error_page(host: &str, path: &str, failure: OriginFailure) -> Resp
     <ul>
       <li>稍等片刻后刷新页面（多数源站故障是短暂的）</li>
       <li>站点管理员检查源站进程、端口、DNS 与证书是否正常</li>
-      <li>在 Lagran 控制台查看「源站健康」与边缘日志，必要时刷新缓存</li>
+      <li>在控制台查看「源站健康」与边缘日志，必要时刷新缓存</li>
     </ul>"#,
         title = failure.title(),
         detail = failure.detail(),
@@ -318,16 +300,16 @@ pub fn waf_blocked_page(host: &str, path: &str, rule: &str, _category: &str) -> 
         HeaderValue::from_static("no-store, no-cache, must-revalidate"),
     );
     headers.insert(
-        HeaderName::from_static("x-lagran-error"),
+        HeaderName::from_static("x-cdn-error"),
         HeaderValue::from_static("WAF_BLOCKED"),
     );
     headers.remove(header::RETRY_AFTER);
     headers.insert(
-        HeaderName::from_static("x-lagran-waf"),
+        HeaderName::from_static("x-cdn-waf"),
         HeaderValue::from_static("blocked"),
     );
     if let Ok(v) = HeaderValue::from_str(&truncate(rule, 96)) {
-        headers.insert(HeaderName::from_static("x-lagran-waf-rule"), v);
+        headers.insert(HeaderName::from_static("x-cdn-waf-rule"), v);
     }
     response
 }
@@ -365,7 +347,7 @@ pub fn rate_limited_page(host: &str, path: &str, retry_after: u64, banned: bool)
         headers.insert(header::RETRY_AFTER, value);
     }
     headers.insert(
-        HeaderName::from_static("x-lagran-cc"),
+        HeaderName::from_static("x-cdn-cc"),
         HeaderValue::from_static(if banned { "banned" } else { "limit" }),
     );
     response
@@ -402,7 +384,7 @@ pub fn unknown_domain_page(host: &str) -> Response {
     let body = format!(
         r#"<h1>该域名尚未接入加速</h1>
     <p>您访问的域名 <code>{host_esc}</code> 已解析到 CDN 节点，但尚未在控制台完成接入配置。</p>
-    <p>请联系站点管理员在 Lagran 控制台：</p>
+    <p>请联系站点管理员在控制台：</p>
     <ul>
       <li>添加该加速域名</li>
       <li>配置对应源站（Origin）</li>
@@ -411,7 +393,7 @@ pub fn unknown_domain_page(host: &str) -> Response {
     );
     render_page(
         StatusCode::NOT_FOUND,
-        "Lagran CDN",
+        "接入提示",
         "域名未接入",
         &body,
         "DOMAIN_NOT_ONBOARDED",
@@ -425,7 +407,7 @@ pub fn unknown_domain_page(host: &str) -> Response {
 pub fn missing_host_page() -> Response {
     render_page(
         StatusCode::BAD_REQUEST,
-        "Lagran CDN",
+        "请求错误",
         "缺少 Host",
         "<p>请求未包含 <code>Host</code> 或 HTTP/2 <code>:authority</code>，无法确定要访问的加速域名。</p>",
         "MISSING_HOST",
@@ -448,7 +430,7 @@ fn render_page(
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="theme-color" content="#f6f0e5" />
-  <title>{page_title} | Lagran CDN</title>
+  <title>{page_title}</title>
   <style>{CARD_CSS}</style>
 </head>
 <body>
@@ -459,19 +441,11 @@ fn render_page(
     </svg>
   </div>
   <div class="wrap">
-    <div class="brand">
-      <div class="seal">澜</div>
-      <div class="brand-text">
-        <b>Lagran 边缘</b>
-        <small>EDGE SECURITY &amp; ACCELERATION</small>
-      </div>
-    </div>
     <div class="card">
       <div class="badge{badge_cls}">{badge}</div>
       {body_html}
       <div class="meta"><span>错误码</span><code>{code}</code></div>
     </div>
-    <p class="foot">Lagran Edge · 为每一次访问保驾护航 · <a href="https://t.me/lagranedge" target="_blank" rel="noopener noreferrer">获取技术支持</a></p>
   </div>
 </body>
 </html>"##,
@@ -490,7 +464,7 @@ fn render_page(
         HeaderValue::from_static("no-store, no-cache, must-revalidate"),
     );
     if let Ok(v) = HeaderValue::from_str(code) {
-        headers.insert(HeaderName::from_static("x-lagran-error"), v);
+        headers.insert(HeaderName::from_static("x-cdn-error"), v);
     }
     if warn {
         headers.insert(header::RETRY_AFTER, HeaderValue::from_static("30"));
@@ -514,7 +488,7 @@ fn html_escape(s: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -530,7 +504,7 @@ mod tests {
                 resp.headers().get("cache-control").unwrap(),
                 "no-store, no-cache, must-revalidate"
             );
-            assert_eq!(resp.headers().get("x-lagran-error").unwrap(), code);
+            assert_eq!(resp.headers().get("x-cdn-error").unwrap(), code);
             assert_eq!(resp.headers().get("retry-after").unwrap(), "30");
             assert_eq!(
                 resp.headers().get(header::CONTENT_TYPE).unwrap(),
@@ -552,8 +526,8 @@ mod tests {
     fn waf_block_page_headers() {
         let resp = waf_blocked_page("cdn.test", "/search?q=x", "SQL 注入", "sqli");
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-        assert_eq!(resp.headers().get("x-lagran-waf").unwrap(), "blocked");
-        assert_eq!(resp.headers().get("x-lagran-error").unwrap(), "WAF_BLOCKED");
+        assert_eq!(resp.headers().get("x-cdn-waf").unwrap(), "blocked");
+        assert_eq!(resp.headers().get("x-cdn-error").unwrap(), "WAF_BLOCKED");
         assert!(resp.headers().get("retry-after").is_none());
         assert_eq!(
             resp.headers().get("cache-control").unwrap(),
@@ -570,7 +544,7 @@ mod tests {
             "no-store, no-cache, must-revalidate"
         );
         assert_eq!(
-            resp.headers().get("x-lagran-error").unwrap(),
+            resp.headers().get("x-cdn-error").unwrap(),
             "DOMAIN_NOT_ONBOARDED"
         );
         assert!(resp.headers().get("retry-after").is_none());
@@ -580,35 +554,53 @@ mod tests {
     fn missing_host_is_a_bad_request_not_an_unknown_domain() {
         let resp = missing_host_page();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(
-            resp.headers().get("x-lagran-error").unwrap(),
-            "MISSING_HOST"
-        );
+        assert_eq!(resp.headers().get("x-cdn-error").unwrap(), "MISSING_HOST");
         assert_eq!(
             resp.headers().get("cache-control").unwrap(),
             "no-store, no-cache, must-revalidate"
         );
     }
 
-    #[tokio::test]
-    async fn non_waf_error_pages_include_support_link() {
+    /// Brand names, slogans and support links that must never reach visitors.
+    /// (Internal endpoints such as `/__lagran/challenge/verify` are paths, not
+    /// branding, so the lowercase form is not checked.)
+    pub(crate) const BRAND_MARKERS: &[&str] = &[
+        "Lagran",
+        "澜",
+        "t.me/",
+        "获取技术支持",
+        "保驾护航",
+        "EDGE SECURITY",
+    ];
+
+    pub(crate) async fn assert_unbranded(response: Response) {
         use http_body_util::BodyExt;
 
-        // The WAF page is intentionally standalone and has no branding or support link.
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&body);
+        for marker in BRAND_MARKERS {
+            assert!(
+                !html.contains(marker),
+                "edge page shows {marker:?}:\n{html}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn edge_pages_carry_no_brand_or_ads() {
         let pages = [
             origin_error_page("cdn.test", "/a", OriginFailure::Unreachable),
+            origin_error_page("cdn.test", "/a", OriginFailure::Timeout),
+            origin_error_page("cdn.test", "/a", OriginFailure::Unhealthy),
+            waf_blocked_page("cdn.test", "/search", "SQL 注入", "sqli"),
             node_disabled_page("cdn.test"),
             rate_limited_page("cdn.test", "/api", 7, false),
+            rate_limited_page("cdn.test", "/api", 7, true),
             unknown_domain_page("not-onboarded.test"),
+            missing_host_page(),
         ];
         for response in pages {
-            let body = response.into_body().collect().await.unwrap().to_bytes();
-            let html = String::from_utf8_lossy(&body);
-            assert!(
-                html.contains("https://t.me/lagranedge"),
-                "missing Telegram URL"
-            );
-            assert!(html.contains("获取技术支持"), "missing support link text");
+            assert_unbranded(response).await;
         }
     }
 }

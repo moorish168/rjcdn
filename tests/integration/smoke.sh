@@ -276,9 +276,14 @@ else
 fi
 grep -qi '^content-type: text/html' "$LOG_DIR/down.hdr" && pass "error page is HTML" || fail "error page content-type"
 grep -q '源站' "$LOG_DIR/down.html" && pass "error page explains the origin problem" || fail "error page text"
-grep -qi '^x-lagran-error: ORIGIN_' "$LOG_DIR/down.hdr" && pass "error page carries ORIGIN_* code" || fail "x-lagran-error header"
+grep -qi '^x-cdn-error: ORIGIN_' "$LOG_DIR/down.hdr" && pass "error page carries ORIGIN_* code" || fail "x-cdn-error header"
 grep -qi '^cache-control: no-store' "$LOG_DIR/down.hdr" && pass "error page is no-store" || fail "error page cache-control"
 grep -q "$DOWN" "$LOG_DIR/down.html" && pass "error page names the domain" || fail "error page domain"
+if grep -qiE '^(x-lagran-|x-powered-by:)' "$LOG_DIR/down.hdr" || grep -qiE 'lagran|t\.me/' "$LOG_DIR/down.html"; then
+  fail "visitor response carries the product name"
+else
+  pass "visitor response carries no product name"
+fi
 
 echo "== multi-tenant isolation =="
 REG=$(curl -s -X POST "http://127.0.0.1:$CONTROL_PORT/api/v1/auth/register" \

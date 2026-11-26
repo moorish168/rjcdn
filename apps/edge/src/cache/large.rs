@@ -926,26 +926,27 @@ impl LargeCache {
     /// copied upstream headers verbatim while the small-object path filtered
     /// them elsewhere.
     pub(crate) fn cacheable_header(name: &str) -> bool {
-        !matches!(
-            name.to_ascii_lowercase().as_str(),
-            "set-cookie"
-                | "set-cookie2"
-                | "content-length"
-                | "transfer-encoding"
-                | "connection"
-                | "keep-alive"
-                | "proxy-authenticate"
-                | "proxy-authorization"
-                | "proxy-connection"
-                | "te"
-                | "trailer"
-                | "trailers"
-                | "upgrade"
-                | "age"
-                | "date"
-                | "x-lagran-cache-reason"
-                | "x-lagran-validator-source"
-        )
+        !crate::cache::policy::is_legacy_diagnostic_header(name)
+            && !matches!(
+                name.to_ascii_lowercase().as_str(),
+                "set-cookie"
+                    | "set-cookie2"
+                    | "content-length"
+                    | "transfer-encoding"
+                    | "connection"
+                    | "keep-alive"
+                    | "proxy-authenticate"
+                    | "proxy-authorization"
+                    | "proxy-connection"
+                    | "te"
+                    | "trailer"
+                    | "trailers"
+                    | "upgrade"
+                    | "age"
+                    | "date"
+                    | "x-cache-reason"
+                    | "x-lagran-validator-source"
+            )
     }
 
     /// Drop uncacheable headers from a header list before it is persisted.
@@ -962,7 +963,8 @@ impl LargeCache {
     /// Entries written by an older build can still contain `Set-Cookie`, so the
     /// replay side filters independently of the write side.
     pub(crate) fn replayable_header(name: &str) -> bool {
-        !name.to_ascii_lowercase().starts_with("set-cookie")
+        !crate::cache::policy::is_legacy_diagnostic_header(name)
+            && !name.to_ascii_lowercase().starts_with("set-cookie")
     }
 
     fn paths_for_key(&self, key: &str) -> (PathBuf, PathBuf) {
@@ -1721,6 +1723,17 @@ async fn scan_usage(root: &Path) -> anyhow::Result<(u64, usize)> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// Objects stored before the header rename may hold the old names.
+    #[test]
+    fn pre_rename_diagnostic_headers_are_neither_stored_nor_replayed() {
+        for legacy in crate::cache::policy::LEGACY_DIAGNOSTIC_HEADERS {
+            assert!(!LargeCache::cacheable_header(legacy), "{legacy} stored");
+            assert!(!LargeCache::replayable_header(legacy), "{legacy} replayed");
+        }
+        assert!(LargeCache::replayable_header("x-cache-source"));
+        assert!(LargeCache::replayable_header("content-type"));
+    }
 
     /// Storing an origin response that sets a session cookie and replaying it
     /// from cache hands that session to every later client: session fixation.

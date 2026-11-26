@@ -97,7 +97,7 @@
                   {{ statusLabel(n.status) }}
                 </StatusTag>
               </td>
-              <td class="num text-2">{{ n.version || '—' }}</td>
+              <td class="num text-2">{{ displayVersion(n.version) || '—' }}</td>
               <td>
                 <div class="resource">
                   <span class="res-label">CPU</span>
@@ -336,6 +336,7 @@
 <script setup lang="ts">
 import { friendlyErrorMessage } from '~/utils/friendlyError'
 import { humanBytes } from '~/utils/edgeSizing'
+import { displayVersion } from '~/utils/version'
 
 const api = useApi()
 const toast = useToast()
@@ -381,7 +382,7 @@ function exportNodes() {
     { key: 'name', label: '节点' },
     { key: 'region', label: '区域' },
     { key: 'status', label: '状态' },
-    { key: 'version', label: '版本' },
+    { key: 'version', label: '版本', value: (n) => displayVersion(n.version) },
     { key: 'public_ip', label: '公网 IP' },
     { key: 'agent_url', label: '节点地址' },
     { key: 'cpu_usage', label: 'CPU%' },
@@ -535,7 +536,7 @@ async function upgrade(node: any) {
   try {
     const result = await api.post<any>(`/api/v1/nodes/${node.id}/upgrade`, {})
     queued = true
-    toast.success(`升级任务已下发：${result.version}，节点将在下载校验后自动重启`)
+    toast.success(`升级任务已下发：${displayVersion(result.version)}，节点将在下载校验后自动重启`)
     window.setTimeout(load, 5000)
     window.setTimeout(load, 15000)
   } catch (e: any) {

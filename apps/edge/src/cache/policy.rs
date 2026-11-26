@@ -26,6 +26,31 @@ use tokio::sync::RwLock;
 /// Values: `etag`, `last-modified`, `computed`.
 pub const VALIDATOR_SOURCE_HEADER: &str = "x-lagran-validator-source";
 
+/// Diagnostic response headers edges sent before they were given neutral
+/// names (`x-cache-*`, `x-cdn-*`). A shield on an older release, or an object
+/// stored before the upgrade, can still carry them, so they are neither stored
+/// nor replayed: visitors never see the old product name.
+pub const LEGACY_DIAGNOSTIC_HEADERS: [&str; 11] = [
+    "x-lagran-cache-reason",
+    "x-lagran-cache-source",
+    "x-lagran-cache-ttl",
+    "x-lagran-cache-lookup-ms",
+    "x-lagran-datapath",
+    "x-lagran-error",
+    "x-lagran-waf",
+    "x-lagran-waf-rule",
+    "x-lagran-cc",
+    "x-lagran-challenge",
+    "x-lagran-redirect",
+];
+
+/// Whether `name` is one of [`LEGACY_DIAGNOSTIC_HEADERS`].
+pub fn is_legacy_diagnostic_header(name: &str) -> bool {
+    LEGACY_DIAGNOSTIC_HEADERS
+        .iter()
+        .any(|legacy| name.eq_ignore_ascii_case(legacy))
+}
+
 /// Standard CDN-style cache status labels
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheStatus {
@@ -870,7 +895,7 @@ pub fn has_non_clearance_cookie(headers: &HeaderMap) -> bool {
 
 /// Why a request bypasses the shared cache: authenticated or personalised
 /// traffic, or a client `Cache-Control: no-store`. The returned value is
-/// exposed as `X-Lagran-Cache-Reason` for operator diagnostics.
+/// exposed as `X-Cache-Reason` for operator diagnostics.
 ///
 /// A client's `Cache-Control: no-cache` / `max-age=0` and `Pragma: no-cache`
 /// are ignored. Browsers send `max-age=0` on every reload and `no-cache` on a
@@ -1212,8 +1237,9 @@ pub fn is_uncacheable_header(name: &str) -> bool {
         || n == "age"
         || n == "date"
         || n == "etag"
-        || n == "x-lagran-cache-reason"
+        || n == "x-cache-reason"
         || n == "x-lagran-validator-source"
+        || is_legacy_diagnostic_header(&n)
         || is_hop_by_hop(&n)
 }
 
@@ -1225,8 +1251,9 @@ pub fn strip_response_headers(headers: &mut HeaderMap) {
             let n = k.as_str().to_ascii_lowercase();
             is_hop_by_hop(&n)
                 || n == "content-length"
-                || n == "x-lagran-cache-reason"
+                || n == "x-cache-reason"
                 || n == "x-lagran-validator-source"
+                || is_legacy_diagnostic_header(&n)
         })
         .map(|k| k.as_str().to_string())
         .collect();
@@ -1257,6 +1284,25 @@ mod tests {
     use super::*;
     use axum::http::HeaderValue;
     use bytes::Bytes;
+
+    #[test]
+    fn pre_rename_diagnostic_headers_are_never_stored_or_passed_on() {
+        for legacy in LEGACY_DIAGNOSTIC_HEADERS {
+            assert!(is_legacy_diagnostic_header(&legacy.to_ascii_uppercase()));
+            assert!(is_uncacheable_header(legacy), "{legacy} stored");
+        }
+        assert!(!is_legacy_diagnostic_header("x-cache-source"));
+        assert!(!is_legacy_diagnostic_header(VALIDATOR_SOURCE_HEADER));
+
+        // An older shield's diagnostics on an origin response.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-lagran-cache-source", HeaderValue::from_static("l1"));
+        headers.insert("X-Lagran-Datapath", HeaderValue::from_static("pingora"));
+        headers.insert("content-type", HeaderValue::from_static("text/css"));
+        strip_response_headers(&mut headers);
+        assert!(headers.keys().all(|name| !name.as_str().contains("lagran")));
+        assert!(headers.contains_key("content-type"));
+    }
 
     #[test]
     fn strips_alt_svc_from_origin_responses() {

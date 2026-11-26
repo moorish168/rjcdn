@@ -391,3 +391,24 @@ async fn stale_prefetch_tasks_fail_after_the_retry_limit() {
     assert!(message.contains("abandoned"), "message: {message}");
     db.close().await;
 }
+
+/// The built-in 「默认缓存条件」 keeps static assets at the edge for one year.
+#[tokio::test]
+async fn builtin_default_cache_conditions_keep_static_assets_one_year() {
+    let db = TestDb::new().await;
+    db_or_skip!(db);
+
+    let (ttl, browser_ttl, note): (i32, i32, String) = sqlx::query_as(
+        "SELECT ttl_seconds, browser_ttl_seconds, note FROM cache_policy_rules
+         WHERE policy_id = 'a0000000-0000-4000-8000-000000000001'::uuid
+           AND match_type = 'regex' AND action = 'cache'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("built-in static rule");
+    assert_eq!(ttl, 365 * 24 * 60 * 60);
+    assert_eq!(note, "静态资源 1 年");
+    // Browsers keep following the origin: a purge cannot reach them.
+    assert_eq!(browser_ttl, 0);
+    db.close().await;
+}

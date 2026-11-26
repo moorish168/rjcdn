@@ -95,7 +95,7 @@ CODE=$(get "/")
 check "first request allowed" "$CODE" "200"
 CODE=$(get "/")
 check "second request banned" "$CODE" "429"
-check "ban header" "$(hdr x-lagran-cc)" "banned"
+check "ban header" "$(hdr x-cdn-cc)" "banned"
 check "retry-after present" "$([[ -n "$(hdr retry-after)" ]] && echo yes)" "yes"
 CODE=$(get "/")
 check "banned IP stays blocked" "$CODE" "429"
@@ -122,7 +122,7 @@ for _ in $(seq 1 40); do
   sleep 0.25
 done
 check "second edge receives shared ban" "$SHARED" "1"
-check "second edge ban header" "$(hdr2 x-lagran-cc)" "banned"
+check "second edge ban header" "$(hdr2 x-cdn-cc)" "banned"
 BANS=$(api "http://127.0.0.1:$CONTROL_PORT/api/v1/cc/bans/all?domain=$DOMAIN")
 check "control plane lists shared ban" "$(printf '%s' "$BANS" | jq -r '.bans[0].ip')" "127.0.0.1"
 

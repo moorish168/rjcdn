@@ -520,12 +520,14 @@ const actionOptions = [
 ]
 
 const presets = [
-  { label: 'CSS/JS 后缀 7 天', path: '\\.(css|js)$', matchType: 'regex', ignoreCookie: true, ttl: 604800, swr: 86400, browser: 604800, methods: ['GET', 'HEAD'] },
-  { label: '静态资源 7 天', path: '/static/*', ttl: 604800, swr: 86400, browser: 604800, methods: ['GET', 'HEAD'] },
-  { label: '图片 30 天', path: '/images/*', ttl: 2592000, swr: 86400, browser: 2592000, methods: ['GET', 'HEAD'] },
+  // Static assets stay at the edge for a year (a purge refreshes them there);
+  // the browser TTL stays short because a purge cannot reach browsers.
+  { label: 'CSS/JS 后缀 1 年', path: '\\.(css|js)$', matchType: 'regex', ignoreCookie: true, ttl: 31536000, swr: 86400, browser: 604800, methods: ['GET', 'HEAD'] },
+  { label: '静态资源 1 年', path: '/static/*', ttl: 31536000, swr: 86400, browser: 604800, methods: ['GET', 'HEAD'] },
+  { label: '图片 1 年', path: '/images/*', ttl: 31536000, swr: 86400, browser: 2592000, methods: ['GET', 'HEAD'] },
   { label: 'HTML 5 分钟', path: '/', ttl: 300, swr: 60, browser: 300, methods: ['GET', 'HEAD'] },
   { label: 'API 不缓存', path: '/api/*', bypass: true, methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'] },
-  { label: '下载 1 天', path: '/download/*', ttl: 86400, swr: 3600, browser: 86400, methods: ['GET', 'HEAD'] },
+  { label: '下载 1 年', path: '/download/*', ttl: 31536000, swr: 3600, browser: 86400, methods: ['GET', 'HEAD'] },
 ]
 
 const actionHint = computed(() => {

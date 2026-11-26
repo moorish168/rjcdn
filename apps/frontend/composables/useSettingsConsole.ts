@@ -1,4 +1,5 @@
 import { copyText } from '~/utils/clipboard'
+import { displayVersion } from '~/utils/version'
 
 export function useSettingsConsole() {
 
@@ -68,18 +69,6 @@ interface UpdateInfo {
   error: string | null
 }
 const updateInfo = ref<UpdateInfo | null>(null)
-// The release URL comes from the update API; only follow http(s) links so a
-// compromised/misconfigured response cannot inject `javascript:` into href.
-const releaseLink = computed(() => {
-  const raw = updateInfo.value?.release_url
-  if (!raw) return null
-  try {
-    const url = new URL(raw)
-    return url.protocol === 'https:' || url.protocol === 'http:' ? url.href : null
-  } catch {
-    return null
-  }
-})
 const updateChecking = ref(false)
 const updateApplying = ref(false)
 const UPDATE_PENDING_KEY = 'lagran-update-pending'
@@ -175,7 +164,7 @@ async function applyUpdate() {
   if (updateBusy.value) return
   const ok = await ask({
     title: '确认系统更新',
-    message: `确定更新到 ${updateInfo.value.latest_version}？控制面会短暂重启，请确认当前无重要操作。`,
+    message: `确定更新到 ${displayVersion(updateInfo.value.latest_version)}？控制面会短暂重启，请确认当前无重要操作。`,
     confirmText: '开始更新',
     danger: true,
   })
@@ -457,7 +446,6 @@ onUnmounted(clearUpdatePoll)
     healthStatus,
     controlVersion,
     updateInfo,
-    releaseLink,
     updateChecking,
     updateApplying,
     UPDATE_PENDING_KEY,

@@ -175,7 +175,7 @@ H=$(req "/ttl/overflow")
 contains "overflow: stored (MISS)" "$H" "x-cache: MISS"
 H=$(req "/ttl/overflow")
 contains "overflow: served from cache (HIT)" "$H" "x-cache: HIT"
-TTL=$(printf '%s\n' "$H" | awk 'tolower($1) == "x-lagran-cache-ttl:" {gsub("\r", "", $2); print $2; exit}')
+TTL=$(printf '%s\n' "$H" | awk 'tolower($1) == "x-cache-ttl:" {gsub("\r", "", $2); print $2; exit}')
 if [[ -n "$TTL" && "$TTL" -le 34560000 ]]; then
   pass "clamped TTL reported ($TTL s <= 400 days)"
 else
@@ -211,7 +211,7 @@ if [[ "$CODE" == "502" || "$CODE" == "503" ]]; then
 else
   fail "expired cache + dead origin status (got $CODE)"
 fi
-grep -qi '^x-lagran-error: ORIGIN_' "$LOG_DIR/down.hdr" \
+grep -qi '^x-cdn-error: ORIGIN_' "$LOG_DIR/down.hdr" \
   && pass "origin-down page carries ORIGIN_* code" || fail "origin-down page code"
 grep -qi '^cache-control: no-store' "$LOG_DIR/down.hdr" \
   && pass "origin-down page is no-store" || fail "origin-down page cache-control"

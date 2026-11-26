@@ -517,6 +517,22 @@ fn waf_config_for_global_deny(global_ip_deny: Vec<String>) -> WafConfigOut {
     }
 }
 
+/// HTTP/3 is not offered yet. The console hides the site switch (`HTTP3_OFFERED`
+/// in the frontend's domain advanced settings page) and edges get it off
+/// whatever a site has stored — including sites created while the column
+/// defaulted to on. Flip both constants together to offer it again.
+const HTTP3_OFFERED: bool = false;
+
+/// Apply [`HTTP3_OFFERED`] to a published snapshot, which was built before and
+/// carries its own version: change that version too, or edges that cached the
+/// snapshot would keep advertising HTTP/3.
+fn withhold_unoffered_features(config: &mut DomainConfigResponse) {
+    if !HTTP3_OFFERED && config.http3_enabled {
+        config.http3_enabled = false;
+        config.version = format!("{}:h3off", config.version);
+    }
+}
+
 fn overlay_global_ip_deny(config: &mut DomainConfigResponse, entries: &[String]) {
     if let Some(waf) = config.waf.as_mut() {
         waf.global_ip_deny = entries.to_vec();
@@ -608,7 +624,7 @@ pub(crate) fn build(
         cc,
         websocket_enabled: row.websocket_enabled,
         http2_enabled: row.http2_enabled,
-        http3_enabled: row.http3_enabled,
+        http3_enabled: HTTP3_OFFERED && row.http3_enabled,
         gzip_enabled: row.gzip_enabled,
         image_webp_enabled: row.image_webp_enabled,
         min_tls_version: {
@@ -1025,6 +1041,7 @@ pub async fn list_all_configs(
                 cfg = snapshot.clone();
             }
         }
+        withhold_unoffered_features(&mut cfg);
         overlay_global_ip_deny(&mut cfg, &global_ip_deny);
         version_parts.push(format!(
             "{}:{:?}",
@@ -1344,6 +1361,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn http3_is_withheld_while_not_offered() {
+        let mut row = domain();
+        row.http3_enabled = true;
+        // Live configuration: a stored "on" never reaches the edge.
+        let live = build(&row, Vec::new(), None);
+        assert!(!live.http3_enabled);
+
+        // A snapshot published while HTTP/3 could be on is switched off with
+        // a new version, so edges that cached it pick the change up.
+        let mut snapshot = live.clone();
+        snapshot.http3_enabled = true;
+        let published_version = snapshot.version.clone();
+        withhold_unoffered_features(&mut snapshot);
+        assert!(!snapshot.http3_enabled);
+        assert_ne!(snapshot.version, published_version);
+
+        // Snapshots already off keep their version.
+        let mut off = live.clone();
+        withhold_unoffered_features(&mut off);
+        assert_eq!(off.version, live.version);
     }
 
     #[test]

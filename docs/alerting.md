@@ -37,7 +37,7 @@ groups:
           severity: warning
         annotations:
           summary: 普通请求仍在落入 legacy 数据面
-          description: 对照 x-lagran-datapath 与 legacy fallback WARN，确认是否 native plan 失败。
+          description: 对照 x-cdn-datapath 与 legacy fallback WARN，确认是否 native plan 失败。
 
       - alert: LagranCacheHitRatioLow
         expr: |

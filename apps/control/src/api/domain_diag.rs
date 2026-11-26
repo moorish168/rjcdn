@@ -481,7 +481,9 @@ async fn check_cache(
             let cache = get("x-cache-status")
                 .or_else(|| get("x-cache"))
                 .unwrap_or_else(|| "UNKNOWN".into());
-            let reason = get("x-lagran-cache-reason").unwrap_or_default();
+            let reason = get("x-cache-reason")
+                .or_else(|| get(crate::api::cache_diag::LEGACY_CACHE_REASON_HEADER))
+                .unwrap_or_default();
             let ok = cache.eq_ignore_ascii_case("HIT");
             let detail = if reason.is_empty() {
                 format!("HTTP {status} · 缓存状态 {cache}")

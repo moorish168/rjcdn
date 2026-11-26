@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { displayVersion } from '~/utils/version'
 const settings = inject('settingsConsole') as ReturnType<typeof useSettingsConsole>
 const {
   openEmail,
@@ -120,7 +121,7 @@ const {
           </div>
           <div class="info-item">
             <div class="info-label">控制面版本</div>
-            <div class="info-value mono">{{ controlVersion || '—' }}</div>
+            <div class="info-value mono">{{ displayVersion(controlVersion) || '—' }}</div>
           </div>
           <div class="info-item">
             <div class="info-label">当前角色</div>

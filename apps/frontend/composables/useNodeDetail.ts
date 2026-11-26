@@ -1,4 +1,5 @@
 import { copyText } from '~/utils/clipboard'
+import { displayVersion } from '~/utils/version'
 import { friendlyErrorMessage } from '~/utils/friendlyError'
 import {
   CACHE_BACKEND_LABEL,
@@ -265,7 +266,7 @@ export function useNodeDetail(nodeId: Ref<string> | ComputedRef<string>) {
     upgrading.value = true
     try {
       const result = await api.post<any>(`/api/v1/nodes/${node.id}/upgrade`, {})
-      toast.success(`升级任务已下发：${result.version}，节点将在下载校验后自动重启`)
+      toast.success(`升级任务已下发：${displayVersion(result.version)}，节点将在下载校验后自动重启`)
       window.setTimeout(() => void load(), 5000)
       window.setTimeout(() => void load(), 15000)
     } catch (e: any) {

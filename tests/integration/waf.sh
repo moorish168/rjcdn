@@ -150,7 +150,7 @@ echo "== managed rules (block mode) =="
 CODE=$(request "/search?q=1%27%20or%20%271%27=%271" -H 'X-Forwarded-For: 198.51.100.1')
 check "SQLi query blocked" "$CODE" "403"
 contains "block page is the WAF page" "$(cat "$LOG_DIR/body")" "安全拦截"
-contains "block page carries WAF header" "$(cat "$LOG_DIR/headers")" "x-lagran-waf: blocked"
+contains "block page carries WAF header" "$(cat "$LOG_DIR/headers")" "x-cdn-waf: blocked"
 contains "block page has error code" "$(cat "$LOG_DIR/headers")" "WAF_BLOCKED"
 
 CODE=$(request "/x?q=%3Cscript%3Ealert(1)%3C/script%3E" -H 'X-Forwarded-For: 198.51.100.1')
@@ -180,7 +180,7 @@ check "sensitive path blocked" "$CODE" "403"
 echo "== custom rule =="
 CODE=$(request "/blocked" -H 'X-Forwarded-For: 198.51.100.1')
 check "custom path rule blocked" "$CODE" "403"
-contains "custom rule name in header" "$(cat "$LOG_DIR/headers")" "x-lagran-waf-rule:"
+contains "custom rule name in header" "$(cat "$LOG_DIR/headers")" "x-cdn-waf-rule:"
 
 echo "== IP ACL =="
 CODE=$(request "/" -H 'X-Forwarded-For: 203.0.113.9')
@@ -194,7 +194,7 @@ echo "== browser challenge =="
 CODE=$(request "/challenge-me" -H 'X-Forwarded-For: 198.51.100.1' -H 'Accept: text/html')
 check "challenge rule returns interstitial" "$CODE" "403"
 contains "challenge page marker" "$(cat "$LOG_DIR/body")" "正在进行安全验证"
-contains "challenge response header" "$(cat "$LOG_DIR/headers")" "x-lagran-challenge:"
+contains "challenge response header" "$(cat "$LOG_DIR/headers")" "x-cdn-challenge:"
 
 # A client that cannot render the interstitial (no Accept: text/html) must be
 # blocked, not passed through to the origin.

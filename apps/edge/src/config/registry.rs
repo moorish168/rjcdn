@@ -195,6 +195,37 @@ fn h2_disabled_hosts() -> &'static std::sync::RwLock<std::collections::HashSet<S
     HOSTS.get_or_init(Default::default)
 }
 
+fn h3_enabled_hosts() -> &'static std::sync::RwLock<std::collections::HashSet<String>> {
+    static HOSTS: std::sync::OnceLock<std::sync::RwLock<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    HOSTS.get_or_init(Default::default)
+}
+
+/// Whether this Host may be advertised as an HTTP/3 alternative.
+///
+/// This synchronous snapshot is used by response writers that do not have an
+/// async registry handle. Unknown hosts fail closed.
+pub fn http3_allowed(host: &str) -> bool {
+    let host = normalize_host(host);
+    if host.is_empty() {
+        return false;
+    }
+    h3_enabled_hosts()
+        .read()
+        .map(|set| {
+            if set.contains(&host) {
+                return true;
+            }
+            if let Some((_, rest)) = host.split_once('.') {
+                if !rest.is_empty() && set.contains(&format!("*.{rest}")) {
+                    return true;
+                }
+            }
+            false
+        })
+        .unwrap_or(false)
+}
+
 /// Whether the TLS handshake may negotiate `h2` for this SNI.
 pub fn http2_allowed(sni: &str) -> bool {
     let host = normalize_host(sni);
@@ -267,8 +298,16 @@ impl DomainRegistry {
             .filter(|(_, e)| !e.http2_enabled)
             .map(|(host, _)| host.clone())
             .collect();
+        let h3_enabled: std::collections::HashSet<String> = map
+            .iter()
+            .filter(|(_, e)| e.http3_enabled)
+            .map(|(host, _)| host.clone())
+            .collect();
         if let Ok(mut set) = h2_disabled_hosts().write() {
             *set = disabled;
+        }
+        if let Ok(mut set) = h3_enabled_hosts().write() {
+            *set = h3_enabled;
         }
         if let Ok(mut flags) = access_log_flags().write() {
             flags.clear();
@@ -295,6 +334,13 @@ impl DomainRegistry {
                 set.remove(&key);
             } else {
                 set.insert(key.clone());
+            }
+        }
+        if let Ok(mut set) = h3_enabled_hosts().write() {
+            if entry.http3_enabled {
+                set.insert(key.clone());
+            } else {
+                set.remove(&key);
             }
         }
         remember_access_log(&key, entry.access_log_enabled);

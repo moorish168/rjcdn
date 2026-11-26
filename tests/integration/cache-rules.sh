@@ -167,7 +167,7 @@ check "ignore_cookie rule caches browser cookie request" "$(hdr x-cache)" "HIT"
 CODE=$(get "/assets/app.css" -H 'Cache-Control: max-age=0' -H "If-None-Match: $CSS_ETAG")
 check "reload with client ETag answers 304" "$CODE" "304"
 check "reload with client ETag is answered from cache" "$(hdr x-cache)" "REVALIDATED"
-check "reload with client ETag stays on Pingora" "$(hdr x-lagran-datapath)" "pingora"
+check "reload with client ETag stays on Pingora" "$(hdr x-cdn-datapath)" "pingora"
 CODE=$(get "/assets/app.css" -H 'Cache-Control: max-age=0')
 check "reload max-age=0 returns body" "$CODE" "200"
 check "reload max-age=0 is a HIT" "$(hdr x-cache)" "HIT"
@@ -191,7 +191,7 @@ check "large object cold miss" "$(hdr x-cache)" "MISS"
 CODE=$(get "/large" -H 'Cache-Control: max-age=0')
 check "large object reload returns 200" "$CODE" "200"
 check "large object reload is a HIT" "$(hdr x-cache)" "HIT"
-check "large object exposes remaining TTL" "$(hdr x-lagran-cache-ttl | grep -cE '^[0-9]+$' || true)" "1"
+check "large object exposes remaining TTL" "$(hdr x-cache-ttl | grep -cE '^[0-9]+$' || true)" "1"
 check "large object body size" "$(wc -c < "$LOG_DIR/b" | tr -d ' ')" "2097152"
 get "/assets/no-validator.css" -H 'Cache-Control: max-age=0' >/dev/null
 check "no-validator object cold is MISS" "$(hdr x-cache)" "MISS"
@@ -212,7 +212,7 @@ get "/assets/vary.js" -H 'Cookie: sid=1' >/dev/null
 check "vary:cookie static first miss" "$(hdr x-cache)" "MISS"
 get "/assets/vary.js" -H 'Cookie: sid=1' >/dev/null
 check "vary:cookie response is not stored" "$(hdr x-cache)" "MISS"
-check "vary:cookie reason" "$(hdr x-lagran-cache-reason)" "vary:cookie"
+check "vary:cookie reason" "$(hdr x-cache-reason)" "vary:cookie"
 get "/html" >/dev/null
 check "content-type html bypasses cache" "$(hdr x-cache)" "BYPASS"
 get "/html" >/dev/null

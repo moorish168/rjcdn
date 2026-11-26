@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import type { useNodeDetail } from '~/composables/useNodeDetail'
+import { displayVersion } from '~/utils/version'
 
 const ctx = inject('nodeDetail') as ReturnType<typeof useNodeDetail>
 const {
@@ -43,7 +44,7 @@ const {
         </div>
         <div class="detail-item">
           <div class="detail-label">版本</div>
-          <div class="detail-value">{{ detail.node.version || '—' }}</div>
+          <div class="detail-value">{{ displayVersion(detail.node.version) || '—' }}</div>
         </div>
         <div class="detail-item">
           <div class="detail-label">公网 IP</div>

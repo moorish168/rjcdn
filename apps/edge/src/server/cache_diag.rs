@@ -130,8 +130,8 @@ pub async fn diag_handler(
     let selected = [
         "x-cache",
         "x-cache-status",
-        "x-lagran-cache-reason",
-        "x-lagran-cache-ttl",
+        "x-cache-reason",
+        "x-cache-ttl",
         "age",
         "etag",
         "cache-control",

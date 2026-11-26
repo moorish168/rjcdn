@@ -140,7 +140,7 @@ api -X PUT "http://127.0.0.1:$CONTROL_PORT/api/v1/domains/$DOMAIN_ID/waf" \
 CHALLENGED=0
 for _ in $(seq 1 40); do
   CODE=$(get "/page" -A 'Mozilla/5.0' -H 'Accept: text/html')
-  if [[ "$CODE" == "403" && "$(hdr x-lagran-challenge)" != "" ]]; then CHALLENGED=1; break; fi
+  if [[ "$CODE" == "403" && "$(hdr x-cdn-challenge)" != "" ]]; then CHALLENGED=1; break; fi
   sleep 0.5
 done
 check "under-attack challenges documents" "$CHALLENGED" "1"
