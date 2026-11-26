@@ -14,7 +14,7 @@ pub mod geo;
 pub mod rulepack;
 
 use aho_corasick::AhoCorasick;
-use axum::http::HeaderMap;
+use axum::http::{header, HeaderMap};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -87,6 +87,7 @@ pub enum SecurityLevel {
 impl SecurityLevel {
     pub fn parse(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
+            "off" => SecurityLevel::Off,
             "low" => SecurityLevel::Low,
             "medium" | "mid" => SecurityLevel::Medium,
             "high" => SecurityLevel::High,
@@ -536,6 +537,8 @@ pub struct WafConfig {
     pub rules: Vec<WafRule>,
     pub ip_allow: Vec<IpNet>,
     pub ip_deny: Vec<IpNet>,
+    /// Global deny entries are checked before any site allow-list rule.
+    pub global_ip_deny: Vec<IpNet>,
     /// ISO 3166-1 alpha-2 country codes that may pass the Geo/ASN gate.
     pub country_allow: Vec<String>,
     /// Country codes blocked outright (takes precedence over allow).
@@ -579,6 +582,7 @@ impl Default for WafConfig {
             rules: Vec::new(),
             ip_allow: Vec::new(),
             ip_deny: Vec::new(),
+            global_ip_deny: Vec::new(),
             country_allow: Vec::new(),
             country_deny: Vec::new(),
             asn_allow: Vec::new(),
@@ -726,6 +730,8 @@ const TRAVERSAL: &[&str] = &[
     "%2e%2e%2f",
     "/etc/passwd",
     "/etc/shadow",
+    "/etc/hosts",
+    "/proc/self/environ",
     "boot.ini",
     "win.ini",
 ];
@@ -756,26 +762,75 @@ const SCANNER_UA: &[&str] = &[
 
 const SCANNER_PATH: &[&str] = &[
     "/.env",
+    "/.env.local",
+    "/.env.production",
     "/.git/",
+    "/.git/config",
     "/.svn/",
+    "/.hg/",
     "/.aws/credentials",
     "/.kube/config",
     "/.ssh/",
     "/id_rsa",
     "/wp-login.php",
     "/wp-admin",
+    "/wp-config.php",
+    "/xmlrpc.php",
+    "/phpinfo.php",
+    "/adminer.php",
     "/phpmyadmin",
     "/actuator",
+    "/actuator/env",
     "/server-status",
+    "/server-info",
     "/.DS_Store",
     "/web.config",
     "/config.php",
     "/docker-compose.yml",
     "/dockerfile",
+    "/vendor/phpunit/",
+    "/phpunit/",
+    "/composer.lock",
+    "/package-lock.json",
+    "/yarn.lock",
+    "/pnpm-lock.yaml",
+    "/debug/default/view",
+    "/cgi-bin/",
+    "/backup/",
+    "/backups/",
     "/backup.sql",
     "/.sql",
     "/.bak",
 ];
+
+/// Sensitive exports and editor backups are commonly probed under arbitrary
+/// filenames, so exact paths alone miss requests such as `/data.sql`.
+const SCANNER_PATH_SUFFIXES: &[&str] = &[
+    ".sql", ".sql.gz", ".dump", ".bak", ".backup", ".old", ".orig", ".save", ".swp", ".swo",
+    ".sqlite", ".sqlite3", ".db",
+];
+const SCANNER_HEADERS: &[&str] = &[
+    "x-acunetix-product",
+    "x-burp-scan",
+    "x-nuclei-id",
+    "x-sqlmap",
+    "x-wapiti",
+    "x-zap-scan",
+];
+
+fn scanner_path_suffix_matches(path: &str) -> bool {
+    path.rsplit('/').next().is_some_and(|name| {
+        SCANNER_PATH_SUFFIXES
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
+    })
+}
+
+fn scanner_header_matches(headers: &HeaderMap) -> bool {
+    headers
+        .keys()
+        .any(|name| SCANNER_HEADERS.contains(&name.as_str()))
+}
 
 const RCE: &[&str] = &[
     ";wget ",
@@ -804,6 +859,18 @@ const RCE: &[&str] = &[
     "${ifs}",
     "$ifs",
     "bash -c",
+    "child_process.exec(",
+    "child_process.execsync(",
+    "child_process.spawn(",
+    "child_process.spawnsync(",
+    "subprocess.popen(",
+    "os.popen(",
+    "os.system(",
+    "shell_exec(",
+    "passthru(",
+    "proc_open(",
+    "process.start(",
+    "system.diagnostics.process",
 ];
 
 const SSRF: &[&str] = &[
@@ -869,8 +936,15 @@ const SSTI: &[&str] = &[
     "__mro__",
     "__subclasses__",
     "freemarker.template",
+    "freemarker.template.utility.execute",
     "org.apache.velocity",
+    "#this.getclass()",
+    "class.forname(",
+    "{{request.application",
+    "{{config.__class__",
+    "{{range(",
     "#set(",
+    "#set($",
     "getengine(",
     "runtime.exec",
 ];
@@ -903,6 +977,14 @@ const JAVA: &[&str] = &[
     "%{#",
     "_memberaccess",
     "class.module.classloader",
+    "java.io.objectinputstream",
+    "readobject(",
+    "org.apache.commons.collections.functors",
+    "org.apache.commons.collections4.functors",
+    "com.sun.org.apache.xalan.internal.xsltc.trax.templatesimpl",
+    "org.springframework.expression",
+    "t(java.lang.runtime)",
+    "ysoserial",
 ];
 
 const WEBSHELL: &[&str] = &[
@@ -910,6 +992,10 @@ const WEBSHELL: &[&str] = &[
     "<?=",
     "php://",
     "php://filter",
+    "php://input",
+    "phar://",
+    "data://text/plain",
+    "allow_url_include",
     "auto_prepend_file",
     "auto_append_file",
     "$_get[",
@@ -1122,7 +1208,9 @@ fn managed_verdict(
     // that also carries an injection payload is still reported as the more
     // severe category.
     let scanner_hit = cfg.managed.scanners
-        && (matchers.scanner_ua.is_match(ua) || matchers.scanner_path.is_match(path));
+        && (matchers.scanner_ua.is_match(ua)
+            || matchers.scanner_path.is_match(path)
+            || scanner_path_suffix_matches(path));
     if hits == 0 {
         return scanner_hit.then(|| verdict("恶意扫描器", "scanners"));
     }
@@ -1182,7 +1270,7 @@ fn legacy_managed_verdict(
         if contains_any(ua, SCANNER_UA) {
             return Some(verdict("恶意扫描器", "scanners"));
         }
-        if contains_any(path, SCANNER_PATH) {
+        if contains_any(path, SCANNER_PATH) || scanner_path_suffix_matches(path) {
             return Some(verdict("敏感路径探测", "scanners"));
         }
     }
@@ -1214,6 +1302,410 @@ fn legacy_managed_verdict(
         return Some(verdict("WebShell / PHP 注入", "webshell"));
     }
     None
+}
+
+/// Maximum raw request body sent through the body-inspection path. Large and
+/// streaming uploads remain on the normal proxy path.
+pub const WAF_BODY_INSPECTION_LIMIT: usize = 1024 * 1024;
+const WAF_DECOMPRESSED_BODY_LIMIT: usize = 8 * 1024 * 1024;
+
+/// Whether a small, fixed-length textual request body should be inspected.
+/// Pingora uses this to route only supported body types through the bounded
+/// in-process path where the complete payload can be evaluated before origin.
+pub fn should_inspect_body(method: &str, headers: &HeaderMap) -> bool {
+    if method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD") {
+        return false;
+    }
+    let Some(length) = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+    else {
+        return false;
+    };
+    if length == 0 || length > WAF_BODY_INSPECTION_LIMIT {
+        return false;
+    }
+    let Some(content_type) = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let supported_type = media_type == "application/x-www-form-urlencoded"
+        || media_type == "application/json"
+        || media_type.ends_with("+json")
+        || media_type == "application/xml"
+        || media_type == "text/xml"
+        || media_type.ends_with("+xml")
+        || media_type == "multipart/form-data"
+        || media_type == "text/plain";
+    if !supported_type {
+        return false;
+    }
+    headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .is_none_or(|value| {
+            value.eq_ignore_ascii_case("identity")
+                || value.eq_ignore_ascii_case("gzip")
+                || value.eq_ignore_ascii_case("deflate")
+        })
+}
+
+/// Inspect supported request bodies with the same managed signatures used for
+/// URL, UA, and Referer checks. JSON/form fields are decoded into text first;
+/// gzip/deflate bodies and suspicious base64 values get bounded decode passes.
+pub fn evaluate_body(
+    cfg: &WafConfig,
+    ip: Option<IpAddr>,
+    body: &[u8],
+    content_type: &str,
+    content_encoding: &str,
+) -> Option<WafVerdict> {
+    if !cfg.enabled || body.is_empty() || body.len() > WAF_BODY_INSPECTION_LIMIT {
+        return None;
+    }
+    if ip.is_some_and(|ip| cfg.ip_allow.iter().any(|network| network.contains(ip))) {
+        return None;
+    }
+
+    let decoded_body = match decompress_waf_body(body, content_encoding) {
+        Ok(decoded) => decoded,
+        Err(BodyDecodeError::Invalid) => body.to_vec(),
+        Err(BodyDecodeError::TooLarge) if cfg.managed.protocol => {
+            return Some(verdict(
+                "Compressed request body exceeds inspection limit",
+                "protocol",
+            ));
+        }
+        Err(BodyDecodeError::TooLarge) => return None,
+    };
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let body_text = String::from_utf8_lossy(&decoded_body);
+
+    if cfg.managed.webshell
+        && media_type == "multipart/form-data"
+        && dangerous_upload_filename(&body_text)
+    {
+        return Some(verdict("Executable script upload", "webshell"));
+    }
+
+    let mut candidates = vec![body_text.into_owned()];
+    if media_type == "application/json" || media_type.ends_with("+json") {
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&decoded_body) {
+            collect_json_text(&value, &mut candidates, 2048);
+        }
+    } else if media_type == "application/x-www-form-urlencoded" {
+        for field in body_text_pairs(&decoded_body, 2048) {
+            candidates.push(field);
+        }
+    }
+
+    let mut base64_budget = 128usize;
+    for candidate in candidates.iter().take(4096) {
+        if let Some(hit) = body_signature_verdict(cfg, candidate) {
+            return Some(hit);
+        }
+        if base64_budget == 0 {
+            continue;
+        }
+        let (decoded_values, checked) = decoded_base64_values(candidate, base64_budget);
+        base64_budget = base64_budget.saturating_sub(checked);
+        for decoded in decoded_values {
+            if let Some(hit) = body_signature_verdict(cfg, &decoded) {
+                return Some(hit);
+            }
+        }
+        if base64_budget > 0 {
+            let (decoded_values, checked) = decoded_hex_values(candidate, base64_budget);
+            base64_budget = base64_budget.saturating_sub(checked);
+            for decoded in decoded_values {
+                if let Some(hit) = body_signature_verdict(cfg, &decoded) {
+                    return Some(hit);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyDecodeError {
+    Invalid,
+    TooLarge,
+}
+
+fn decompress_waf_body(body: &[u8], content_encoding: &str) -> Result<Vec<u8>, BodyDecodeError> {
+    use std::io::Read;
+
+    let encoding = content_encoding.trim().to_ascii_lowercase();
+    if encoding.is_empty() || encoding == "identity" {
+        return Ok(body.to_vec());
+    }
+    let mut decoded = Vec::new();
+    let limit = WAF_DECOMPRESSED_BODY_LIMIT as u64 + 1;
+    let read = match encoding.as_str() {
+        "gzip" => flate2::read::MultiGzDecoder::new(body)
+            .take(limit)
+            .read_to_end(&mut decoded),
+        "deflate" => flate2::read::ZlibDecoder::new(body)
+            .take(limit)
+            .read_to_end(&mut decoded),
+        _ => return Ok(body.to_vec()),
+    };
+    if read.is_err() {
+        return Err(BodyDecodeError::Invalid);
+    }
+    if decoded.len() > WAF_DECOMPRESSED_BODY_LIMIT {
+        return Err(BodyDecodeError::TooLarge);
+    }
+    Ok(decoded)
+}
+
+fn collect_json_text(value: &serde_json::Value, output: &mut Vec<String>, limit: usize) {
+    if output.len() >= limit {
+        return;
+    }
+    match value {
+        serde_json::Value::String(value) => output.push(value.clone()),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_json_text(value, output, limit);
+                if output.len() >= limit {
+                    break;
+                }
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for (key, value) in values {
+                output.push(key.clone());
+                collect_json_text(value, output, limit);
+                if output.len() >= limit {
+                    break;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn body_text_pairs(body: &[u8], max_values: usize) -> Vec<String> {
+    let text = String::from_utf8_lossy(body);
+    let mut values = Vec::new();
+    for pair in text.split('&').take(max_values / 2) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        values.push(decode_form_component(key));
+        values.push(decode_form_component(value));
+    }
+    values
+}
+
+fn decode_form_component(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                decoded.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                let high = (bytes[index + 1] as char).to_digit(16);
+                let low = (bytes[index + 2] as char).to_digit(16);
+                if let (Some(high), Some(low)) = (high, low) {
+                    decoded.push((high * 16 + low) as u8);
+                    index += 3;
+                } else {
+                    decoded.push(bytes[index]);
+                    index += 1;
+                }
+            }
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+fn dangerous_upload_filename(body: &str) -> bool {
+    const SCRIPT_EXTENSIONS: &[&str] = &[
+        ".php", ".php3", ".php4", ".php5", ".php7", ".php8", ".phtml", ".pht", ".phtm", ".phps",
+        ".phar", ".asp", ".aspx", ".jsp", ".jspx", ".jspf", ".cgi", ".pl", ".sh", ".shtml", ".cfm",
+        ".cfml",
+    ];
+    let lower = body.to_ascii_lowercase();
+    for part in lower.split("filename").skip(1) {
+        let Some((_, value)) = part.split_once('=') else {
+            continue;
+        };
+        let value = value.split_once("''").map_or(value, |(_, value)| value);
+        let value = value
+            .trim_start_matches([' ', '\t', '"', '\''])
+            .split(['"', '\'', ';', '\r', '\n'])
+            .next()
+            .unwrap_or_default();
+        let decoded = decode_lower_twice(value);
+        if SCRIPT_EXTENSIONS
+            .iter()
+            .any(|extension| decoded.ends_with(extension))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn body_signature_verdict(cfg: &WafConfig, input: &str) -> Option<WafVerdict> {
+    let unicode_decoded = decode_unicode_escapes(input);
+    let percent_decoded = decode_lower_twice(&unicode_decoded);
+    let entity_decoded = decode_common_html_entities(&percent_decoded);
+    let normalized = decode_lower_twice(&entity_decoded);
+    let parts = ["", normalized.as_ref(), "", ""];
+    const FULL_SEPS: [char; 3] = ['?', ' ', ' '];
+    const URL_SEPS: [char; 1] = ['?'];
+    managed_verdict(cfg, &parts, &FULL_SEPS, &URL_SEPS, "", "")
+}
+
+fn decode_unicode_escapes(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut output = String::with_capacity(input.len());
+    let mut copied_until = 0;
+    let mut index = 0;
+    while index + 6 <= bytes.len() {
+        let marker = (bytes[index] == b'%' || bytes[index] == b'\\')
+            && bytes[index + 1].eq_ignore_ascii_case(&b'u');
+        if marker {
+            let digits = &input[index + 2..index + 6];
+            if let Ok(codepoint) = u32::from_str_radix(digits, 16) {
+                if let Some(character) = char::from_u32(codepoint) {
+                    output.push_str(&input[copied_until..index]);
+                    output.push(character);
+                    index += 6;
+                    copied_until = index;
+                    continue;
+                }
+            }
+        }
+        index += 1;
+    }
+    if copied_until == 0 {
+        return input.to_string();
+    }
+    output.push_str(&input[copied_until..]);
+    output
+}
+
+fn decode_common_html_entities(input: &str) -> String {
+    input
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#x3c;", "<")
+        .replace("&#x3e;", ">")
+        .replace("&#60;", "<")
+        .replace("&#62;", ">")
+        .replace("&#39;", "'")
+        .replace("&colon;", ":")
+}
+
+fn decoded_base64_values(input: &str, budget: usize) -> (Vec<String>, usize) {
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+    use base64::Engine as _;
+
+    let mut decoded_values = Vec::new();
+    let mut checked = 0;
+    for token in input.split(|character: char| {
+        !(character.is_ascii_alphanumeric() || matches!(character, '+' | '/' | '-' | '_' | '='))
+    }) {
+        if token.len() < 20 || token.len() > 8192 {
+            continue;
+        }
+        if checked >= budget {
+            break;
+        }
+        checked += 1;
+        let decoded = STANDARD
+            .decode(token)
+            .or_else(|_| STANDARD_NO_PAD.decode(token))
+            .or_else(|_| URL_SAFE.decode(token))
+            .or_else(|_| URL_SAFE_NO_PAD.decode(token));
+        let Ok(decoded) = decoded else {
+            continue;
+        };
+        let Ok(value) = String::from_utf8(decoded) else {
+            continue;
+        };
+        if !value.is_empty()
+            && value
+                .chars()
+                .filter(|character| !character.is_control())
+                .count()
+                * 10
+                >= value.chars().count() * 8
+        {
+            decoded_values.push(value);
+        }
+    }
+    (decoded_values, checked)
+}
+
+fn decoded_hex_values(input: &str, budget: usize) -> (Vec<String>, usize) {
+    let mut decoded_values = Vec::new();
+    let mut checked = 0;
+    for token in input.split(|character: char| !character.is_ascii_hexdigit()) {
+        if token.len() < 16 || token.len() > 8192 || token.len() % 2 != 0 {
+            continue;
+        }
+        if checked >= budget {
+            break;
+        }
+        checked += 1;
+        let mut bytes = Vec::with_capacity(token.len() / 2);
+        let mut valid = true;
+        for pair in token.as_bytes().chunks_exact(2) {
+            let pair = std::str::from_utf8(pair).unwrap_or_default();
+            match u8::from_str_radix(pair, 16) {
+                Ok(byte) => bytes.push(byte),
+                Err(_) => {
+                    valid = false;
+                    break;
+                }
+            }
+        }
+        if !valid {
+            continue;
+        }
+        let Ok(value) = String::from_utf8(bytes) else {
+            continue;
+        };
+        if !value.is_empty()
+            && value
+                .chars()
+                .filter(|character| !character.is_control())
+                .count()
+                * 10
+                >= value.chars().count() * 8
+        {
+            decoded_values.push(value);
+        }
+    }
+    (decoded_values, checked)
 }
 
 /// Exactly equivalent to `contains` on `parts.join(separators)`, without
@@ -1354,20 +1846,12 @@ fn eval_dsl(
 /// Whether the edge can evaluate a region: country / continent only
 /// (MaxMind Country has no province / city / ISP data).
 fn region_supported(rule: &RegionMatch) -> bool {
-    let has_geo = !rule.country.is_empty()
-        || !rule.continent.is_empty()
-        || !rule.countries.is_empty();
-    has_geo
-        && rule.province.is_empty()
-        && rule.city.is_empty()
-        && rule.isp.is_empty()
+    let has_geo =
+        !rule.country.is_empty() || !rule.continent.is_empty() || !rule.countries.is_empty();
+    has_geo && rule.province.is_empty() && rule.city.is_empty() && rule.isp.is_empty()
 }
 
-fn region_rule_matches(
-    rule: &RegionMatch,
-    country: Option<&str>,
-    continent: Option<&str>,
-) -> bool {
+fn region_rule_matches(rule: &RegionMatch, country: Option<&str>, continent: Option<&str>) -> bool {
     if !region_supported(rule) {
         return false;
     }
@@ -1385,6 +1869,16 @@ fn region_rule_matches(
 }
 
 pub fn evaluate(cfg: &WafConfig, req: &WafRequest) -> Option<WafVerdict> {
+    if let Some(ip) = req.ip {
+        if cfg.global_ip_deny.iter().any(|net| net.contains(ip)) {
+            return Some(WafVerdict {
+                action: WafAction::Block,
+                rule_name: "全局 IP 黑名单".into(),
+                category: "global_ip_deny".into(),
+            });
+        }
+    }
+
     if !cfg.enabled {
         return None;
     }
@@ -1476,6 +1970,9 @@ pub fn evaluate(cfg: &WafConfig, req: &WafRequest) -> Option<WafVerdict> {
 
     if let Some(verdict) = managed_verdict(cfg, &parts, &FULL_SEPS, &URL_SEPS, &ua, &path) {
         return Some(verdict);
+    }
+    if cfg.managed.scanners && scanner_header_matches(req.headers) {
+        return Some(verdict("Scanner fingerprint header", "scanners"));
     }
     if cfg.managed.crlf
         && (path.contains('\r')
@@ -1653,7 +2150,10 @@ mod tests {
     fn unsupported_region_allow_does_not_block_everyone() {
         let mut c = cfg();
         c.region_allow = vec![region("CN", "", "电信")];
-        assert!(!c.has_geo_allow(), "ISP region must not arm the allow-list gate");
+        assert!(
+            !c.has_geo_allow(),
+            "ISP region must not arm the allow-list gate"
+        );
         c.region_allow.push(region("CN", "", ""));
         assert!(c.has_geo_allow());
         assert!(region_rule_matches(&c.region_allow[1], Some("cn"), None));
@@ -2544,7 +3044,7 @@ mod geo_policy_tests {
                 referer: "",
                 ip: Some("198.51.100.10".parse().unwrap()),
                 country: None,
-            continent: None,
+                continent: None,
                 asn: None,
                 headers: &h,
             };
@@ -2609,7 +3109,7 @@ mod geo_policy_tests {
                 referer: "",
                 ip: Some("198.51.100.10".parse().unwrap()),
                 country: None,
-            continent: None,
+                continent: None,
                 asn: None,
                 headers: &h,
             };
@@ -2690,7 +3190,7 @@ mod geo_policy_tests {
                 referer: "",
                 ip: Some("198.51.100.10".parse().unwrap()),
                 country: None,
-            continent: None,
+                continent: None,
                 asn: None,
                 headers: &h,
             };

@@ -15,8 +15,8 @@ pub mod config_release;
 pub mod dns_admin;
 pub mod dns_nodes;
 pub mod dns_providers;
-pub mod dns_zones;
 pub mod dns_test;
+pub mod dns_zones;
 pub mod domain;
 pub mod domain_diag;
 pub mod edge_endpoints;
@@ -82,10 +82,7 @@ pub fn create_router(state: AppState) -> Router {
                     get(system::check_update).post(system::apply_update),
                 )
                 .route("/system/update/status", get(system::update_status))
-                .route(
-                    "/system/geoip",
-                    get(geoip::status).post(geoip::update),
-                )
+                .route("/system/geoip", get(geoip::status).post(geoip::update))
                 .route("/geoip/meta", get(geoip::agent_meta))
                 .route("/geoip/country.mmdb", get(geoip::agent_country))
                 .route("/users", get(user::list).post(user::create))
@@ -148,16 +145,13 @@ pub fn create_router(state: AppState) -> Router {
                 .route("/domains/:id/cdn", post(domain::set_cdn_enabled))
                 .route("/domains/:id/cache", post(domain::set_cache_enabled))
                 .route("/domains/:id/signed-url", post(domain::create_signed_url))
-                .route("/domains/:id/signed-url/rotate", post(domain::rotate_signed_url))
+                .route(
+                    "/domains/:id/signed-url/rotate",
+                    post(domain::rotate_signed_url),
+                )
                 .route("/domains/:id/diagnose", post(domain_diag::diagnose))
-                .route(
-                    "/domains/:id/access-status",
-                    get(domain::access_status),
-                )
-                .route(
-                    "/domains/:id/auto-https",
-                    post(domain::trigger_auto_https),
-                )
+                .route("/domains/:id/access-status", get(domain::access_status))
+                .route("/domains/:id/auto-https", post(domain::trigger_auto_https))
                 .route("/edge-endpoints", get(edge_endpoints::list))
                 .route("/rules", get(rule::list).post(rule::create))
                 .route("/rules/test", post(rule::test))
@@ -173,6 +167,7 @@ pub fn create_router(state: AppState) -> Router {
                 )
                 .route("/geo-catalog", get(geo_region::catalog))
                 .route("/ip-lists", get(ip_list::list).post(ip_list::create))
+                .route("/waf/global-ips/ban", post(ip_list::quick_ban_global))
                 .route(
                     "/ip-lists/:id",
                     put(ip_list::update).delete(ip_list::delete),
@@ -245,18 +240,12 @@ pub fn create_router(state: AppState) -> Router {
                     "/domains/:id/waf/ips",
                     get(waf::list_ips).post(waf::create_ip),
                 )
-                .route(
-                    "/waf/ips/:id",
-                    put(waf::update_ip).delete(waf::delete_ip),
-                )
+                .route("/waf/ips/:id", put(waf::update_ip).delete(waf::delete_ip))
                 .route(
                     "/domains/:id/waf/geo",
                     get(waf::list_geo).post(waf::create_geo),
                 )
-                .route(
-                    "/waf/geo/:id",
-                    put(waf::update_geo).delete(waf::delete_geo),
-                )
+                .route("/waf/geo/:id", put(waf::update_geo).delete(waf::delete_geo))
                 .route("/waf/rulesets", get(waf::list_rulesets))
                 .route("/waf/rulepacks", get(waf::list_rulepacks))
                 .route("/waf/rulepacks/publish", post(waf::publish_rulepack))
@@ -264,10 +253,7 @@ pub fn create_router(state: AppState) -> Router {
                     "/waf/rulepacks/:version/rollback",
                     post(waf::rollback_rulepack),
                 )
-                .route(
-                    "/waf/rulepacks/:version/retire",
-                    post(waf::retire_rulepack),
-                )
+                .route("/waf/rulepacks/:version/retire", post(waf::retire_rulepack))
                 .route("/waf/rulepacks/:version", delete(waf::delete_rulepack))
                 .route("/waf/rulepack/:version", get(waf::download_rulepack))
                 .route(
@@ -282,10 +268,7 @@ pub fn create_router(state: AppState) -> Router {
                     "/dns/settings",
                     get(dns_admin::get_settings).put(dns_admin::put_settings),
                 )
-                .route(
-                    "/dns/settings/public-check",
-                    get(dns_admin::public_check),
-                )
+                .route("/dns/settings/public-check", get(dns_admin::public_check))
                 .route(
                     "/dns/providers",
                     get(dns_providers::list).post(dns_providers::create),
@@ -297,10 +280,7 @@ pub fn create_router(state: AppState) -> Router {
                 .route("/dns/sync", get(dns_admin::sync))
                 .route("/dns/resolve-line", get(dns_admin::resolve_line))
                 .route("/dns/heartbeat", post(dns_nodes::heartbeat))
-                .route(
-                    "/dns/nodes",
-                    get(dns_nodes::list).post(dns_nodes::create),
-                )
+                .route("/dns/nodes", get(dns_nodes::list).post(dns_nodes::create))
                 .route(
                     "/dns/nodes/:id",
                     put(dns_nodes::update).delete(dns_nodes::delete),
@@ -350,7 +330,10 @@ pub fn create_router(state: AppState) -> Router {
                     "/remote/nodes/:id/ssh/reset-key",
                     post(remote::reset_host_key),
                 )
-                .route("/remote/ops", get(remote::list_ops).post(remote::create_ops))
+                .route(
+                    "/remote/ops",
+                    get(remote::list_ops).post(remote::create_ops),
+                )
                 .route("/remote/ops/:id", get(remote::get_op))
                 .route("/remote/dns-nodes", get(remote::list_dns_nodes))
                 .route(
@@ -476,9 +459,7 @@ pub fn create_router(state: AppState) -> Router {
 /// CORS at all, so an empty list keeps working: it preserves the previous
 /// behaviour and lets operators tighten it with `CORS_ALLOWED_ORIGINS`.
 fn build_cors(allowed: &[String]) -> CorsLayer {
-    let base = CorsLayer::new()
-        .allow_methods(Any)
-        .allow_headers(Any);
+    let base = CorsLayer::new().allow_methods(Any).allow_headers(Any);
     if allowed.is_empty() {
         return base.allow_origin(Any);
     }
@@ -486,17 +467,21 @@ fn build_cors(allowed: &[String]) -> CorsLayer {
         .iter()
         // `HeaderValue::from_str` rejects CR/LF and other non-ASCII bytes, so a
         // malformed entry can never be used for header injection.
-        .filter_map(|origin| match axum::http::HeaderValue::from_str(origin.trim()) {
-            Ok(value) => Some(value),
-            Err(_) => {
-                tracing::warn!(origin = %origin, "ignoring invalid CORS_ALLOWED_ORIGINS entry");
-                None
-            }
-        })
+        .filter_map(
+            |origin| match axum::http::HeaderValue::from_str(origin.trim()) {
+                Ok(value) => Some(value),
+                Err(_) => {
+                    tracing::warn!(origin = %origin, "ignoring invalid CORS_ALLOWED_ORIGINS entry");
+                    None
+                }
+            },
+        )
         .collect();
     if origins.is_empty() {
         // Every entry was invalid: fail closed rather than silently opening up.
-        tracing::error!("CORS_ALLOWED_ORIGINS contains no valid origin; cross-origin requests are denied");
+        tracing::error!(
+            "CORS_ALLOWED_ORIGINS contains no valid origin; cross-origin requests are denied"
+        );
         return base.allow_origin(Vec::<axum::http::HeaderValue>::new());
     }
     base.allow_origin(origins)

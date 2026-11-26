@@ -48,16 +48,16 @@ const stats = ref<any>({
 const statsLoading = ref(false)
 
 const securityLevels = [
-  { value: 'off', label: '关闭' },
-  { value: 'low', label: '低' },
-  { value: 'medium', label: '中' },
-  { value: 'high', label: '高' },
+  { value: 'off', label: '关闭质询' },
+  { value: 'low', label: '基础' },
+  { value: 'medium', label: '标准' },
+  { value: 'high', label: '严格' },
   { value: 'under_attack', label: '攻击中' },
 ]
 
 const levelHint = computed(() => {
   const hints: Record<string, string> = {
-    off: '只执行 IP 名单与显式规则，不按安全级别额外要求验证。',
+    off: '不额外发起浏览器质询；托管规则、自定义规则和名单仍由 WAF 总开关控制。',
     low: '对空浏览器标识的浏览请求发起安全验证。',
     medium: '在低级别基础上，对常见扫描工具与空浏览器标识发起安全验证。',
     high: '对所有网页浏览请求发起安全验证，静态资源除外。',
@@ -99,6 +99,8 @@ const rulepackBusy = ref(false)
 const ips = ref<any[]>([])
 const ipBindings = ref<any[]>([])
 const availableIpLists = ref<any[]>([])
+const globalIpLists = ref<any[]>([])
+const activeGlobalIpListCount = computed(() => globalIpLists.value.filter((l) => l.enabled).length)
 const bindListOpen = ref(false)
 const bindListId = ref('')
 const bindSaving = ref(false)
@@ -142,7 +144,10 @@ watch(
 const events = ref<any[]>([])
 const eventsLoading = ref(false)
 const eventAction = ref('')
-const eventLimit = ref(100)
+const eventPage = ref(1)
+const eventPageSize = ref(100)
+const eventLimit = eventPageSize
+const eventHasMore = ref(false)
 
 const bans = ref<any[]>([])
 const bansLoading = ref(false)
@@ -176,6 +181,7 @@ const ipModalOpen = ref(false)
 const ipError = ref('')
 const editingIp = ref<any>(null)
 const ipForm = ref({ kind: 'deny', ip: '', note: '', enabled: true })
+const quickBanBusy = ref<string | number | null>(null)
 const geoModalOpen = ref(false)
 const geoError = ref('')
 const editingGeo = ref<any>(null)
@@ -259,32 +265,16 @@ async function loadStats() {
   }
 }
 
-const filteredEvents = computed(() => {
-  if (!eventAction.value) return events.value
-  return events.value.filter((e) => e.action === eventAction.value)
-})
-
-const eventPage = ref(1)
-const eventPageSize = ref(20)
-const pagedEvents = computed(() => {
-  const start = (eventPage.value - 1) * eventPageSize.value
-  return filteredEvents.value.slice(start, start + eventPageSize.value)
-})
+const filteredEvents = computed(() => events.value)
+const pagedEvents = computed(() => events.value)
 watch(eventAction, () => {
   eventPage.value = 1
+  if (section.value === 'events') loadEvents()
 })
 watch(eventLimit, () => {
   eventPage.value = 1
+  if (section.value === 'events') loadEvents()
 })
-watch(
-  () => filteredEvents.value.length,
-  (total) => {
-    eventPage.value = Math.min(
-      eventPage.value,
-      Math.max(1, Math.ceil(total / eventPageSize.value)),
-    )
-  },
-)
 
 function fieldLabel(field: string) {
   if (field && field.startsWith('header:')) return `请求头 ${field.slice(7)}`
@@ -345,7 +335,7 @@ function categoryLabel(category: string) {
       region_deny: '地区黑名单',
       asn_deny: '网络号黑名单',
       custom: '自定义规则',
-      security_level: '安全级别',
+      security_level: '浏览器质询',
     } as Record<string, string>
   )[category] || category || '—'
 }
@@ -525,15 +515,18 @@ async function loadRules() {
 async function loadIps() {
   if (!domainId.value) return
   try {
-    const [rows, bindings] = await Promise.all([
+    const [rows, bindings, lists] = await Promise.all([
       api.get<any[]>(`/api/v1/domains/${domainId.value}/waf/ips`),
       api.get<any[]>(`/api/v1/domains/${domainId.value}/waf/ip-lists`),
+      api.get<any[]>('/api/v1/ip-lists').catch(() => []),
     ])
     ips.value = rows || []
     ipBindings.value = bindings || []
+    globalIpLists.value = (lists || []).filter((l) => l.applies_globally && l.list_type === 'black')
   } catch (e: any) {
     ips.value = []
     ipBindings.value = []
+    globalIpLists.value = []
     toast.error(e?.data?.error || e?.message || '加载 IP 名单失败')
   }
 }
@@ -541,7 +534,9 @@ async function loadIps() {
 async function openBindListModal() {
   availableIpLists.value = (await api.get<any[]>('/api/v1/ip-lists').catch(() => [])) || []
   const bound = new Set(ipBindings.value.map((b) => b.list_id))
-  availableIpLists.value = availableIpLists.value.filter((l) => !bound.has(l.id))
+  availableIpLists.value = availableIpLists.value.filter(
+    (l) => !bound.has(l.id) && !l.applies_globally,
+  )
   bindListId.value = availableIpLists.value[0]?.id || ''
   bindListOpen.value = true
 }
@@ -623,11 +618,16 @@ async function loadEvents() {
   try {
     const q = new URLSearchParams({
       domain: domains.value.find((d) => d.id === domainId.value)?.name || '',
-      limit: String(eventLimit.value),
+      page: String(eventPage.value),
+      page_size: String(eventPageSize.value),
     })
-    events.value = (await api.get<any[]>(`/api/v1/waf/events?${q.toString()}`)) || []
+    if (eventAction.value) q.set('action', eventAction.value)
+    const result = await api.get<any>(`/api/v1/waf/events?${q.toString()}`)
+    events.value = result?.items || []
+    eventHasMore.value = !!result?.has_more
   } catch (e: any) {
     events.value = []
+    eventHasMore.value = false
     toast.error(e?.data?.error || e?.message || '加载 WAF 事件失败')
   } finally {
     eventsLoading.value = false
@@ -1082,6 +1082,31 @@ async function saveIp() {
   }
 }
 
+async function quickBanEventIp(event: any) {
+  const ip = String(event?.client_ip || '').trim()
+  if (!domainId.value || !ip || quickBanBusy.value !== null) return
+  quickBanBusy.value = event.id
+  try {
+    await api.post(`/api/v1/domains/${domainId.value}/waf/ips`, {
+      kind: 'deny',
+      ip,
+      note: `WAF event ${event.category || ''} ${event.rule_name || ''}`.trim(),
+      enabled: true,
+    })
+    toast.success(`${ip} 已加入本站 WAF 黑名单`)
+    await loadIps()
+  } catch (e: any) {
+    const message = e?.data?.error || ''
+    if (message.includes('already exists')) {
+      toast.success(`${ip} 已在本站 WAF 黑名单`)
+    } else {
+      toast.error(message || '拉黑失败')
+    }
+  } finally {
+    quickBanBusy.value = null
+  }
+}
+
 async function toggleIp(ip: any) {
   try {
     await api.put(`/api/v1/waf/ips/${ip.id}`, {
@@ -1207,11 +1232,6 @@ watch(domainId, async (id) => {
   }
 })
 
-watch(eventLimit, () => {
-  // action is client-filtered; only limit changes need a refetch
-  if (section.value === 'events') loadEvents()
-})
-
 watch(
   () => String(route.query.domain || ''),
   (q) => {
@@ -1280,6 +1300,8 @@ onMounted(reload)
     removeRule,
     openIpModal,
     saveIp,
+    quickBanEventIp,
+    quickBanBusy,
     toggleIp,
     removeIp,
     openGeoModal,
@@ -1307,6 +1329,8 @@ onMounted(reload)
     ips,
     ipBindings,
     availableIpLists,
+    globalIpLists,
+    activeGlobalIpListCount,
     bindListOpen,
     bindListId,
     bindSaving,
@@ -1324,6 +1348,7 @@ onMounted(reload)
     eventsLoading,
     eventAction,
     eventLimit,
+    eventHasMore,
     bans,
     bansLoading,
     bansError,

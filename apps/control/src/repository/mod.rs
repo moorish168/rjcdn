@@ -662,8 +662,16 @@ pub async fn create_domain(
     origin_proto: &str,
     ssl_enabled: bool,
 ) -> sqlx::Result<DomainRow> {
-    create_domain_with_project(pool, name, origin_host, origin_port, origin_proto, ssl_enabled, None)
-        .await
+    create_domain_with_project(
+        pool,
+        name,
+        origin_host,
+        origin_port,
+        origin_proto,
+        ssl_enabled,
+        None,
+    )
+    .await
 }
 
 pub async fn delete_domain(pool: &PgPool, id: Uuid) -> sqlx::Result<u64> {
@@ -1053,9 +1061,9 @@ pub async fn node_token_exists(pool: &PgPool, token: &str) -> sqlx::Result<bool>
     let row: Option<(i32,)> = sqlx::query_as(
         "SELECT 1 FROM edge_nodes WHERE auth_token = $1 AND status <> 'disabled' LIMIT 1",
     )
-            .bind(token)
-            .fetch_optional(pool)
-            .await?;
+    .bind(token)
+    .fetch_optional(pool)
+    .await?;
     Ok(row.is_some())
 }
 
@@ -1067,9 +1075,9 @@ pub async fn node_name_for_token(pool: &PgPool, token: &str) -> sqlx::Result<Opt
     let row: Option<(String,)> = sqlx::query_as(
         "SELECT name FROM edge_nodes WHERE auth_token = $1 AND status <> 'disabled' LIMIT 1",
     )
-            .bind(token)
-            .fetch_optional(pool)
-            .await?;
+    .bind(token)
+    .fetch_optional(pool)
+    .await?;
     Ok(row.map(|r| r.0))
 }
 
@@ -2976,7 +2984,10 @@ pub async fn auto_https_queue(pool: &PgPool, id: Uuid, reset_attempts: bool) -> 
 }
 
 /// When the next automatic attempt is allowed (None = now).
-pub async fn auto_https_next_attempt(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<DateTime<Utc>>> {
+pub async fn auto_https_next_attempt(
+    pool: &PgPool,
+    id: Uuid,
+) -> sqlx::Result<Option<DateTime<Utc>>> {
     sqlx::query_scalar("SELECT cert_next_attempt_at FROM domains WHERE id = $1")
         .bind(id)
         .fetch_optional(pool)
@@ -3347,6 +3358,7 @@ pub async fn list_access_logs(
     status_min: Option<i32>,
     status_max: Option<i32>,
     limit: i64,
+    offset: i64,
 ) -> sqlx::Result<Vec<AccessLogRow>> {
     sqlx::query_as::<_, AccessLogRow>(
         r#"
@@ -3358,8 +3370,8 @@ pub async fn list_access_logs(
           AND ($2::text[] IS NULL OR host = ANY($2))
           AND ($3::int IS NULL OR status >= $3)
           AND ($4::int IS NULL OR status < $4)
-        ORDER BY ts DESC
-        LIMIT $5
+        ORDER BY ts DESC, id DESC
+        LIMIT $5 OFFSET $6
         "#,
     )
     .bind(host.filter(|s| !s.is_empty()))
@@ -3367,6 +3379,7 @@ pub async fn list_access_logs(
     .bind(status_min)
     .bind(status_max)
     .bind(limit)
+    .bind(offset)
     .fetch_all(pool)
     .await
 }
@@ -4322,6 +4335,7 @@ pub async fn list_waf_events(
     visible_domains: Option<Vec<String>>,
     action: Option<&str>,
     limit: i64,
+    offset: i64,
 ) -> sqlx::Result<Vec<WafEventRow>> {
     // Visibility filtering must happen before LIMIT. Filtering the newest 500
     // rows in Rust let one noisy tenant fill the page and hid a smaller
@@ -4333,13 +4347,14 @@ pub async fn list_waf_events(
         WHERE ($1::text IS NULL OR domain = $1)
           AND ($2::text[] IS NULL OR domain = ANY($2))
           AND ($3::text IS NULL OR action = $3)
-        ORDER BY ts DESC LIMIT $4
+        ORDER BY ts DESC, id DESC LIMIT $4 OFFSET $5
         "#,
     )
     .bind(domain.filter(|d| !d.is_empty()))
     .bind(visible_domains)
     .bind(action.filter(|a| !a.is_empty()))
     .bind(limit)
+    .bind(offset)
     .fetch_all(pool)
     .await
 }
@@ -4958,7 +4973,10 @@ pub async fn get_dns_zone_meta(pool: &PgPool, zone_id: Uuid) -> sqlx::Result<Opt
     .await
 }
 
-pub async fn get_dns_zone_meta_by_name(pool: &PgPool, name: &str) -> sqlx::Result<Option<DnsZoneMeta>> {
+pub async fn get_dns_zone_meta_by_name(
+    pool: &PgPool,
+    name: &str,
+) -> sqlx::Result<Option<DnsZoneMeta>> {
     let name = name.trim().trim_end_matches('.').to_ascii_lowercase();
     sqlx::query_as::<_, DnsZoneMeta>(
         r#"
@@ -5015,7 +5033,10 @@ pub async fn platform_ns_entries(pool: &PgPool) -> sqlx::Result<Vec<PlatformNsRo
     .await
 }
 
-pub async fn get_dns_zone_by_name(pool: &PgPool, name: &str) -> sqlx::Result<Option<(Uuid, String)>> {
+pub async fn get_dns_zone_by_name(
+    pool: &PgPool,
+    name: &str,
+) -> sqlx::Result<Option<(Uuid, String)>> {
     let name = name.trim().trim_end_matches('.').to_ascii_lowercase();
     sqlx::query_as::<_, (Uuid, String)>(
         r#"
@@ -5148,7 +5169,10 @@ pub async fn sync_zone_ns_from_platform(pool: &PgPool, zone_id: Uuid) -> sqlx::R
 ///
 /// Zones added on the 域名与记录 page used to get no NS at all, so lagran-dns
 /// skipped them and their records were never served.
-pub async fn propagate_schedule_ns_to_ns_zones(pool: &PgPool, previous_ns: &[String]) -> sqlx::Result<u64> {
+pub async fn propagate_schedule_ns_to_ns_zones(
+    pool: &PgPool,
+    previous_ns: &[String],
+) -> sqlx::Result<u64> {
     let mut previous: Vec<String> = previous_ns
         .iter()
         .map(|n| n.trim().trim_end_matches('.').to_ascii_lowercase())
@@ -5635,11 +5659,12 @@ pub async fn sync_domain_access_dns(
     if names.is_empty() {
         names.push(primary_name.to_string());
     }
-    let project_id: Option<Uuid> = sqlx::query_scalar("SELECT project_id FROM domains WHERE id = $1")
-        .bind(domain_id)
-        .fetch_optional(pool)
-        .await?
-        .flatten();
+    let project_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT project_id FROM domains WHERE id = $1")
+            .bind(domain_id)
+            .fetch_optional(pool)
+            .await?
+            .flatten();
     if mode == "ns" {
         let apex = crate::service::auto_https::site_apex(primary_name);
         let zone_id = ensure_ns_hosted_zone(pool, &apex, &names, project_id).await?;

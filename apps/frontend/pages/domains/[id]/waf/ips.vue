@@ -82,6 +82,7 @@ const {
   ips,
   ipBindings,
   availableIpLists,
+  activeGlobalIpListCount,
   bindListOpen,
   bindListId,
   bindSaving,
@@ -142,9 +143,14 @@ const {
 <template>
   <div class="card-body tight">
 
+          <div class="global-ip-notice">
+            <span>本站自动继承 {{ activeGlobalIpListCount }} 个启用的全局黑名单。全局黑名单优先于本站白名单，本站 WAF 关闭时仍会拦截。</span>
+            <NuxtLink to="/ip-lists" class="btn btn-text btn-sm">管理全局名单</NuxtLink>
+          </div>
+
           <div class="filter-bar">
             <span class="text-muted" style="font-size: 13px">
-              白名单优先于所有规则；黑名单命中后直接拦截。支持单条 IP/CIDR，也可引用可复用 IP 名单
+              本站白名单优先于本站规则；本站黑名单命中后直接拦截。支持单条 IP/CIDR，也可引用可复用 IP 名单
             </span>
             <span class="spacer" />
             <button class="btn btn-default btn-sm" type="button" @click="openBindListModal">
@@ -243,7 +249,7 @@ const {
               <AppPagination v-model:page="ipPage" :total="ips.length" :page-size="ipPageSize" />
             </div>
             <EmptyState
-              v-if="!ips.length && !ipBindings.length"
+              v-if="!ips.length && !ipBindings.length && !activeGlobalIpListCount"
               icon="shield"
               title="还没有 IP 名单"
               text="添加单条 IP/CIDR，或从「IP 名单」库引用可复用黑白名单。"
@@ -257,3 +263,26 @@ const {
         
   </div>
 </template>
+
+<style scoped>
+.global-ip-notice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--brand-bg);
+  color: var(--text-2);
+  font-size: 13px;
+}
+
+@media (max-width: 720px) {
+  .global-ip-notice {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}
+</style>

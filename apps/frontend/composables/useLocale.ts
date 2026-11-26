@@ -27,6 +27,7 @@ const DICT: Record<string, { zh: string; en: string }> = {
   'nav.cacheDebug': { zh: '缓存诊断', en: 'Cache Debug' },
   'nav.waf': { zh: 'WAF 防护', en: 'WAF' },
   'nav.ipLists': { zh: 'IP 名单', en: 'IP Lists' },
+  'nav.wafEvents': { zh: 'WAF 事件', en: 'WAF Events' },
   'nav.certs': { zh: '证书管理', en: 'Certificates' },
   'nav.purge': { zh: '缓存刷新', en: 'Purge' },
   'nav.prefetch': { zh: '缓存预热', en: 'Prefetch' },

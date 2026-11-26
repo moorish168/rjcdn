@@ -3,7 +3,7 @@
     <div class="page-head">
       <div>
         <div class="page-title">IP 名单</div>
-        <div class="page-desc">可复用的黑名单 / 白名单，供 WAF 策略引用</div>
+        <div class="page-desc">可复用的名单供站点引用；管理员也可创建自动应用到所有站点的全局黑名单。</div>
       </div>
       <button class="btn btn-primary" type="button" @click="openCreate">新建名单</button>
     </div>
@@ -18,6 +18,7 @@
                 <tr>
                   <th>名称</th>
                   <th>类型</th>
+                  <th>范围</th>
                   <th>条目</th>
                   <th>状态</th>
                   <th style="width: 180px">操作</th>
@@ -27,6 +28,7 @@
                 <tr v-for="l in lists" :key="l.id">
                   <td>{{ l.name }}</td>
                   <td>{{ l.list_type === 'white' ? '白名单' : '黑名单' }}</td>
+                  <td>{{ l.applies_globally ? '全站自动' : l.project_id ? '项目内' : '手动绑定' }}</td>
                   <td>{{ l.entry_count }}</td>
                   <td>{{ l.enabled ? '启用' : '停用' }}</td>
                   <td>
@@ -61,6 +63,15 @@
             <option value="black">黑名单</option>
             <option value="white">白名单</option>
           </select>
+        </div>
+        <div v-if="auth.isAdmin && form.list_type === 'black'" class="field">
+          <label class="check-row">
+            <input v-model="form.applies_globally" type="checkbox" />
+            <span>
+              <strong>全局黑名单</strong>
+              <small>自动应用到所有站点，优先于站点白名单，站点 WAF 关闭时仍会拦截。</small>
+            </span>
+          </label>
         </div>
         <div class="field">
           <label class="field-label">备注</label>
@@ -120,6 +131,7 @@ import { friendlyErrorMessage } from '~/utils/friendlyError'
 const api = useApi()
 const toast = useToast()
 const { ask } = useConfirm()
+const auth = useAuthStore()
 
 const lists = ref<any[]>([])
 const entries = ref<any[]>([])
@@ -129,7 +141,7 @@ const entryOpen = ref(false)
 const saving = ref(false)
 const loading = ref(false)
 const busy = ref(false)
-const form = reactive({ name: '', list_type: 'black', note: '' })
+const form = reactive({ name: '', list_type: 'black', note: '', applies_globally: false })
 const entryForm = reactive({ cidr: '', note: '' })
 
 async function load() {
@@ -148,8 +160,13 @@ function openCreate() {
   form.name = ''
   form.list_type = 'black'
   form.note = ''
+  form.applies_globally = false
   createOpen.value = true
 }
+
+watch(() => form.list_type, (value) => {
+  if (value !== 'black') form.applies_globally = false
+})
 
 async function createList() {
   if (!form.name.trim()) {
@@ -247,3 +264,26 @@ async function removeList(l: any) {
 
 onMounted(load)
 </script>
+
+<style scoped>
+.check-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  color: var(--text-1);
+}
+
+.check-row input {
+  margin-top: 3px;
+}
+
+.check-row span {
+  display: grid;
+  gap: 4px;
+}
+
+.check-row small {
+  color: var(--text-3);
+  line-height: 1.5;
+}
+</style>

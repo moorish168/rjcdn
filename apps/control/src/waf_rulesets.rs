@@ -69,9 +69,9 @@ const SCANNER_GUARD_LABELS: &[&str] = &["扫描器与敏感路径", "协议异�
 pub const CATALOG: &[ManagedRuleset] = &[
     ManagedRuleset {
         id: "owasp-core",
-        name: "OWASP 核心防护",
-        version: "2026.11",
-        description: "覆盖 SQL 注入、XSS、路径穿越、命令执行、SSRF、XXE、Log4Shell 与协议异常。",
+        name: "核心攻击防护",
+        version: "2026.11.26",
+        description: "覆盖注入、脚本攻击、路径穿越、敏感文件探测、命令执行、SSRF 与协议异常。",
         severity: "high",
         recommended: true,
         categories: OWASP_CORE,
@@ -80,7 +80,7 @@ pub const CATALOG: &[ManagedRuleset] = &[
     ManagedRuleset {
         id: "injection-extended",
         name: "注入扩展防护",
-        version: "2026.11",
+        version: "2026.11.26",
         description: "补充模板注入、NoSQL、LDAP、Java 反序列化与 WebShell 特征。",
         severity: "high",
         recommended: true,
@@ -90,7 +90,7 @@ pub const CATALOG: &[ManagedRuleset] = &[
     ManagedRuleset {
         id: "ssrf-xxe",
         name: "SSRF / XXE 防护",
-        version: "2026.11",
+        version: "2026.11.26",
         description: "针对云元数据访问、内网探测与外部实体注入的专项规则。",
         severity: "medium",
         recommended: false,
@@ -100,8 +100,8 @@ pub const CATALOG: &[ManagedRuleset] = &[
     ManagedRuleset {
         id: "scanner-guard",
         name: "扫描器与协议基线",
-        version: "2026.11",
-        description: "拦截常见漏洞扫描器 UA、敏感探测路径、空字节和超长请求。",
+        version: "2026.11.26",
+        description: "识别常见扫描器 UA/请求头、敏感文件与备份后缀探测及协议异常。",
         severity: "low",
         recommended: false,
         categories: SCANNER_GUARD,
@@ -233,10 +233,7 @@ mod tests {
 
     #[test]
     fn validates_and_orders_ids() {
-        let ids = vec![
-            "scanner-guard".to_string(),
-            "unknown".to_string(),
-        ];
+        let ids = vec!["scanner-guard".to_string(), "unknown".to_string()];
         assert!(validate_ids(&ids).is_err());
         let ids = vec!["scanner-guard".to_string(), "owasp-core".to_string()];
         let out = validate_ids(&ids).unwrap();

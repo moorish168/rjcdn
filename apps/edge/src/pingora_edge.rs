@@ -9,39 +9,38 @@
 
 use crate::cache::large::{ChunkPlan, FillBudget, LargeEntry, RangeWriter};
 use crate::cache::policy::{
-    ResolvedPolicy, RuleAction, VALIDATOR_SOURCE_HEADER, apply_key_ignore_default, compute_etag,
-    decide_storage_reason, decide_storage_reason_map, request_bypass_reason_headers,
-    resolve_rule_policy_for_response,
+    apply_key_ignore_default, compute_etag, decide_storage_reason, decide_storage_reason_map,
+    request_bypass_reason_headers, resolve_rule_policy_for_response, ResolvedPolicy, RuleAction,
+    VALIDATOR_SOURCE_HEADER,
 };
 use crate::cache::{CacheBackend, CacheSource};
-use crate::config::EdgeConfig;
 use crate::config::registry::{DomainEntry, OriginTarget};
+use crate::config::EdgeConfig;
 use crate::origin_dns::OriginDnsCache;
 use crate::security::header_guard;
 use crate::security::origin_auth;
 use crate::security::signed_url;
 use crate::server::cert_store::CertStore;
 use crate::server::challenge;
-use crate::server::compression::{CompressionConfig, GzipEncoder, replay_chunk, should_compress};
+use crate::server::compression::{replay_chunk, should_compress, CompressionConfig, GzipEncoder};
 use crate::server::default_page::{self, OriginFailure};
 use crate::server::handler::{
-    AppState, apply_browser_ttl, apply_cors_and_custom, apply_security_headers, hotlink_allowed,
-    log_access, policy_browser_ttl, proxy_handler,
+    apply_browser_ttl, apply_cors_and_custom, apply_security_headers, hotlink_allowed, log_access,
+    policy_browser_ttl, proxy_handler, AppState,
 };
 use crate::server::host_util::normalized_authority_host;
-use crate::server::native_cache::{META_HEADER, NativeStorage, leak_storage_with_large};
+use crate::server::native_cache::{leak_storage_with_large, NativeStorage, META_HEADER};
 use crate::server::pipeline::{RequestFacts, RequestPipeline};
 use crate::server::purge;
 use async_trait::async_trait;
-use axum::Json;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, State};
 use axum::http::{
-    HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri, Version, header,
+    header, HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri, Version,
 };
+use axum::Json;
 use bytes::{Bytes, BytesMut};
 use http_body_util::BodyExt;
-use pingora::Result;
 use pingora::apps::HttpServerOptions;
 use pingora::http::ResponseHeader;
 use pingora::listeners::tls::TlsSettings;
@@ -51,6 +50,7 @@ use pingora::proxy::{FailToProxy, ProxyHttp, ProxyServiceBuilder, Session};
 use pingora::server::Server;
 use pingora::tls::{ext, ssl};
 use pingora::upstreams::peer::HttpPeer;
+use pingora::Result;
 use pingora_cache::lock::CacheLock;
 use pingora_cache::{
     CacheKey, CacheMeta, CacheOptionOverrides, CachePhase, ForcedFreshness, NoCacheReason,
@@ -1452,6 +1452,7 @@ impl ProxyHttp for DataPlaneProxy {
             )));
         }
         if resp.headers.contains_key("set-cookie") {
+            ctx.response_bypass = true;
             ctx.cache_reason = Some("set-cookie");
             return Ok(RespCacheable::Uncacheable(NoCacheReason::Custom(
                 "set-cookie",
@@ -1490,6 +1491,10 @@ impl ProxyHttp for DataPlaneProxy {
         ) {
             Ok(decision) => decision,
             Err(reason) => {
+                // Responses rejected by cache policy (including non-cacheable
+                // statuses such as 404) are not cache misses. Keep them out of
+                // the hit-ratio denominator just like request-side bypasses.
+                ctx.response_bypass = true;
                 ctx.cache_reason = Some(reason);
                 return Ok(RespCacheable::Uncacheable(NoCacheReason::Custom(
                     "cache policy",
@@ -1686,9 +1691,10 @@ impl ProxyHttp for DataPlaneProxy {
                             .filter(|v| !v.is_empty())
                             .map(|v| format!("last-modified:{v}"))
                     });
-                if let (Some(validator), true) =
-                    (validator.as_deref(), plan.cacheable && ctx.identity_ttl_secs.is_some())
-                {
+                if let (Some(validator), true) = (
+                    validator.as_deref(),
+                    plan.cacheable && ctx.identity_ttl_secs.is_some(),
+                ) {
                     let key = webp_variant_key(&plan.key, validator);
                     if let Some(cached) = self.state.compressed.get(&key).await {
                         if !cached.body.is_empty() {
@@ -2306,6 +2312,16 @@ impl DataPlaneProxy {
     ) -> Option<NativePlan> {
         let req = session.req_header();
         let is_websocket = is_websocket_upgrade(&req.headers);
+        // The native stream path cannot inspect a complete payload before it
+        // reaches the origin. Route bounded, fixed-length text bodies through
+        // the in-process handler, which buffers the body and replays it after
+        // WAF evaluation. Large and streaming uploads remain on Pingora.
+        if !is_websocket
+            && domain.waf.enabled
+            && crate::waf::should_inspect_body(req.method.as_str(), &req.headers)
+        {
+            return None;
+        }
         // WebSocket needs the Pingora H1 upgrade tunnel even when the native
         // cache storage is off. Every other request still requires storage.
         if !is_websocket && (!self.native_cache || self.storage.is_none()) {
@@ -5057,7 +5073,12 @@ fn resolve_cache_source(label: &str, header: Option<&str>) -> String {
 /// say) made such origins answer with their default site, so every site
 /// needed 回源 Host filled in by hand. The origin address is only a fallback
 /// for a request that carried no host at all.
-fn upstream_host(configured: &str, visitor: &str, origin_url: &str, plan_origin_host: &str) -> String {
+fn upstream_host(
+    configured: &str,
+    visitor: &str,
+    origin_url: &str,
+    plan_origin_host: &str,
+) -> String {
     if !configured.is_empty() {
         return configured.to_string();
     }
@@ -5482,11 +5503,11 @@ pub fn run(config: EdgeConfig, certs: Arc<CertStore>, state: Arc<AppState>) -> a
 #[cfg(test)]
 mod tests {
     use super::{
-        DataPlaneProxy, ResponsePolicySlot, cached_response_policy, compressed_variant_key,
-        effective_connect_timeout_ms, fill_window, gzip_engine_body,
-        head_content_length_for_protocol, is_websocket_upgrade, parse_multi_ranges,
-        parse_single_range, range_fill_is_candidate, tls_version_meets_min, upstream_host,
-        valid_release_tag, vary_on_accept_encoding, weaken_etag,
+        cached_response_policy, compressed_variant_key, effective_connect_timeout_ms, fill_window,
+        gzip_engine_body, head_content_length_for_protocol, is_websocket_upgrade,
+        parse_multi_ranges, parse_single_range, range_fill_is_candidate, tls_version_meets_min,
+        upstream_host, valid_release_tag, vary_on_accept_encoding, weaken_etag, DataPlaneProxy,
+        ResponsePolicySlot,
     };
     use http::{HeaderMap, HeaderValue};
 
@@ -5516,17 +5537,33 @@ mod tests {
     fn origin_gets_the_visited_name_unless_a_host_is_configured() {
         // Default: the name the visitor asked for, not the origin's address.
         assert_eq!(
-            upstream_host("", "www.example.com", "http://203.0.113.10:8080", "203.0.113.10"),
+            upstream_host(
+                "",
+                "www.example.com",
+                "http://203.0.113.10:8080",
+                "203.0.113.10"
+            ),
             "www.example.com"
         );
         // A configured 回源 Host (or SNI name) wins.
         assert_eq!(
-            upstream_host("bucket.oss.example.net", "www.example.com", "https://203.0.113.10", "203.0.113.10"),
+            upstream_host(
+                "bucket.oss.example.net",
+                "www.example.com",
+                "https://203.0.113.10",
+                "203.0.113.10"
+            ),
             "bucket.oss.example.net"
         );
         // No visitor host at all: fall back to the origin's address.
-        assert_eq!(upstream_host("", "", "http://203.0.113.10:8080", "x"), "203.0.113.10");
-        assert_eq!(upstream_host("", "", "", "origin.example.net"), "origin.example.net");
+        assert_eq!(
+            upstream_host("", "", "http://203.0.113.10:8080", "x"),
+            "203.0.113.10"
+        );
+        assert_eq!(
+            upstream_host("", "", "", "origin.example.net"),
+            "origin.example.net"
+        );
     }
 
     #[test]
@@ -5898,18 +5935,16 @@ mod tests {
         );
 
         // HEAD has no body to compress.
-        assert!(
-            gzip_engine_body(
-                &cfg,
-                true,
-                http::Version::HTTP_11,
-                &http::Method::HEAD,
-                200,
-                &resp,
-                &req,
-                &body
-            )
-            .is_none()
-        );
+        assert!(gzip_engine_body(
+            &cfg,
+            true,
+            http::Version::HTTP_11,
+            &http::Method::HEAD,
+            200,
+            &resp,
+            &req,
+            &body
+        )
+        .is_none());
     }
 }

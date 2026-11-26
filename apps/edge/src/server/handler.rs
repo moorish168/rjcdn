@@ -13,10 +13,10 @@ use crate::agent::origin_health::OriginHealthMap;
 use crate::agent::{ControlClient, NodeControl};
 use crate::cache::flight::RedisFlight;
 use crate::cache::policy::{
-    compute_etag, decide_storage_reason, etag_matches,
-    is_uncacheable_header, request_method_cacheable, resolve_rule_policy,
-    resolve_rule_policy_for_response_with_domain, strip_response_headers, CacheDecision, CacheRule,
-    CacheStatus, ResolvedPolicy, RuleAction, RuleSet, VALIDATOR_SOURCE_HEADER,
+    compute_etag, decide_storage_reason, etag_matches, is_uncacheable_header,
+    request_method_cacheable, resolve_rule_policy, resolve_rule_policy_for_response_with_domain,
+    strip_response_headers, CacheDecision, CacheRule, CacheStatus, ResolvedPolicy, RuleAction,
+    RuleSet, VALIDATOR_SOURCE_HEADER,
 };
 use crate::cache::{CacheEntry, CacheGetResult, LargeCache, SharedCache};
 use crate::config::registry::{DomainEntry, DomainRegistry, OriginTarget};
@@ -36,7 +36,10 @@ use crate::server::rate_limit::RateLimiter;
 use crate::server::response_headers::ResponseHeaderOverrides;
 use crate::server::waf_log::WafLog;
 use crate::server::websocket;
-use crate::waf::{evaluate as waf_evaluate, WafAction, WafMode, WafRequest};
+use crate::waf::{
+    evaluate as waf_evaluate, evaluate_body as waf_evaluate_body,
+    should_inspect_body as waf_should_inspect_body, WafAction, WafMode, WafRequest,
+};
 use axum::{
     body::Body,
     extract::{ConnectInfo, State},
@@ -415,7 +418,7 @@ async fn proxy_handler_inner(State(state): State<Arc<AppState>>, req: Request<Bo
     // single request header was enough to bypass `signed_url_mode=all`, so the
     // same verification has to run here. On success the signature parameters
     // are removed so they never reach the cache key or the origin.
-    let req = match domain_entry.as_ref() {
+    let mut req = match domain_entry.as_ref() {
         Some(domain) => match signed_url_gate(domain, req, &host).await {
             SignedUrlGate::Pass(req) | SignedUrlGate::Signed(req) => req,
             SignedUrlGate::Reject => {
@@ -546,11 +549,7 @@ async fn proxy_handler_inner(State(state): State<Arc<AppState>>, req: Request<Bo
     if let Some(domain) = domain_entry.as_ref() {
         // Pingora already ran this exact preflight before handing the request
         // over; running it again would charge CC / rate-limit budget twice.
-        if req
-            .extensions()
-            .get::<host_util::PreflightDone>()
-            .is_none()
-        {
+        if req.extensions().get::<host_util::PreflightDone>().is_none() {
             let pipeline = RequestPipeline::new(&state);
             let facts = facts_from_request(
                 &req,
@@ -570,16 +569,105 @@ async fn proxy_handler_inner(State(state): State<Arc<AppState>>, req: Request<Bo
         // passed signature verification.
     }
 
+    // The header/path preflight runs before request bodies are available. Small
+    // fixed-length textual bodies are buffered here, inspected, then replayed
+    // unchanged to the origin if they pass.
+    if let Some(domain) = domain_entry
+        .as_ref()
+        .filter(|domain| domain.waf.enabled && waf_should_inspect_body(method.as_str(), &headers))
+    {
+        let content_type = headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let content_encoding = headers
+            .get(header::CONTENT_ENCODING)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let (parts, body) = req.into_parts();
+        let body = match Limited::new(body, MAX_PROXY_BODY).collect().await {
+            Ok(collected) => collected.to_bytes(),
+            Err(error) => {
+                tracing::warn!(error = %error, "request body too large or unreadable during WAF inspection");
+                log_access(
+                    &state.access_log,
+                    &method,
+                    &host,
+                    &path_only,
+                    StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
+                    start,
+                    &client_ip,
+                    &user_agent,
+                    &referer,
+                    0,
+                    CacheStatus::Dynamic.as_str(),
+                    &request_id,
+                )
+                .await;
+                return (StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large").into_response();
+            }
+        };
+        req = Request::from_parts(parts, Body::from(body.clone()));
+
+        if let Some(verdict) = waf_evaluate_body(
+            &domain.waf,
+            client_ip.parse::<IpAddr>().ok(),
+            &body,
+            &content_type,
+            &content_encoding,
+        ) {
+            let mode_is_block = domain.waf.mode == WafMode::Block;
+            let blocked = mode_is_block && verdict.action == WafAction::Block;
+            let action = if blocked { "block" } else { "monitor" };
+            let mode = if mode_is_block { "block" } else { "monitor" };
+            state
+                .waf_log
+                .push(
+                    &host,
+                    &client_ip,
+                    method.as_str(),
+                    &path_and_query,
+                    action,
+                    &verdict.category,
+                    &verdict.rule_name,
+                    mode,
+                )
+                .await;
+            if blocked {
+                log_access(
+                    &state.access_log,
+                    &method,
+                    &host,
+                    &path_only,
+                    StatusCode::FORBIDDEN.as_u16(),
+                    start,
+                    &client_ip,
+                    &user_agent,
+                    &referer,
+                    0,
+                    "WAF",
+                    &request_id,
+                )
+                .await;
+                return default_page::waf_blocked_page(
+                    &host,
+                    &path_only,
+                    &verdict.rule_name,
+                    &verdict.category,
+                );
+            }
+        }
+    }
+
     // NOTE: origin health is checked where an origin fetch is actually needed
     // (below), not here: a fresh cache hit must still be served while the
     // origin is down.
 
     // WebSocket upgrade → handshake with origin, then raw byte tunnel.
     if websocket::is_websocket_upgrade(&headers) {
-        if domain_entry
-            .as_ref()
-            .is_some_and(|d| !d.websocket_enabled)
-        {
+        if domain_entry.as_ref().is_some_and(|d| !d.websocket_enabled) {
             let resp = Response::builder()
                 .status(StatusCode::FORBIDDEN)
                 .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
@@ -608,7 +696,10 @@ async fn proxy_handler_inner(State(state): State<Arc<AppState>>, req: Request<Bo
             &eff.origin_auth_header,
             &eff.origin_auth_value,
         );
-        let ws_target = origin_sequence(&state, &host, &eff).await.into_iter().next();
+        let ws_target = origin_sequence(&state, &host, &eff)
+            .await
+            .into_iter()
+            .next();
         let ws_origin = ws_target
             .as_ref()
             .map(|o| o.url.clone())
@@ -937,8 +1028,12 @@ async fn proxy_handler_inner(State(state): State<Arc<AppState>>, req: Request<Bo
                         content_type,
                         &eff.key_ignore_headers,
                     );
-                    let response_bypass = response_policy.action != RuleAction::Cache;
-                    if !response_bypass && (200..300).contains(&status.as_u16()) {
+                    let response_bypass = response_policy.action != RuleAction::Cache
+                        || resp.cache_reason.is_some()
+                        // HEAD is fetched for metadata only and is not stored
+                        // as a shared cache entry by this path.
+                        || method == Method::HEAD;
+                    if !response_bypass {
                         state.metrics.record_miss(&host, body_len);
                     } else {
                         state.metrics.record_bypass(&host, body_len);
@@ -974,8 +1069,7 @@ async fn proxy_handler_inner(State(state): State<Arc<AppState>>, req: Request<Bo
                     );
                     if let Some(length) = head_length {
                         if let Ok(value) = HeaderValue::from_str(&length) {
-                            out.headers_mut()
-                                .insert(header::CONTENT_LENGTH, value);
+                            out.headers_mut().insert(header::CONTENT_LENGTH, value);
                         }
                     }
                     log_access(
@@ -1317,8 +1411,7 @@ async fn fetch_with_single_flight(
                 }
             }
             let _flight_guard = flight_guard;
-            let mut result =
-                fetch_origin(state, eff, host, path_and_query, headers, method).await;
+            let mut result = fetch_origin(state, eff, host, path_and_query, headers, method).await;
             if let Ok(resp) = &mut result {
                 let content_type = resp
                     .headers
@@ -1498,7 +1591,10 @@ async fn fetch_head_origin(
         if result.is_ok() {
             break;
         }
-        if matches!(result, Err(FetchError::Timeout) | Err(FetchError::Failed(_))) {
+        if matches!(
+            result,
+            Err(FetchError::Timeout) | Err(FetchError::Failed(_))
+        ) {
             let reason = result
                 .as_ref()
                 .err()
@@ -1648,9 +1744,10 @@ fn if_range_matches(value: &str, entry: &CacheEntry, etag: &str) -> bool {
         }
         return value == etag;
     }
-    let (Ok(date), Some(last_modified)) =
-        (httpdate::parse_http_date(value), entry.header("last-modified"))
-    else {
+    let (Ok(date), Some(last_modified)) = (
+        httpdate::parse_http_date(value),
+        entry.header("last-modified"),
+    ) else {
         return false;
     };
     let Ok(last_modified) = httpdate::parse_http_date(last_modified) else {
@@ -2289,7 +2386,7 @@ pub(crate) async fn preflight_cacheable(
         }
     }
 
-    if domain.waf.enabled {
+    if domain.waf.enabled || !domain.waf.global_ip_deny.is_empty() {
         // Only pay for a database lookup when this domain configured Geo/ASN
         // rules. The lookup uses the already-resolved trusted client IP.
         let geo = if domain.waf.needs_geo() {
@@ -2311,7 +2408,8 @@ pub(crate) async fn preflight_cacheable(
         };
         if let Some(verdict) = waf_evaluate(&domain.waf, &waf_request) {
             if verdict.action != WafAction::Allow {
-                let mode_is_block = domain.waf.mode == WafMode::Block;
+                let mode_is_block =
+                    domain.waf.mode == WafMode::Block || verdict.category == "global_ip_deny";
                 let challenge_capable = challenge_accepts_html(method, headers);
                 let cleared = challenge::has_clearance(
                     headers,
@@ -2890,7 +2988,10 @@ mod tests {
             200,
             vec![
                 ("etag".into(), "\"abc\"".into()),
-                ("last-modified".into(), "Wed, 21 Oct 2015 07:28:00 GMT".into()),
+                (
+                    "last-modified".into(),
+                    "Wed, 21 Oct 2015 07:28:00 GMT".into(),
+                ),
             ],
             Bytes::from_static(b"0123456789"),
         )
@@ -2912,7 +3013,11 @@ mod tests {
             &if_range("\"different\""),
             None
         ));
-        assert!(!range_preconditions_met(&entry, &if_range("W/\"abc\""), None));
+        assert!(!range_preconditions_met(
+            &entry,
+            &if_range("W/\"abc\""),
+            None
+        ));
         assert!(range_preconditions_met(
             &entry,
             &if_range("Wed, 21 Oct 2015 07:28:00 GMT"),

@@ -109,6 +109,10 @@ pub struct WafConfigOut {
     pub rules: Vec<WafRuleOut>,
     pub ip_allow: Vec<String>,
     pub ip_deny: Vec<String>,
+    /// Global deny entries are evaluated before site WAF allow rules and do
+    /// not depend on the site's WAF master switch.
+    #[serde(default)]
+    pub global_ip_deny: Vec<String>,
     /// ISO 3166-1 alpha-2 codes; a match clears the Geo gate only.
     #[serde(default)]
     pub country_allow: Vec<String>,
@@ -323,6 +327,7 @@ fn waf_config_from_ext(
     rulepacks: &[crate::waf_rulepack::RulepackRow],
     extra_ip_allow: &[String],
     extra_ip_deny: &[String],
+    extra_global_ip_deny: &[String],
 ) -> WafConfigOut {
     let managed_rulesets = crate::waf_rulesets::parse_csv(&settings.managed_rulesets);
     let active = rulepacks.iter().find(|p| p.slot == "active");
@@ -367,8 +372,10 @@ fn waf_config_from_ext(
     // these lists linearly on every request.
     let mut ip_allow = Vec::new();
     let mut ip_deny = Vec::new();
+    let mut global_ip_deny = Vec::new();
     let mut seen_allow = std::collections::HashSet::new();
     let mut seen_deny = std::collections::HashSet::new();
+    let mut seen_global_deny = std::collections::HashSet::new();
     for ip in ips {
         if !ip.enabled {
             continue;
@@ -389,6 +396,11 @@ fn waf_config_from_ext(
     for cidr in extra_ip_deny {
         if seen_deny.insert(cidr.clone()) {
             ip_deny.push(cidr.clone());
+        }
+    }
+    for cidr in extra_global_ip_deny {
+        if seen_global_deny.insert(cidr.clone()) {
+            global_ip_deny.push(cidr.clone());
         }
     }
     // A 地区 rule covers whole continents and single countries; the edge only
@@ -452,6 +464,7 @@ fn waf_config_from_ext(
             .collect(),
         ip_allow,
         ip_deny,
+        global_ip_deny,
         country_allow,
         country_deny,
         asn_allow: Vec::new(),
@@ -462,6 +475,63 @@ fn waf_config_from_ext(
         challenge_ttl_secs: settings.challenge_ttl_secs.clamp(60, 86_400) as u64,
         security_level: settings.security_level,
     }
+}
+
+fn waf_config_for_global_deny(global_ip_deny: Vec<String>) -> WafConfigOut {
+    WafConfigOut {
+        enabled: false,
+        mode: "block".into(),
+        managed: WafManagedOut {
+            sqli: false,
+            xss: false,
+            traversal: false,
+            scanners: false,
+            rce: false,
+            ssrf: false,
+            xxe: false,
+            log4shell: false,
+            crlf: false,
+            ssti: false,
+            nosql: false,
+            ldap: false,
+            java: false,
+            webshell: false,
+            protocol: false,
+        },
+        managed_rulesets: Vec::new(),
+        rulepack_version: String::new(),
+        rulepack: None,
+        rules: Vec::new(),
+        ip_allow: Vec::new(),
+        ip_deny: Vec::new(),
+        global_ip_deny,
+        country_allow: Vec::new(),
+        country_deny: Vec::new(),
+        asn_allow: Vec::new(),
+        asn_deny: Vec::new(),
+        region_allow: Vec::new(),
+        region_deny: Vec::new(),
+        challenge_difficulty: 4,
+        challenge_ttl_secs: 1800,
+        security_level: "off".into(),
+    }
+}
+
+fn overlay_global_ip_deny(config: &mut DomainConfigResponse, entries: &[String]) {
+    if let Some(waf) = config.waf.as_mut() {
+        waf.global_ip_deny = entries.to_vec();
+    } else if !entries.is_empty() {
+        config.waf = Some(waf_config_for_global_deny(entries.to_vec()));
+    }
+    // Published snapshots can predate the current global list. Include its
+    // value in the edge version even when the list becomes empty, so removals
+    // also invalidate the edge's cached configuration.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in serde_json::to_vec(entries).unwrap_or_default() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    config.version = format!("{}:g{:x}", config.version, hash);
 }
 
 pub(crate) fn build(
@@ -588,9 +658,14 @@ pub async fn snapshot_domain(
     // protection (or, for a Geo allow-list, blocks all traffic). A 5xx makes the
     // edge keep its current config instead.
     let mut rules = repository::list_rules_for_domain(pool, row.id).await?;
-    rules.extend(crate::api::cache_policy::PolicyIndex::load(pool).await?.rules_for(row.id, None));
+    rules.extend(
+        crate::api::cache_policy::PolicyIndex::load(pool)
+            .await?
+            .rules_for(row.id, None),
+    );
     let rulepacks = crate::waf_rulepack::list(pool).await?;
-    let (extra_allow, extra_deny) = crate::api::ip_list::expand_for_domain(pool, row.id).await?;
+    let (extra_allow, extra_deny, global_ip_deny) =
+        crate::api::ip_list::expand_for_domain(pool, row.id).await?;
     let waf = match repository::get_waf_settings(pool, row.id).await? {
         Some(settings) => {
             let waf_rules = repository::list_waf_rules(pool, row.id).await?;
@@ -605,7 +680,11 @@ pub async fn snapshot_domain(
                 &rulepacks,
                 &extra_allow,
                 &extra_deny,
+                &global_ip_deny,
             ))
+        }
+        None if !global_ip_deny.is_empty() => {
+            Some(waf_config_for_global_deny(global_ip_deny.clone()))
         }
         None => None,
     };
@@ -642,6 +721,13 @@ pub async fn get_domain_config(
         tracing::error!(error = %e, "load rulepacks for config");
         db_error()
     })?;
+    let (extra_allow, extra_deny, global_ip_deny) =
+        crate::api::ip_list::expand_for_domain(&state.pool, row.id)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, domain = %row.name, "load ip lists for config");
+                db_error()
+            })?;
     let waf = match repository::get_waf_settings(&state.pool, row.id)
         .await
         .map_err(|e| {
@@ -667,13 +753,6 @@ pub async fn get_domain_config(
                     tracing::error!(error = %e, domain = %row.name, "load waf geo for config");
                     db_error()
                 })?;
-            let (extra_allow, extra_deny) =
-                crate::api::ip_list::expand_for_domain(&state.pool, row.id)
-                    .await
-                    .map_err(|e| {
-                        tracing::error!(error = %e, domain = %row.name, "load ip lists for config");
-                        db_error()
-                    })?;
             Some(waf_config_from_ext(
                 &row.name,
                 settings,
@@ -683,7 +762,11 @@ pub async fn get_domain_config(
                 &rulepacks,
                 &extra_allow,
                 &extra_deny,
+                &global_ip_deny,
             ))
+        }
+        None if !global_ip_deny.is_empty() => {
+            Some(waf_config_for_global_deny(global_ip_deny.clone()))
         }
         None => None,
     };
@@ -835,12 +918,13 @@ pub async fn list_all_configs(
     }
     // One query each for the whole document, and every failure is a 5xx: an
     // empty IP list would ship a config with protection off.
-    let mut ip_lists_by_domain = crate::api::ip_list::expand_all(&state.pool)
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "load ip lists for config");
-            db_error()
-        })?;
+    let mut ip_lists_by_domain =
+        crate::api::ip_list::expand_all(&state.pool)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "load ip lists for config");
+                db_error()
+            })?;
     let policies = crate::api::cache_policy::PolicyIndex::load(&state.pool)
         .await
         .map_err(|e| {
@@ -909,8 +993,9 @@ pub async fn list_all_configs(
         }
         let mut rules = by_domain.remove(&row.id).unwrap_or_default();
         rules.extend(policies.rules_for(row.id, node_policy));
+        let (extra_allow, extra_deny, global_ip_deny) =
+            ip_lists_by_domain.remove(&row.id).unwrap_or_default();
         let waf = if let Some(settings) = waf_settings_by.remove(&row.id) {
-            let (extra_allow, extra_deny) = ip_lists_by_domain.remove(&row.id).unwrap_or_default();
             Some(waf_config_from_ext(
                 &row.name,
                 settings,
@@ -920,7 +1005,10 @@ pub async fn list_all_configs(
                 &rulepacks,
                 &extra_allow,
                 &extra_deny,
+                &global_ip_deny,
             ))
+        } else if !global_ip_deny.is_empty() {
+            Some(waf_config_for_global_deny(global_ip_deny.clone()))
         } else {
             None
         };
@@ -937,6 +1025,7 @@ pub async fn list_all_configs(
                 cfg = snapshot.clone();
             }
         }
+        overlay_global_ip_deny(&mut cfg, &global_ip_deny);
         version_parts.push(format!(
             "{}:{:?}",
             cfg.version,
@@ -1091,7 +1180,7 @@ mod tests {
         geo: Vec<repository::WafGeoRow>,
         rulepacks: &[crate::waf_rulepack::RulepackRow],
     ) -> WafConfigOut {
-        waf_config_from_ext(domain, settings, rules, ips, geo, rulepacks, &[], &[])
+        waf_config_from_ext(domain, settings, rules, ips, geo, rulepacks, &[], &[], &[])
     }
 
     fn settings() -> repository::WafSettingsRow {

@@ -1,9 +1,9 @@
 //! Reusable IP black/white lists for WAF policies.
 
 use axum::{
-    Json,
     extract::{Path, State},
     http::StatusCode,
+    Json,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
@@ -22,7 +22,12 @@ fn bad_request(e: impl Into<String>) -> ApiError {
     (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e.into() }))
 }
 fn forbidden() -> ApiError {
-    (StatusCode::FORBIDDEN, Json(ErrorBody { error: "forbidden".into() }))
+    (
+        StatusCode::FORBIDDEN,
+        Json(ErrorBody {
+            error: "forbidden".into(),
+        }),
+    )
 }
 fn db_error() -> ApiError {
     (
@@ -33,7 +38,12 @@ fn db_error() -> ApiError {
     )
 }
 fn not_found() -> ApiError {
-    (StatusCode::NOT_FOUND, Json(ErrorBody { error: "not found".into() }))
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorBody {
+            error: "not found".into(),
+        }),
+    )
 }
 
 #[derive(Debug, Clone, Serialize, FromRow)]
@@ -44,6 +54,7 @@ pub struct IpListDto {
     pub project_id: Option<Uuid>,
     pub note: String,
     pub enabled: bool,
+    pub applies_globally: bool,
     pub entry_count: i64,
 }
 
@@ -63,6 +74,7 @@ pub struct CreateListRequest {
     pub project_id: Option<String>,
     pub note: Option<String>,
     pub enabled: Option<bool>,
+    pub applies_globally: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -70,6 +82,7 @@ pub struct UpdateListRequest {
     pub name: Option<String>,
     pub note: Option<String>,
     pub enabled: Option<bool>,
+    pub applies_globally: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,6 +90,12 @@ pub struct CreateEntryRequest {
     pub cidr: String,
     pub note: Option<String>,
     pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct QuickGlobalBanRequest {
+    pub ip: String,
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -128,7 +147,9 @@ fn normalize_cidr(raw: &str) -> Result<String, ApiError> {
             .map_err(|_| bad_request("invalid CIDR prefix"))?;
         let max = if ip.is_ipv4() { 32 } else { 128 };
         if prefix > max {
-            return Err(bad_request("CIDR prefix is too long for this address family"));
+            return Err(bad_request(
+                "CIDR prefix is too long for this address family",
+            ));
         }
         Ok(format!("{ip}/{prefix}"))
     } else {
@@ -154,7 +175,7 @@ pub async fn list(
     let rows = if actor.is_admin {
         sqlx::query_as::<_, IpListDto>(
             r#"
-            SELECT l.id, l.name, l.list_type, l.project_id, l.note, l.enabled,
+            SELECT l.id, l.name, l.list_type, l.project_id, l.note, l.enabled, l.applies_globally,
                    (SELECT COUNT(*) FROM ip_list_entries e WHERE e.list_id = l.id) AS entry_count
             FROM ip_lists l
             ORDER BY l.name
@@ -166,7 +187,7 @@ pub async fn list(
         let pids = actor_project_ids(&state, &actor).await;
         sqlx::query_as::<_, IpListDto>(
             r#"
-            SELECT l.id, l.name, l.list_type, l.project_id, l.note, l.enabled,
+            SELECT l.id, l.name, l.list_type, l.project_id, l.note, l.enabled, l.applies_globally,
                    (SELECT COUNT(*) FROM ip_list_entries e WHERE e.list_id = l.id) AS entry_count
             FROM ip_lists l
             WHERE l.project_id IS NULL
@@ -205,13 +226,19 @@ pub async fn create(
         }
         _ => None,
     };
+    let applies_globally = req.applies_globally.unwrap_or(false);
+    if applies_globally && (!actor.is_admin || project_id.is_some() || list_type != "black") {
+        return Err(bad_request(
+            "only admins can apply a global black list to all sites",
+        ));
+    }
     if project_id.is_none() && !actor.is_admin {
         return Err(forbidden());
     }
     let id: Uuid = sqlx::query_scalar(
         r#"
-        INSERT INTO ip_lists (name, list_type, project_id, note, enabled)
-        VALUES ($1, $2, $3, $4, $5)
+        INSERT INTO ip_lists (name, list_type, project_id, note, enabled, applies_globally)
+        VALUES ($1, $2, $3, $4, $5, $6)
         RETURNING id
         "#,
     )
@@ -220,10 +247,13 @@ pub async fn create(
     .bind(project_id)
     .bind(req.note.as_deref().unwrap_or("").trim())
     .bind(req.enabled.unwrap_or(true))
+    .bind(applies_globally)
     .fetch_one(&state.pool)
     .await
     .map_err(|e| {
-        if e.as_database_error().is_some_and(|d| d.is_unique_violation()) {
+        if e.as_database_error()
+            .is_some_and(|d| d.is_unique_violation())
+        {
             return bad_request("list name already exists");
         }
         tracing::error!(error = %e, "create ip_list");
@@ -236,7 +266,7 @@ pub async fn create(
 async fn get_list(state: &AppState, id: Uuid) -> Result<IpListDto, ApiError> {
     sqlx::query_as::<_, IpListDto>(
         r#"
-        SELECT l.id, l.name, l.list_type, l.project_id, l.note, l.enabled,
+        SELECT l.id, l.name, l.list_type, l.project_id, l.note, l.enabled, l.applies_globally,
                (SELECT COUNT(*) FROM ip_list_entries e WHERE e.list_id = l.id) AS entry_count
         FROM ip_lists l WHERE l.id = $1
         "#,
@@ -257,12 +287,20 @@ pub async fn update(
     let uid = Uuid::parse_str(&id).map_err(|_| bad_request("invalid id"))?;
     let current = get_list(&state, uid).await?;
     ensure_list_write(&state, &actor, &current).await?;
+    if req.applies_globally.is_some()
+        && (!actor.is_admin || current.project_id.is_some() || current.list_type != "black")
+    {
+        return Err(bad_request(
+            "only admins can apply a global black list to all sites",
+        ));
+    }
     sqlx::query(
         r#"
         UPDATE ip_lists SET
           name = COALESCE($2, name),
           note = COALESCE($3, note),
           enabled = COALESCE($4, enabled),
+          applies_globally = COALESCE($5, applies_globally),
           updated_at = NOW()
         WHERE id = $1
         "#,
@@ -271,10 +309,13 @@ pub async fn update(
     .bind(req.name.as_deref().map(str::trim).filter(|s| !s.is_empty()))
     .bind(req.note.as_deref())
     .bind(req.enabled)
+    .bind(req.applies_globally)
     .execute(&state.pool)
     .await
     .map_err(|e| {
-        if e.as_database_error().is_some_and(|d| d.is_unique_violation()) {
+        if e.as_database_error()
+            .is_some_and(|d| d.is_unique_violation())
+        {
             return bad_request("list name already exists");
         }
         db_error()
@@ -340,12 +381,98 @@ pub async fn add_entry(
     .fetch_one(&state.pool)
     .await
     .map_err(|e| {
-        if e.as_database_error().is_some_and(|d| d.is_unique_violation()) {
+        if e.as_database_error()
+            .is_some_and(|d| d.is_unique_violation())
+        {
             return bad_request("CIDR already in list");
         }
         db_error()
     })?;
     Ok((StatusCode::CREATED, Json(row)))
+}
+
+/// Add a WAF event address to the shared deny list. The operation is
+/// idempotent so an operator can click it repeatedly while reviewing events.
+pub async fn quick_ban_global(
+    State(state): State<AppState>,
+    actor: Actor,
+    Json(req): Json<QuickGlobalBanRequest>,
+) -> Result<Json<IpListEntryDto>, ApiError> {
+    if !actor.is_admin {
+        return Err(forbidden());
+    }
+    let cidr = normalize_cidr(&req.ip)?;
+    let mut tx = state.pool.begin().await.map_err(|_| db_error())?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('lagran:waf:global-blacklist')::bigint)")
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| db_error())?;
+
+    let mut list_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM ip_lists WHERE applies_globally AND list_type = 'black' ORDER BY enabled DESC, created_at, id LIMIT 1",
+    )
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| db_error())?;
+
+    if list_id.is_none() {
+        list_id = sqlx::query_scalar(
+            r#"
+            INSERT INTO ip_lists (name, list_type, project_id, note, enabled, applies_globally)
+            VALUES ('WAF event blacklist', 'black', NULL, 'IPs blocked from WAF event logs', TRUE, TRUE)
+            ON CONFLICT DO NOTHING
+            RETURNING id
+            "#,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| db_error())?;
+        if list_id.is_none() {
+            list_id = sqlx::query_scalar(
+                "SELECT id FROM ip_lists WHERE applies_globally AND list_type = 'black' ORDER BY enabled DESC, created_at, id LIMIT 1",
+            )
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|_| db_error())?;
+        }
+    }
+    let list_id = list_id.ok_or_else(db_error)?;
+    sqlx::query("UPDATE ip_lists SET enabled = TRUE, updated_at = NOW() WHERE id = $1")
+        .bind(list_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| db_error())?;
+    let row = sqlx::query_as::<_, IpListEntryDto>(
+        r#"
+        INSERT INTO ip_list_entries (list_id, cidr, note, enabled)
+        VALUES ($1, $2, $3, TRUE)
+        ON CONFLICT (list_id, cidr)
+        DO UPDATE SET note = EXCLUDED.note, enabled = TRUE
+        RETURNING id, list_id, cidr, note, enabled
+        "#,
+    )
+    .bind(list_id)
+    .bind(&cidr)
+    .bind(
+        req.note
+            .as_deref()
+            .unwrap_or("WAF event quick block")
+            .trim(),
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|_| db_error())?;
+    tx.commit().await.map_err(|_| db_error())?;
+
+    let _ = crate::repository::insert_audit(
+        &state.pool,
+        &actor.email,
+        "waf.global_ip.quick_ban",
+        &list_id.to_string(),
+        &format!("global deny {cidr}"),
+    )
+    .await;
+    Ok(Json(row))
 }
 
 pub async fn update_entry(
@@ -501,7 +628,11 @@ pub async fn unbind(
 
 /// Global lists and lists of the caller's projects are readable; anything
 /// else answers 404 so a list id from another tenant reveals nothing.
-async fn ensure_list_read(state: &AppState, actor: &Actor, list: &IpListDto) -> Result<(), ApiError> {
+async fn ensure_list_read(
+    state: &AppState,
+    actor: &Actor,
+    list: &IpListDto,
+) -> Result<(), ApiError> {
     if actor.is_admin {
         return Ok(());
     }
@@ -545,23 +676,27 @@ async fn ensure_list_write(
     }
 }
 
-/// Expand enabled list bindings for a domain into allow/deny CIDRs.
+/// Expand site-bound lists plus globally applied black lists for a domain.
 pub async fn expand_for_domain(
     pool: &sqlx::PgPool,
     domain_id: Uuid,
-) -> sqlx::Result<(Vec<String>, Vec<String>)> {
+) -> sqlx::Result<(Vec<String>, Vec<String>, Vec<String>)> {
     #[derive(FromRow)]
     struct Row {
         list_type: String,
         cidr: String,
+        applies_globally: bool,
     }
     let rows = sqlx::query_as::<_, Row>(
         r#"
-        SELECT l.list_type, e.cidr
-        FROM waf_ip_list_bindings b
-        JOIN ip_lists l ON l.id = b.list_id AND l.enabled = TRUE
+        SELECT l.list_type, e.cidr, l.applies_globally
+        FROM ip_lists l
         JOIN ip_list_entries e ON e.list_id = l.id AND e.enabled = TRUE
-        WHERE b.domain_id = $1 AND b.enabled = TRUE
+        LEFT JOIN waf_ip_list_bindings b
+          ON b.list_id = l.id AND b.domain_id = $1 AND b.enabled = TRUE
+        WHERE l.enabled = TRUE
+          AND (l.applies_globally = TRUE OR b.domain_id IS NOT NULL)
+        ORDER BY l.applies_globally DESC, l.list_type, e.cidr
         "#,
     )
     .bind(domain_id)
@@ -569,42 +704,59 @@ pub async fn expand_for_domain(
     .await?;
     let mut allow = Vec::new();
     let mut deny = Vec::new();
+    let mut global_deny = Vec::new();
+    let mut seen_global = std::collections::HashSet::new();
     for r in rows {
-        if r.list_type == "white" {
+        if r.applies_globally {
+            if seen_global.insert(r.cidr.clone()) {
+                global_deny.push(r.cidr);
+            }
+        } else if r.list_type == "white" {
             allow.push(r.cidr);
         } else {
             deny.push(r.cidr);
         }
     }
-    Ok((allow, deny))
+    Ok((allow, deny, global_deny))
 }
 
-/// `expand_for_domain` for every site at once: domain id → (allow, deny).
+/// `expand_for_domain` for every site at once: domain id → (allow, deny, global deny).
 pub async fn expand_all(
     pool: &sqlx::PgPool,
-) -> sqlx::Result<std::collections::HashMap<Uuid, (Vec<String>, Vec<String>)>> {
+) -> sqlx::Result<std::collections::HashMap<Uuid, (Vec<String>, Vec<String>, Vec<String>)>> {
     #[derive(FromRow)]
     struct Row {
         domain_id: Uuid,
         list_type: String,
         cidr: String,
+        applies_globally: bool,
     }
     let rows = sqlx::query_as::<_, Row>(
         r#"
-        SELECT b.domain_id, l.list_type, e.cidr
+        SELECT b.domain_id, l.list_type, e.cidr, FALSE AS applies_globally
         FROM waf_ip_list_bindings b
-        JOIN ip_lists l ON l.id = b.list_id AND l.enabled = TRUE
+        JOIN ip_lists l ON l.id = b.list_id AND l.enabled = TRUE AND l.applies_globally = FALSE
         JOIN ip_list_entries e ON e.list_id = l.id AND e.enabled = TRUE
         WHERE b.enabled = TRUE
+        UNION ALL
+        SELECT d.id AS domain_id, l.list_type, e.cidr, TRUE AS applies_globally
+        FROM domains d
+        JOIN ip_lists l ON l.applies_globally = TRUE AND l.enabled = TRUE
+        JOIN ip_list_entries e ON e.list_id = l.id AND e.enabled = TRUE
+        ORDER BY domain_id, applies_globally DESC, list_type, cidr
         "#,
     )
     .fetch_all(pool)
     .await?;
-    let mut out: std::collections::HashMap<Uuid, (Vec<String>, Vec<String>)> =
+    let mut out: std::collections::HashMap<Uuid, (Vec<String>, Vec<String>, Vec<String>)> =
         std::collections::HashMap::new();
     for r in rows {
         let entry = out.entry(r.domain_id).or_default();
-        if r.list_type == "white" {
+        if r.applies_globally {
+            if !entry.2.contains(&r.cidr) {
+                entry.2.push(r.cidr);
+            }
+        } else if r.list_type == "white" {
             entry.0.push(r.cidr);
         } else {
             entry.1.push(r.cidr);

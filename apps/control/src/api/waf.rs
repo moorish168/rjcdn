@@ -8,6 +8,7 @@ use crate::state::AppState;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
+    response::IntoResponse,
     Json,
 };
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,7 @@ use uuid::Uuid;
 const FIELDS: [&str; 6] = ["path", "query", "user_agent", "referer", "method", "ip"];
 const OPERATORS: [&str; 4] = ["contains", "equals", "prefix", "suffix"];
 const ACTIONS: [&str; 4] = ["block", "allow", "log", "challenge"];
+const MAX_PAGE_SIZE: i64 = 500;
 
 #[derive(Serialize)]
 pub struct ErrorBody {
@@ -579,6 +581,8 @@ pub async fn put_settings(
         .unwrap_or(&current.security_level)
         .trim()
         .to_ascii_lowercase();
+    // This level controls browser challenges only. WAF.enabled is the sole
+    // switch for managed/custom rules and IP/Geo lists.
     if !["off", "low", "medium", "high", "under_attack"].contains(&security_level.as_str()) {
         return Err(bad_request(
             "security_level must be off, low, medium, high or under_attack".into(),
@@ -1554,6 +1558,14 @@ pub struct WafEventDto {
     pub mode: String,
 }
 
+#[derive(Serialize)]
+pub struct WafEventPageDto {
+    pub items: Vec<WafEventDto>,
+    pub page: i64,
+    pub page_size: i64,
+    pub has_more: bool,
+}
+
 #[derive(Deserialize)]
 pub struct EventIn {
     pub domain: String,
@@ -1669,6 +1681,8 @@ pub async fn report_events(
 pub struct EventsQuery {
     pub domain: Option<String>,
     pub limit: Option<i64>,
+    pub page: Option<i64>,
+    pub page_size: Option<i64>,
     pub action: Option<String>,
 }
 
@@ -1772,7 +1786,7 @@ pub async fn list_events(
     State(state): State<AppState>,
     actor: Actor,
     Query(q): Query<EventsQuery>,
-) -> Result<Json<Vec<WafEventDto>>, (StatusCode, Json<ErrorBody>)> {
+) -> Result<axum::response::Response, (StatusCode, Json<ErrorBody>)> {
     let visible: Option<HashSet<String>> = match actor.visible_domain_ids(&state).await {
         None => None,
         Some(ids) => Some(
@@ -1787,12 +1801,40 @@ pub async fn list_events(
     if let Some(ref d) = q.domain {
         if let Some(ref names) = visible {
             if !d.is_empty() && !names.contains(d) {
-                return Ok(Json(vec![]));
+                if q.page.is_some() || q.page_size.is_some() {
+                    return Ok(Json(WafEventPageDto {
+                        items: Vec::new(),
+                        page: q.page.unwrap_or(1).clamp(1, 1_000_000),
+                        page_size: q
+                            .page_size
+                            .or(q.limit)
+                            .unwrap_or(100)
+                            .clamp(1, MAX_PAGE_SIZE),
+                        has_more: false,
+                    })
+                    .into_response());
+                }
+                return Ok(Json(Vec::<WafEventDto>::new()).into_response());
             }
         }
     }
 
-    let limit = q.limit.unwrap_or(100).clamp(1, 500);
+    let paginated = q.page.is_some() || q.page_size.is_some();
+    let page = q.page.unwrap_or(1).clamp(1, 1_000_000);
+    let page_size = q
+        .page_size
+        .unwrap_or_else(|| q.limit.unwrap_or(100))
+        .clamp(1, MAX_PAGE_SIZE);
+    let limit = if paginated {
+        page_size + 1
+    } else {
+        q.limit.unwrap_or(100).clamp(1, MAX_PAGE_SIZE)
+    };
+    let offset = if paginated {
+        page.saturating_sub(1).saturating_mul(page_size)
+    } else {
+        0
+    };
     let visible_names = visible.map(|names| names.into_iter().collect::<Vec<_>>());
     let rows = repository::list_waf_events(
         &state.pool,
@@ -1800,27 +1842,43 @@ pub async fn list_events(
         visible_names,
         Some(q.action.as_deref().unwrap_or("")),
         limit,
+        offset,
     )
     .await
     .map_err(|_| db_error())?;
 
-    Ok(Json(
-        rows.into_iter()
-            .map(|r| WafEventDto {
-                id: r.id,
-                ts: r.ts.to_rfc3339(),
-                domain: r.domain,
-                node_id: r.node_id,
-                client_ip: r.client_ip,
-                method: r.method,
-                path: r.path,
-                action: r.action,
-                category: r.category,
-                rule_name: r.rule_name,
-                mode: r.mode,
-            })
-            .collect(),
-    ))
+    let has_more = paginated && rows.len() as i64 > page_size;
+    let mut rows = rows;
+    if has_more {
+        rows.truncate(page_size as usize);
+    }
+    let items: Vec<WafEventDto> = rows
+        .into_iter()
+        .map(|r| WafEventDto {
+            id: r.id,
+            ts: r.ts.to_rfc3339(),
+            domain: r.domain,
+            node_id: r.node_id,
+            client_ip: r.client_ip,
+            method: r.method,
+            path: r.path,
+            action: r.action,
+            category: r.category,
+            rule_name: r.rule_name,
+            mode: r.mode,
+        })
+        .collect();
+    if paginated {
+        Ok(Json(WafEventPageDto {
+            items,
+            page,
+            page_size,
+            has_more,
+        })
+        .into_response())
+    } else {
+        Ok(Json(items).into_response())
+    }
 }
 
 #[cfg(test)]

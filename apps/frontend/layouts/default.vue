@@ -52,8 +52,8 @@ const MENU: MenuModule[] = [
     to: '/ip-lists',
     icon: 'shield',
     subItems: [
-      // WAF 细则挂在「网站 → 站点 → WAF」（对齐 GoEdge）；此处仅全局能力。
       { label: 'IP 名单', to: '/ip-lists' },
+      { label: 'WAF 事件', to: '/waf/events' },
     ],
   },
   {
@@ -144,6 +144,7 @@ const NAV_KEYS: Record<string, string> = {
   '/prefetch': 'nav.prefetch',
   '/config-releases': 'nav.releases',
   '/ip-lists': 'nav.ipLists',
+  '/waf/events': 'nav.wafEvents',
   '/nodes/remote': 'nav.nodeRemote',
   '/dns/settings': 'nav.dnsSettings',
   '/dns/zones': 'nav.dnsZones',
@@ -237,6 +238,7 @@ const NAV_PERMISSIONS: Record<string, string> = {
   '/prefetch': 'prefetch:read',
   '/config-releases': 'config:read',
   '/ip-lists': 'waf:read',
+  '/waf/events': 'waf:read',
   '/nodes': 'node:read',
   '/l2-nodes': 'node:read',
   '/ssh-grants': 'node:read',
@@ -270,7 +272,7 @@ function pathMatches(to: string, path: string): boolean {
 const MODULE_PATHS: Record<string, string[]> = {
   servers: ['/domains', '/access-logs', '/certs'],
   cache: ['/rules', '/cache-policies', '/cache-debug', '/purge', '/prefetch'],
-  security: ['/ip-lists'],
+  security: ['/ip-lists', '/waf/events'],
   clusters: [
     '/nodes',
     '/nodes/onboard',

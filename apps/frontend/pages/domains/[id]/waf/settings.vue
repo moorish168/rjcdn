@@ -178,7 +178,7 @@ const {
             </div>
           </div>
 
-          <div class="section-label">安全级别</div>
+          <div class="section-label">浏览器质询</div>
           <div class="segmented level-seg">
             <button v-for="l in securityLevels" :key="l.value" type="button"
               :class="{ active: settings.security_level === l.value }" @click="settings.security_level = l.value">
@@ -186,7 +186,7 @@ const {
             </button>
           </div>
           <p class="text-muted" style="font-size: 12px; margin-top: 8px">
-            {{ levelHint }}
+            {{ levelHint }} WAF 总开关关闭时，所有 WAF 检查都不生效。
           </p>
 
           <div class="section-label">托管规则集</div>

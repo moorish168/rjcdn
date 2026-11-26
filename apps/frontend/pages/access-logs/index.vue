@@ -3,14 +3,14 @@
     <div class="page-head">
       <div>
         <div class="page-title">访问日志</div>
-        <div class="page-desc">边缘节点批量上报的访客请求明细，默认展示最近 200 条</div>
+        <div class="page-desc">按站点和状态筛选访问记录，可翻页查看保留期内的全部数据</div>
       </div>
       <div class="page-actions">
         <button class="btn btn-default" type="button" @click="exportLogs">
           <AppIcon name="upload" :size="15" />
-          导出 CSV
+          导出当前页
         </button>
-        <button class="btn btn-default" type="button" :disabled="loading" @click="load">
+        <button class="btn btn-default" type="button" :disabled="loading" @click="load()">
           <AppIcon name="refresh" :size="15" />
           刷新
         </button>
@@ -20,7 +20,7 @@
     <div class="card">
       <div class="filter-bar">
         <input v-model="host" class="input" placeholder="按域名筛选，如 cdn.example.com" style="min-width: 240px"
-          @keyup.enter="load" />
+          @keyup.enter="load(1)" />
         <select v-model="statusClass" class="select">
           <option value="">全部状态码</option>
           <option value="2xx">2xx 成功</option>
@@ -28,17 +28,18 @@
           <option value="4xx">4xx 客户端错误</option>
           <option value="5xx">5xx 服务端错误</option>
         </select>
-        <select v-model.number="limit" class="select">
-          <option :value="100">最近 100 条</option>
-          <option :value="200">最近 200 条</option>
-          <option :value="500">最近 500 条</option>
+        <select v-model.number="pageSize" class="select">
+          <option :value="50">50 条 / 页</option>
+          <option :value="100">100 条 / 页</option>
+          <option :value="200">200 条 / 页</option>
+          <option :value="500">500 条 / 页（接口上限）</option>
         </select>
-        <button class="btn btn-default" type="button" @click="load">查询</button>
+        <button class="btn btn-default" type="button" @click="load(1)">查询</button>
         <span class="spacer" />
-        <span class="text-muted" style="font-size: 13px">{{ filtered.length }} 条记录</span>
+        <span class="text-muted" style="font-size: 13px">第 {{ page }} 页 · 本页 {{ rows.length }} 条</span>
       </div>
 
-      <div v-if="filtered.length" class="table-wrap">
+      <div v-if="rows.length" class="table-wrap">
         <table class="table table-fixed log-table">
           <colgroup>
             <col style="width: var(--col-time)" />
@@ -71,13 +72,13 @@
             </tr>
           </thead>
           <tbody>
-            <tr v-for="r in paged" :key="r.id">
+            <tr v-for="r in rows" :key="r.id">
               <td class="time-cell text-muted nowrap">{{ formatDateTime(r.ts) }}</td>
               <td class="text-2">
                 <span class="cell-ellipsis" :title="r.node_id || '—'">{{ r.node_id || '—' }}</span>
               </td>
-              <td class="mono">
-                <span class="cell-ellipsis" :title="r.client_ip || '—'">{{ r.client_ip || '—' }}</span>
+              <td class="mono ip-cell" :title="r.client_ip || '—'">
+                {{ r.client_ip || '—' }}
               </td>
               <td>
                 <span class="method" :class="r.method?.toLowerCase()">{{ r.method }}</span>
@@ -116,14 +117,16 @@
 
       <EmptyState v-else icon="logs" title="暂无访问日志" text="边缘端开启 ACCESS_LOG_REPORT=true 后，约 30 秒上报一次批量日志。" />
 
-      <div v-if="filtered.length > pageSize || filtered.length > 10" class="table-footer">
-        <AppPagination
-          v-model:page="page"
-          v-model:page-size="pageSize"
-          :total="filtered.length"
-          :page-size="pageSize"
-          :page-sizes="[10, 20, 50, 100]"
-        />
+      <div v-if="rows.length || page > 1" class="table-footer log-pagination">
+        <span class="text-muted">第 {{ page }} 页 · {{ hasMore ? '还有后续记录' : '已到末页' }}</span>
+        <div class="page-actions">
+          <button class="btn btn-default btn-sm" type="button" :disabled="page <= 1 || loading" @click="load(page - 1)">
+            上一页
+          </button>
+          <button class="btn btn-default btn-sm" type="button" :disabled="!hasMore || loading" @click="load(page + 1)">
+            下一页
+          </button>
+        </div>
       </div>
     </div>
   </div>
@@ -136,20 +139,13 @@ const toast = useToast()
 const rows = ref<any[]>([])
 const host = ref('')
 const statusClass = ref('')
-const limit = ref(200)
 const loading = ref(false)
 const page = ref(1)
-const pageSize = ref(20)
-
-const filtered = computed(() => rows.value)
-
-const paged = computed(() => {
-  const start = (page.value - 1) * pageSize.value
-  return filtered.value.slice(start, start + pageSize.value)
-})
+const pageSize = ref(100)
+const hasMore = ref(false)
 
 function exportLogs() {
-  exportCsv(`lagran-access-${new Date().toISOString().slice(0, 10)}`, filtered.value, [
+  exportCsv(`lagran-access-${new Date().toISOString().slice(0, 10)}`, rows.value, [
     { key: 'ts', label: '时间' },
     { key: 'host', label: '域名' },
     { key: 'method', label: '方法' },
@@ -157,16 +153,15 @@ function exportLogs() {
     { key: 'status', label: '状态码' },
     { key: 'cache_status', label: '缓存状态' },
     { key: 'action', label: '动作' },
-    { key: 'bytes_sent', label: '响应字节' },
+    { key: 'bytes', label: '响应字节' },
     { key: 'latency_ms', label: '耗时 ms' },
     { key: 'client_ip', label: '客户端 IP' },
     { key: 'user_agent', label: 'User-Agent' },
   ])
 }
 
-watch([statusClass, limit], () => {
-  page.value = 1
-  load()
+watch([statusClass, pageSize], () => {
+  load(1)
 })
 
 function statusTone(status: number) {
@@ -176,18 +171,22 @@ function statusTone(status: number) {
   return 'success'
 }
 
-async function load() {
+async function load(nextPage = page.value) {
   loading.value = true
-  page.value = 1
   try {
     const q = new URLSearchParams()
     const hostValue = host.value.trim()
     if (hostValue) q.set('host', hostValue)
     if (statusClass.value) q.set('status_class', statusClass.value)
-    q.set('limit', String(limit.value))
-    rows.value = (await api.get<any[]>(`/api/v1/access-logs?${q.toString()}`)) || []
+    q.set('page', String(nextPage))
+    q.set('page_size', String(pageSize.value))
+    const result = await api.get<any>(`/api/v1/access-logs?${q.toString()}`)
+    rows.value = result?.items || []
+    hasMore.value = !!result?.has_more
+    page.value = result?.page || nextPage
   } catch (e: any) {
     rows.value = []
+    hasMore.value = false
     toast.error(e?.data?.error || e?.message || '加载访问日志失败')
   } finally {
     loading.value = false
@@ -242,7 +241,7 @@ onMounted(load)
 .log-table {
   --col-time: 160px;
   --col-node: 105px;
-  --col-ip: 125px;
+  --col-ip: 300px;
   --col-method: 68px;
   --col-host: 150px;
   --col-ua: 180px;
@@ -259,7 +258,7 @@ onMounted(load)
   .log-table {
     --col-time: 170px;
     --col-node: 125px;
-    --col-ip: 145px;
+    --col-ip: 300px;
     --col-method: 72px;
     --col-host: 190px;
     --col-ua: 300px;
@@ -275,7 +274,7 @@ onMounted(load)
   .log-table {
     --col-time: 220px;
     --col-node: 180px;
-    --col-ip: 200px;
+    --col-ip: 300px;
     --col-method: 90px;
     --col-host: 260px;
     --col-ua: 500px;
@@ -301,7 +300,7 @@ onMounted(load)
   .log-table {
     --col-time: 240px;
     --col-node: 200px;
-    --col-ip: 220px;
+    --col-ip: 300px;
     --col-method: 96px;
     --col-host: 300px;
     --col-ua: 500px;
@@ -333,6 +332,15 @@ onMounted(load)
 
 .log-table {
   font-size: 13px;
+}
+
+.ip-cell {
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.log-pagination {
+  justify-content: space-between;
 }
 
 .log-table th {

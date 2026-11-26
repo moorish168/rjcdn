@@ -286,6 +286,8 @@ curl -X POST http://127.0.0.1:8080/api/v1/certs/issue \
   共用逻辑 `composables/useNodeDetail.ts`（对照 EdgeAdmin 节点详情 / 安装 / 设置）。
 - WAF 全局页（`/waf/...`）：顶栏 Tab（概览 / 防护设置 / 自定义规则 / IP 名单 / 地区名单 / 共享封禁 / 事件日志）；
   壳 `pages/waf.vue`，共用 `composables/useWafConsole.ts`（对照 EdgeAdmin WAF 二级菜单）。
+- 安全模块另提供全局 WAF 事件页（`/waf/events`），与 IP 名单同级；站点 WAF 事件页仍在
+  `/domains/:id/waf/events`。
 - 智能 DNS（`/dns/...`）：顶栏 Tab + 侧栏子项（CDN 主域 / 域名与记录 / DNS 节点 / DNS 线路）；
   壳 `pages/dns.vue`，共用 `composables/useDnsConsole.ts`。托管域名与「添加站点 → 整域托管」联动自动创建；
   DNS 页「仅添加 DNS」留给无站点的纯解析场景。
@@ -568,17 +570,17 @@ bash tests/integration/nodes.sh
 
 控制台「WAF 防护」页按域名配置，默认关闭；开启后默认拦截模式。
 
-- **托管规则**：SQL 注入、XSS、路径穿越、扫描器/敏感路径、命令执行（RCE）、SSRF/云元数据、
-  XXE、Log4Shell、CRLF/头注入，每类可单独开关
-- **安全级别**：`off | low | medium | high | under_attack`
+- **托管规则**：SQL 注入、XSS、路径穿越、扫描器/敏感路径、命令执行（含常见运行时）、SSRF/云元数据、
+  XXE、Log4Shell、CRLF/头注入、SSTI、NoSQL、LDAP、Java 反序列化与 WebShell，每类可单独开关
+- **浏览器质询**：`off | low | medium | high | under_attack`，默认 `off`；它只调整质询，不控制托管规则、自定义规则或 IP 名单
   - 低：空 User-Agent 的 GET/HEAD 质询
   - 中：低 + 扫描器 UA
   - 高：文档类 GET/HEAD（HTML 导航）质询
   - 攻击中：所有 GET/HEAD 质询，静态资源（css/js/图片/字体/视频）除外
-  安全级别在显式规则之后生效，因此放行规则可以豁免；观察模式下只记录不质询。
+  质询策略在显式规则之后生效，因此放行规则可以豁免；观察模式下只记录不质询。WAF 总开关默认关闭，控制站点级 WAF 规则。
 - **自定义规则**：字段 `path|query|user_agent|referer|method|ip|header:<name>`，
   操作符 `contains|equals|prefix|suffix`，动作 `block|allow|log|challenge`，按 `priority` 从高到低
-- **IP 名单**：`allow` 优先于一切检查；`deny` 直接拦截；支持 IPv4/IPv6 与 CIDR
+- **IP 名单**：站点级 `allow` 会绕过站点级检查，站点级 `deny` 直接拦截；管理员可创建自动应用于全部站点的全局黑名单。全局黑名单先于站点名单检查，不受站点 WAF 开关或站点白名单影响；支持 IPv4/IPv6 与 CIDR。
 - **浏览器质询**：动作为 `challenge` 时，GET/HEAD 且无有效免质询 Cookie 的客户端会收到一个
   JS 工作量证明页面；浏览器算出满足难度（前导十六进制 0）的 `sha256(nonce:counter)` 后回调
   `/__lagran/challenge/verify`，边缘校验 nonce 签名与 PoW，签发 HttpOnly 的
@@ -593,7 +595,10 @@ bash tests/integration/nodes.sh
 
 配置通过 `/api/v1/config` 随域名下发（版本号包含 WAF 内容，修改后约 15 秒生效）。
 事件由边缘缓冲后每 `WAF_REPORT_INTERVAL`（默认 5 秒）`POST /api/v1/waf/events`，
-控制台可在事件日志中按域名/动作查询；`GET /api/v1/waf/stats?domain=&days=7` 提供
+控制台在「安全 → WAF 事件」和站点 WAF 页查看事件，并可直接把事件 IP 加入全局或本站黑名单。
+访问日志与 WAF 事件列表都使用服务端分页：`page` 从 1 开始，`page_size` 最大 500；请求分页参数时返回
+`{items, page, page_size, has_more}`，前端每页选项为 50/100/200/500。事件旧接口只带 `limit` 时仍返回数组。
+`GET /api/v1/waf/stats?domain=&days=7` 提供
 按动作/类型/天、Top IP/规则/路径的聚合，用于「数据概览」。
 
 ```bash
@@ -686,7 +691,7 @@ CC_SYNC_INTERVAL=5   # 共享封禁拉取间隔（秒），最小 2
 
 - `TRUST_PROXY_HEADERS=true` 时 WAF 信任 `X-Forwarded-For` 的第一个地址。
   只有边缘前面是可信代理（SLB/网关）时才可开启，否则攻击者可以伪造白名单 IP。
-- 当前不做请求体检查（WAF 在读取 body 之前执行），不支持正则，也没有 IP 信誉库/地域封禁。
+- 对已知长度不超过 1 MiB 的表单、JSON、XML、文本与 multipart 请求体做有限检查，解压后最多扫描 8 MiB，支持 gzip/deflate、URL/Unicode/Base64/Hex 解码；更大的请求体、流式上传和未支持的编码不检查。当前是独立实现的特征规则，不等同于 aaWAF 的语义分析引擎；不支持正则，也没有 IP 信誉库。
 - 安全级别「攻击中」会质询所有非静态资源的 GET/HEAD，包括 API 请求；这类客户端无法执行 JS 时会收到 403，
   建议仅在应急时开启，或配合放行规则豁免 API 路径。
 

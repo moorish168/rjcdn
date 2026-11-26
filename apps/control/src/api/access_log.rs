@@ -6,9 +6,21 @@ use crate::repository;
 use crate::state::AppState;
 use axum::{
     extract::{Query, State},
+    http::StatusCode,
+    response::IntoResponse,
     Json,
 };
 use serde::{Deserialize, Serialize};
+
+type ApiError = (StatusCode, Json<serde_json::Value>);
+const MAX_PAGE_SIZE: i64 = 500;
+
+fn db_error() -> ApiError {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({ "error": "database error" })),
+    )
+}
 
 type AccessLogInsertRow = (
     String,
@@ -57,6 +69,8 @@ pub struct ReportAck {
 pub struct ListQuery {
     pub host: Option<String>,
     pub limit: Option<i64>,
+    pub page: Option<i64>,
+    pub page_size: Option<i64>,
     /// 2xx / 3xx / 4xx / 5xx
     pub status_class: Option<String>,
 }
@@ -77,6 +91,14 @@ pub struct AccessLogDto {
     pub action: String,
     pub user_agent: String,
     pub referer: String,
+}
+
+#[derive(Serialize)]
+pub struct AccessLogPageDto {
+    pub items: Vec<AccessLogDto>,
+    pub page: i64,
+    pub page_size: i64,
+    pub has_more: bool,
 }
 
 /// Split an ingest batch into rows that belong to a domain and hostless rows.
@@ -197,25 +219,36 @@ pub async fn list(
     State(state): State<AppState>,
     actor: Actor,
     Query(q): Query<ListQuery>,
-) -> Json<Vec<AccessLogDto>> {
+) -> Result<axum::response::Response, ApiError> {
     // Non-admins only see hosts that belong to their projects.
     let visible_hosts: Option<Vec<String>> = match actor.visible_domain_ids(&state).await {
         None => None,
-        Some(ids) => {
-            Some(
-                repository::hostnames_by_ids(&state.pool, &ids)
+        Some(ids) => Some(
+            repository::hostnames_by_ids(&state.pool, &ids)
                 .await
                 .unwrap_or_default()
                 .into_iter()
                 .collect(),
-            )
-        }
+        ),
     };
 
     if let Some(ref hosts) = visible_hosts {
         if let Some(ref h) = q.host {
             if !hosts.contains(h) {
-                return Json(vec![]);
+                if q.page.is_some() || q.page_size.is_some() {
+                    return Ok(Json(AccessLogPageDto {
+                        items: Vec::new(),
+                        page: q.page.unwrap_or(1).clamp(1, 1_000_000),
+                        page_size: q
+                            .page_size
+                            .or(q.limit)
+                            .unwrap_or(100)
+                            .clamp(1, MAX_PAGE_SIZE),
+                        has_more: false,
+                    })
+                    .into_response());
+                }
+                return Ok(Json(Vec::<AccessLogDto>::new()).into_response());
             }
         }
     }
@@ -227,7 +260,22 @@ pub async fn list(
         Some("5xx") => (Some(500), Some(600)),
         _ => (None, None),
     };
-    let limit = q.limit.unwrap_or(100).clamp(1, 1000);
+    let paginated = q.page.is_some() || q.page_size.is_some();
+    let page = q.page.unwrap_or(1).clamp(1, 1_000_000);
+    let page_size = q
+        .page_size
+        .unwrap_or_else(|| q.limit.unwrap_or(100))
+        .clamp(1, MAX_PAGE_SIZE);
+    let limit = if paginated {
+        page_size + 1
+    } else {
+        q.limit.unwrap_or(100).clamp(1, MAX_PAGE_SIZE)
+    };
+    let offset = if paginated {
+        page.saturating_sub(1).saturating_mul(page_size)
+    } else {
+        0
+    };
     let rows = repository::list_access_logs(
         &state.pool,
         q.host.as_deref(),
@@ -235,29 +283,48 @@ pub async fn list(
         status_min,
         status_max,
         limit,
+        offset,
     )
     .await
-    .unwrap_or_default();
-    Json(
-        rows.into_iter()
-            .map(|r| AccessLogDto {
-                id: r.id,
-                ts: r.ts.to_rfc3339(),
-                node_id: r.node_id,
-                client_ip: r.client_ip,
-                method: r.method,
-                host: r.host,
-                path: r.path,
-                status: r.status,
-                bytes: r.bytes,
-                latency_ms: r.latency_ms,
-                cache_status: r.cache_status,
-                action: r.action,
-                user_agent: r.user_agent,
-                referer: r.referer,
-            })
-            .collect(),
-    )
+    .map_err(|e| {
+        tracing::error!(error = %e, "list access logs");
+        db_error()
+    })?;
+    let has_more = paginated && rows.len() as i64 > page_size;
+    let mut rows = rows;
+    if has_more {
+        rows.truncate(page_size as usize);
+    }
+    let items: Vec<AccessLogDto> = rows
+        .into_iter()
+        .map(|r| AccessLogDto {
+            id: r.id,
+            ts: r.ts.to_rfc3339(),
+            node_id: r.node_id,
+            client_ip: r.client_ip,
+            method: r.method,
+            host: r.host,
+            path: r.path,
+            status: r.status,
+            bytes: r.bytes,
+            latency_ms: r.latency_ms,
+            cache_status: r.cache_status,
+            action: r.action,
+            user_agent: r.user_agent,
+            referer: r.referer,
+        })
+        .collect();
+    if paginated {
+        Ok(Json(AccessLogPageDto {
+            items,
+            page,
+            page_size,
+            has_more,
+        })
+        .into_response())
+    } else {
+        Ok(Json(items).into_response())
+    }
 }
 
 #[cfg(test)]

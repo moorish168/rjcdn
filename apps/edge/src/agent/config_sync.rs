@@ -344,6 +344,8 @@ struct WafCfg {
     #[serde(default)]
     ip_deny: Vec<String>,
     #[serde(default)]
+    global_ip_deny: Vec<String>,
+    #[serde(default)]
     country_allow: Vec<String>,
     #[serde(default)]
     country_deny: Vec<String>,
@@ -592,6 +594,7 @@ fn into_waf(cfg: Option<WafCfg>, config: &EdgeConfig) -> WafConfig {
         rules,
         ip_allow: parse_nets(cfg.ip_allow),
         ip_deny: parse_nets(cfg.ip_deny),
+        global_ip_deny: parse_nets(cfg.global_ip_deny),
         country_allow: parse_countries(cfg.country_allow),
         country_deny: parse_countries(cfg.country_deny),
         asn_allow: cfg.asn_allow,

@@ -213,42 +213,114 @@ pub fn origin_error_page(host: &str, path: &str, failure: OriginFailure) -> Resp
 }
 
 /// Page returned when the WAF rejects a request.
-pub fn waf_blocked_page(host: &str, path: &str, rule: &str, category: &str) -> Response {
+pub fn waf_blocked_page(host: &str, path: &str, rule: &str, _category: &str) -> Response {
     let host_esc = html_escape(host);
     let path_esc = html_escape(&truncate(path, 160));
-    let rule_esc = html_escape(&truncate(rule, 96));
-    let category_label = match category {
-        "sqli" => "SQL 注入",
-        "xss" => "XSS 跨站脚本",
-        "traversal" => "路径穿越",
-        "scanners" => "恶意扫描",
-        "ip_deny" => "IP 黑名单",
-        "geo_deny" => "Geo 黑名单",
-        "asn_deny" => "ASN 黑名单",
-        _ => "自定义规则",
-    };
-    let body = format!(
-        r#"<h1>请求已被安全拦截</h1>
-    <p>该请求命中了 Web 应用防火墙（WAF）策略，已被边缘节点拒绝。</p>
-    <p>请求信息：域名 <code>{host_esc}</code> · 路径 <code>{path_esc}</code></p>
-    <p>命中规则：<code>{rule_esc}</code>（{category_label}）</p>
-    <p>如果你是正常访客：</p>
-    <ul>
-      <li>请检查请求参数中是否包含特殊字符或脚本片段</li>
-      <li>稍后重试，或联系站点管理员确认是否为误报</li>
-    </ul>
-    <p>如果你是站点管理员：可在控制台「WAF 防护」中调整自定义规则、放行 IP，或先把模式切换为「观察」以确认误报。</p>"#
+    let html = format!(
+        r##"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#f4f6fa" />
+  <title>Request blocked</title>
+  <style>
+    * {{ box-sizing: border-box; }}
+    body {{
+      min-height: 100vh; margin: 0; padding: 28px 16px; display: grid; place-items: center;
+      background: #f4f6fa; color: #182230;
+      font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }}
+    main {{ width: min(100%, 600px); }}
+    .card {{
+      padding: clamp(24px, 5vw, 42px); background: #fff; border: 1px solid #e3e8ef;
+      border-radius: 18px; box-shadow: 0 18px 48px rgba(24, 34, 48, .08);
+    }}
+    .eyebrow {{
+      display: inline-flex; align-items: center; gap: 8px; color: #b42318;
+      font-size: 12px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase;
+    }}
+    .eyebrow svg {{ width: 17px; height: 17px; }}
+    h1 {{ margin: 16px 0 8px; font-size: clamp(28px, 5vw, 36px); line-height: 1.15; letter-spacing: -.03em; }}
+    .intro {{ margin: 0; color: #526071; font-size: 16px; line-height: 1.65; }}
+    .details {{
+      display: grid; gap: 14px; margin: 28px 0 0; padding: 18px;
+      background: #f8fafc; border: 1px solid #e8edf3; border-radius: 12px;
+    }}
+    .detail {{ min-width: 0; }}
+    dt {{ margin-bottom: 5px; color: #657386; font-size: 12px; font-weight: 600; }}
+    dd {{ margin: 0; }}
+    code {{
+      display: block; overflow-wrap: anywhere; color: #27364a;
+      font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }}
+    .guidance {{ margin-top: 24px; }}
+    .guidance h2 {{ margin: 0 0 6px; font-size: 15px; }}
+    .guidance p {{ margin: 0; color: #526071; font-size: 14px; line-height: 1.65; }}
+    .reference {{
+      display: flex; align-items: center; justify-content: space-between; gap: 12px;
+      margin-top: 28px; padding-top: 16px; border-top: 1px solid #e8edf3;
+      color: #657386; font-size: 12px;
+    }}
+    .reference code {{ display: inline; color: #344054; font-size: 12px; font-weight: 600; }}
+    @media (max-width: 420px) {{
+      body {{ padding: 16px 12px; }}
+      .card {{ border-radius: 14px; }}
+      .reference {{ align-items: flex-start; flex-direction: column; gap: 4px; }}
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <section class="card" aria-labelledby="page-title">
+      <div class="eyebrow">
+        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M12 3 20 6v5c0 5-3.4 8.5-8 10-4.6-1.5-8-5-8-10V6l8-3Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" />
+          <path d="M12 8v5m0 3h.01" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+        </svg>
+        <span>Access denied</span>
+      </div>
+      <h1 id="page-title">Request blocked</h1>
+      <p class="intro">This request was blocked by the website's security policy.</p>
+
+      <dl class="details" aria-label="Request details">
+        <div class="detail">
+          <dt>Website</dt>
+          <dd><code>{host_esc}</code></dd>
+        </div>
+        <div class="detail">
+          <dt>Requested path</dt>
+          <dd><code>{path_esc}</code></dd>
+        </div>
+      </dl>
+
+      <div class="guidance">
+        <h2>What can I do?</h2>
+        <p>If you believe this was a mistake, contact the website owner and include the reference code below. Site administrators can review the WAF event log for more information.</p>
+      </div>
+
+      <div class="reference"><span>Reference code</span><code>WAF_BLOCKED</code></div>
+    </section>
+  </main>
+</body>
+</html>"##
     );
 
-    let mut response = render_page(
+    let mut response = (
         StatusCode::FORBIDDEN,
-        "安全拦截",
-        "请求已被拦截",
-        &body,
-        "WAF_BLOCKED",
-        true,
-    );
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        Html(html),
+    )
+        .into_response();
     let headers = response.headers_mut();
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, no-cache, must-revalidate"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-lagran-error"),
+        HeaderValue::from_static("WAF_BLOCKED"),
+    );
     headers.remove(header::RETRY_AFTER);
     headers.insert(
         HeaderName::from_static("x-lagran-waf"),
@@ -519,12 +591,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn all_edge_error_pages_include_support_link() {
+    async fn non_waf_error_pages_include_support_link() {
         use http_body_util::BodyExt;
 
+        // The WAF page is intentionally standalone and has no branding or support link.
         let pages = [
             origin_error_page("cdn.test", "/a", OriginFailure::Unreachable),
-            waf_blocked_page("cdn.test", "/search", "SQL 注入", "sqli"),
             node_disabled_page("cdn.test"),
             rate_limited_page("cdn.test", "/api", 7, false),
             unknown_domain_page("not-onboarded.test"),
