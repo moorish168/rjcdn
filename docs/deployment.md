@@ -688,7 +688,7 @@ HTTP/3 / WebP（边缘）：
 | `EDGE_COMPRESSION` | 全局 GZIP 总开关；与站点 `gzip_enabled` 取 AND |
 | Cargo feature `image-webp` | JPEG/PNG→WebP，默认编译进边缘（发布包已包含；`--no-default-features` 可去掉）。`lagran-edge version` 输出 `features: image-webp` 即可转码；运行时仍受站点 `image_webp_enabled` 控制 |
 
-防火墙需放行 UDP/443（或你配置的 H3 端口）。站点高级设置可开关 WebSocket / HTTP2 / HTTP3 / GZIP / WebP。
+新站点的 HTTP/3 默认关闭。开启前，防火墙需放行 UDP/443（或你配置的 H3 端口）；站点高级设置可开关 WebSocket / HTTP2 / HTTP3 / GZIP / WebP。
 
 调试建议：
 
@@ -1229,6 +1229,7 @@ sudo ufw enable
 ```bash
 sudo ufw allow 80/tcp
 sudo ufw allow 443/tcp
+sudo ufw allow 443/udp
 # 管理面只允许控制面来源 IP；不要对公网开放 8081
 sudo ufw allow from 10.0.0.10 to any port 8081 proto tcp
 ```

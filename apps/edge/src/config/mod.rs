@@ -208,6 +208,11 @@ impl Default for EdgeConfig {
         let https_listen_addr = std::env::var("EDGE_HTTPS_LISTEN")
             .ok()
             .filter(|s| !s.is_empty());
+        let h3_listen_addr = match std::env::var("EDGE_H3_LISTEN") {
+            Ok(value) if value.trim().is_empty() => None,
+            Ok(value) => Some(value),
+            Err(_) => https_listen_addr.clone(),
+        };
         let https_redirect_port = std::env::var("EDGE_HTTPS_REDIRECT_PORT")
             .ok()
             .and_then(|v| v.parse::<u16>().ok())
@@ -232,13 +237,8 @@ impl Default for EdgeConfig {
                 })
                 .clamp(1, 256),
             https_listen_addr: https_listen_addr.clone(),
-            h3_listen_addr: std::env::var("EDGE_H3_LISTEN")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .or_else(|| {
-                    // Default: same host:port as HTTPS when set (UDP vs TCP).
-                    https_listen_addr.clone()
-                }),
+            // An unset variable follows HTTPS; an explicitly empty value disables H3.
+            h3_listen_addr,
             origin_url: std::env::var("ORIGIN_URL")
                 .unwrap_or_else(|_| "https://example.com".into()),
             default_ttl_secs: std::env::var("CACHE_TTL")

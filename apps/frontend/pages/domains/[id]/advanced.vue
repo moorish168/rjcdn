@@ -79,7 +79,7 @@ const settings = ref({
   cc_allow_ips: '',
   websocket_enabled: true,
   http2_enabled: true,
-  http3_enabled: true,
+  http3_enabled: false,
   gzip_enabled: true,
   image_webp_enabled: true,
   access_log_enabled: true,
@@ -163,7 +163,7 @@ async function loadSettings() {
       cc_allow_ips: s.cc_allow_ips || '',
       websocket_enabled: s.websocket_enabled !== false,
       http2_enabled: s.http2_enabled !== false,
-      http3_enabled: s.http3_enabled !== false,
+      http3_enabled: s.http3_enabled === true,
       min_tls_version: ['1.0', '1.1', '1.2', '1.3'].includes(s.min_tls_version)
         ? s.min_tls_version
         : '1.2',
@@ -544,7 +544,7 @@ watch(id, loadSettings, { immediate: true })
         <section class="settings-group">
           <h4 class="settings-group-title">协议与优化</h4>
           <p class="field-hint" style="margin-top: 0">
-            按站点开关；HTTP/3 需边缘开启 UDP 监听。图片 WebP 只转换可缓存且源站带 ETag 的 JPEG/PNG，
+            按站点开关；新站点的 HTTP/3 默认关闭，启用前需确认边缘 UDP 监听和防火墙已配置。图片 WebP 只转换可缓存且源站带 ETag 的 JPEG/PNG，
             只发给 Accept 含 image/webp 的客户端：首次请求返回原图并在后台转码，之后返回 WebP。
             边缘需为含 WebP 的版本（<code>lagran-edge version</code> 显示 image-webp）。
           </p>

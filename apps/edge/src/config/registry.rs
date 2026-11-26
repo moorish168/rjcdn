@@ -141,7 +141,7 @@ impl Default for DomainEntry {
             hotlink_signature_enabled: false,
             websocket_enabled: true,
             http2_enabled: true,
-            http3_enabled: true,
+            http3_enabled: false,
             gzip_enabled: true,
             image_webp_enabled: true,
             min_tls_version: String::new(),

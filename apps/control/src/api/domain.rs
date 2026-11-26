@@ -167,7 +167,7 @@ pub(crate) fn to_dto_with_hostnames(
         // Protocol flags come from settings; list views use safe defaults.
         websocket_enabled: true,
         http2_enabled: true,
-        http3_enabled: true,
+        http3_enabled: false,
         gzip_enabled: true,
         image_webp_enabled: true,
     }

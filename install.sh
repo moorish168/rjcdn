@@ -96,6 +96,7 @@ Wizard / unattended settings:
   LAGRAN_CONSOLE_DOMAIN=...      frontend: optional domain for the console
   LAGRAN_CONSOLE_TLS=internal|off frontend: self-signed HTTPS (default) or plain HTTP
   EDGE_HTTPS_LISTEN=...          edge: default 0.0.0.0:443 (empty string disables)
+  EDGE_H3_LISTEN=...              edge: default follows EDGE_HTTPS_LISTEN; empty disables
 
 Environment:
   LAGRAN_REPO=<owner/repo>       GitHub repository (default moorish168/rjcdn)
@@ -1260,6 +1261,7 @@ write_edge_env() {
 
   local edge_listen="${EDGE_LISTEN:-0.0.0.0:80}"
   local https_listen="${EDGE_HTTPS_LISTEN-0.0.0.0:443}"
+  local h3_listen="${EDGE_H3_LISTEN-${https_listen}}"
   local admin_listen="${EDGE_ADMIN_LISTEN:-127.0.0.1:8082}"
   local agent_url="${AGENT_URL:-http://127.0.0.1:8082}"
   if [[ "$CONTROL_BOOTSTRAP" != "1" && "$agent_url" == http://127.0.0.1:* ]]; then
@@ -1287,6 +1289,7 @@ write_edge_env() {
   cat > "$env_file" <<EOF
 EDGE_LISTEN=${edge_listen}
 EDGE_HTTPS_LISTEN=${https_listen}
+EDGE_H3_LISTEN=${h3_listen}
 EDGE_ADMIN_LISTEN=${admin_listen}
 NODE_ID=${node_id}
 NODE_REGION=${NODE_REGION:-local}
@@ -1721,6 +1724,19 @@ main_edge() {
   enable_service lagran-edge
   open_port 80/tcp
   open_port 443/tcp
+  local h3_listen h3_port
+  if grep -q '^EDGE_H3_LISTEN=' "$CONF_DIR/edge.env"; then
+    h3_listen="$(env_value "$CONF_DIR/edge.env" EDGE_H3_LISTEN)"
+  else
+    # Older generated configs omitted EDGE_H3_LISTEN and inherit HTTPS in EdgeConfig.
+    h3_listen="$(env_value "$CONF_DIR/edge.env" EDGE_HTTPS_LISTEN)"
+  fi
+  if [[ -n "$h3_listen" ]]; then
+    h3_port="${h3_listen##*:}"
+    if [[ "$h3_port" =~ ^[0-9]{1,5}$ ]] && (( 10#$h3_port >= 1 && 10#$h3_port <= 65535 )); then
+      open_port "${h3_port}/udp"
+    fi
+  fi
 }
 
 print_summary() {

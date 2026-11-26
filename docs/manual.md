@@ -71,6 +71,7 @@ lagran-dns:53（权威 DNS）── /api/v1/schedule → lagran-control
 | `8080/tcp` | control | 控制面 API；生产只应通过反向代理暴露 |
 | `8081/tcp` | edge | 公共 HTTP 数据面 |
 | `443/tcp` | edge | 公共 HTTPS 数据面（配置后） |
+| `443/udp` | edge | HTTP/3 QUIC 数据面（配置后） |
 | `8082/tcp` | edge | 管理/Agent 接口，建议 `127.0.0.1` 或内网 |
 | `5432/tcp` | PostgreSQL | 仅内网 |
 | `6379/tcp` | Redis（可选） | 仅内网 |
@@ -1016,7 +1017,7 @@ DSL 仍然只检查 path/query/UA/Referer/Method/Header/IP，不读取请求体�
 - 自动续期（默认到期前 45 天，可用 `ACME_RENEW_BEFORE_DAYS` 调整）
 - NS / CNAME 就绪后可自动 HTTPS（`auto_https` + 后台任务）
 - 推送到 Edge，SNI 热加载
-- 站点级协议开关：WebSocket / HTTP/2 / HTTP/3 / GZIP / WebP（高级设置 → 协议与优化）
+- 站点级协议开关：WebSocket / HTTP/2 / HTTP/3 / GZIP / WebP（高级设置 → 协议与优化）；新站点的 HTTP/3 默认关闭，启用前需确保边缘 UDP 端口已放行
 
 ### 3.8 节点管理
 
