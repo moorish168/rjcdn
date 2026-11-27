@@ -3062,10 +3062,12 @@ status=304 + cache_status=BYPASS
 如果是：
 
 ```text
-status=304 + cache_status=REVALIDATED
+status=304 + cache_status=HIT（或 STALE）
 ```
 
-才表示客户端的条件请求（If-None-Match）由 Edge 回答，而不是转发给源站。缓存对象仍新鲜或在 stale 窗口内时，Edge 直接用它判定、不回源，计为命中；缓存未命中、或对象已过期需要先向源站取回或校验时，Edge 回源后再回 304，计为未命中。
+才表示 Edge 用缓存对象直接回答了客户端的条件请求（If-None-Match），没有回源，计为命中，与阿里云 CDN 的 `HIT TCP_IMS_HIT` 一致。
+
+`status=304 + cache_status=MISS` 表示缓存里没有可用对象：Edge 先从源站取回完整对象并写入缓存，再按客户端的条件回 304，计为未命中。`cache_status=REVALIDATED` 只表示 Edge 的缓存对象已过期，Edge 向源站发了条件请求、源站返回 304 后继续使用该对象，计为未命中。
 
 ### 7.4 关键响应头
 

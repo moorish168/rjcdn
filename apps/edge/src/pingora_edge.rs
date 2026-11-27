@@ -380,10 +380,6 @@ struct ReqCtx {
     /// taken from the effective policy in `response_filter`. `None` when the
     /// response did not pass through it (served from `request_filter`).
     rule_matched: Option<bool>,
-    /// A `REVALIDATED` 304 that answered the client's own If-None-Match from
-    /// the cached object (fresh or stale) without contacting the origin. It
-    /// counts as a hit; a 304 after a miss or an origin revalidation does not.
-    not_modified_from_cache: bool,
     head_body: BytesMut,
     head_headers: Option<ResponseHeader>,
     head_status: u16,
@@ -444,7 +440,6 @@ impl Default for ReqCtx {
             response_bypass: false,
             response_policy: None,
             rule_matched: None,
-            not_modified_from_cache: false,
             head_body: BytesMut::new(),
             head_headers: None,
             head_status: 0,
@@ -1715,7 +1710,12 @@ impl ProxyHttp for DataPlaneProxy {
         } else {
             plan.policy
         };
-        let mut label = if ctx.response_bypass {
+        // A 304 to the client's own If-None-Match keeps the cache result, as
+        // on Alibaba Cloud CDN (`HIT TCP_IMS_HIT`): HIT or STALE when the
+        // cached object answered it, MISS when the object was fetched from
+        // the origin first. REVALIDATED is only the edge revalidating a
+        // stale object with the origin.
+        let label = if ctx.response_bypass {
             "BYPASS"
         } else if plan.is_websocket {
             "WS"
@@ -1724,18 +1724,6 @@ impl ProxyHttp for DataPlaneProxy {
         } else {
             plan.label
         };
-        if !ctx.response_bypass
-            && plan.cacheable
-            && response.status == 304
-            && session.req_header().headers.contains_key("if-none-match")
-        {
-            // On a hit (fresh or stale) Pingora answers the client's
-            // If-None-Match from the cached object; the origin is never
-            // asked. On a miss or an origin revalidation it strips the
-            // client's validators, fetches upstream, then answers 304.
-            ctx.not_modified_from_cache = matches!(label, "HIT" | "STALE");
-            label = "REVALIDATED";
-        }
         ctx.cache_label = label;
         ctx.rule_matched = Some(response_policy.rule_matched);
         ctx.status = response.status.as_u16();
@@ -2329,13 +2317,6 @@ impl ProxyHttp for DataPlaneProxy {
             });
         match label {
             "HIT" | "STALE" => {
-                self.state
-                    .metrics
-                    .record_rule_hit(&ctx.host, bytes, rule_matched)
-            }
-            // A browser revalidation answered from the cached object is a
-            // hit, as in the in-process engine.
-            "REVALIDATED" if ctx.not_modified_from_cache => {
                 self.state
                     .metrics
                     .record_rule_hit(&ctx.host, bytes, rule_matched)
@@ -4485,13 +4466,14 @@ impl DataPlaneProxy {
                 headers.insert(name, value);
             }
         }
+        // A 304 answered from the cached object keeps HIT/STALE.
         headers.insert(
             HeaderName::from_static("x-cache"),
-            HeaderValue::from_static(if not_modified { "REVALIDATED" } else { label }),
+            HeaderValue::from_static(label),
         );
         headers.insert(
             HeaderName::from_static("x-cache-status"),
-            HeaderValue::from_static(if not_modified { "REVALIDATED" } else { label }),
+            HeaderValue::from_static(label),
         );
         headers.insert(
             HeaderName::from_static("age"),
@@ -4528,7 +4510,6 @@ impl DataPlaneProxy {
         {
             return false;
         }
-        let cache_label = if not_modified { "REVALIDATED" } else { label };
         log_access(
             &self.state.access_log,
             &ctx.method,
@@ -4540,7 +4521,7 @@ impl DataPlaneProxy {
             &ctx.user_agent,
             &ctx.referer,
             0,
-            cache_label,
+            label,
             &ctx.request_id,
         )
         .await;

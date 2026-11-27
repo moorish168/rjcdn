@@ -166,7 +166,7 @@ check "ignore_cookie rule caches browser cookie request" "$(hdr x-cache)" "HIT"
 # mainstream CDNs the edge serves them from cache while the entry is fresh.
 CODE=$(get "/assets/app.css" -H 'Cache-Control: max-age=0' -H "If-None-Match: $CSS_ETAG")
 check "reload with client ETag answers 304" "$CODE" "304"
-check "reload with client ETag is answered from cache" "$(hdr x-cache)" "REVALIDATED"
+check "reload with client ETag is answered from cache" "$(hdr x-cache)" "HIT"
 check "reload with client ETag stays on Pingora" "$(hdr x-cdn-datapath)" "pingora"
 CODE=$(get "/assets/app.css" -H 'Cache-Control: max-age=0')
 check "reload max-age=0 returns body" "$CODE" "200"
@@ -200,7 +200,7 @@ check "no-validator object reload is a HIT" "$(hdr x-cache)" "HIT"
 CODE=$(get "/assets/app.css" -H 'Cookie: lagran_clearance=test' \
   -H 'Cache-Control: no-cache' -H "If-None-Match: $CSS_ETAG")
 check "no-cache + ignored cookie answers 304 from cache" "$CODE" "304"
-check "no-cache + ignored cookie is answered from cache" "$(hdr x-cache)" "REVALIDATED"
+check "no-cache + ignored cookie is answered from cache" "$(hdr x-cache)" "HIT"
 get "/assets/app.js" >/dev/null
 check "js regex rule miss" "$(hdr x-cache)" "MISS"
 get "/assets/app.js" >/dev/null

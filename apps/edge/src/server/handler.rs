@@ -1913,11 +1913,11 @@ async fn serve_cached(
                 user_agent,
                 referer,
                 0,
-                CacheStatus::Revalidated.as_str(),
+                label.as_str(),
                 request_id,
             )
             .await;
-            return not_modified_response(&etag, &entry);
+            return not_modified_response(&etag, &entry, label);
         }
     }
 
@@ -2927,7 +2927,10 @@ pub(crate) fn cc_too_many(host: &str, path: &str, retry_after: u64, banned: bool
     default_page::rate_limited_page(host, path, retry_after, banned)
 }
 
-fn not_modified_response(etag: &str, entry: &CacheEntry) -> Response {
+/// 304 for the client's own If-None-Match, answered from the cached object.
+/// It keeps the object's cache result (HIT or STALE), as on Alibaba Cloud CDN
+/// (`HIT TCP_IMS_HIT`).
+fn not_modified_response(etag: &str, entry: &CacheEntry, label: CacheStatus) -> Response {
     let mut headers = HeaderMap::new();
     for name in [
         "cache-control",
@@ -2963,7 +2966,7 @@ fn not_modified_response(etag: &str, entry: &CacheEntry) -> Response {
             headers.insert(HeaderName::from_static("x-cache-ttl"), v);
         }
     }
-    cache_status_headers(&mut headers, CacheStatus::Revalidated.as_str());
+    cache_status_headers(&mut headers, label.as_str());
     apply_security_headers(&mut headers);
     let mut resp = Response::new(Body::empty());
     *resp.status_mut() = StatusCode::NOT_MODIFIED;
