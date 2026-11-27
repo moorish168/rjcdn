@@ -26,8 +26,8 @@ pub fn spawn_metrics_report(config: EdgeConfig, control: ControlClient, metrics:
                 // the control plane acknowledged. `take_snapshots` cleared the
                 // counters before the report was attempted, so a failure dropped the
                 // batch outright — the hit-ratio charts showed gaps, and the
-                // `cache_hit_ratio` alert returns early when `requests <= 0`, so a
-                // real problem could hide behind "no data".
+                // `cache_hit_ratio` alert returns early with no hits or misses, so
+                // a real problem could hide behind "no data".
                 let snaps = metrics.take_snapshots_peek();
                 if snaps.is_empty() {
                     continue;

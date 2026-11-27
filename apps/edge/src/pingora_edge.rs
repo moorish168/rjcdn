@@ -347,6 +347,9 @@ struct ReqCtx {
     user_agent: String,
     referer: String,
     start: Instant,
+    /// Cache status for the access log and metrics. Starts as `NONE`: a
+    /// response that never reaches a cache decision (ACME, challenge verify,
+    /// a preflight block) must not be counted as a MISS.
     cache_label: &'static str,
     cache_reason: Option<&'static str>,
     /// Age reported by pingora-cache for a hit; used to override a stale
@@ -373,6 +376,14 @@ struct ReqCtx {
     /// Response policy computed by the cache filter, reused by the response
     /// filter for the same Content-Type.
     response_policy: Option<ResponsePolicySlot>,
+    /// Whether a cache rule (not the default policy) governs this response,
+    /// taken from the effective policy in `response_filter`. `None` when the
+    /// response did not pass through it (served from `request_filter`).
+    rule_matched: Option<bool>,
+    /// A `REVALIDATED` 304 that answered the client's own If-None-Match from
+    /// the cached object (fresh or stale) without contacting the origin. It
+    /// counts as a hit; a 304 after a miss or an origin revalidation does not.
+    not_modified_from_cache: bool,
     head_body: BytesMut,
     head_headers: Option<ResponseHeader>,
     head_status: u16,
@@ -389,6 +400,9 @@ struct ReqCtx {
     flight_guard: Option<crate::cache::flight::FlightGuard>,
     /// Set when the in-process handler already wrote its own access log.
     skip_logging: bool,
+    /// The shared preflight already wrote this request's access-log row
+    /// (WAF, CC, HTTPS_REDIRECT, ...); `logging` only counts the request.
+    access_logged: bool,
     /// Set once the shared preflight has run for this request, so the
     /// in-process fallback does not charge CC / rate limits a second time.
     preflight_done: bool,
@@ -412,7 +426,7 @@ impl Default for ReqCtx {
             user_agent: String::new(),
             referer: String::new(),
             start: Instant::now(),
-            cache_label: "MISS",
+            cache_label: "NONE",
             cache_reason: None,
             cache_age_secs: None,
             cache_ttl_secs: None,
@@ -429,6 +443,8 @@ impl Default for ReqCtx {
             protocol_retries: 0,
             response_bypass: false,
             response_policy: None,
+            rule_matched: None,
+            not_modified_from_cache: false,
             head_body: BytesMut::new(),
             head_headers: None,
             head_status: 0,
@@ -440,6 +456,7 @@ impl Default for ReqCtx {
             identity_ttl_secs: None,
             flight_guard: None,
             skip_logging: false,
+            access_logged: false,
             preflight_done: false,
             webp_buf: None,
             webp_store_key: None,
@@ -497,6 +514,24 @@ fn resolve_response_policy(
         policy.action = RuleAction::Bypass;
     }
     policy
+}
+
+/// Whether a cache rule (not the default policy) governs a response with
+/// `content_type`. Content-Type rules can only be decided once the type is
+/// known; without them the request-time match is final.
+fn response_rule_matched(
+    plan: &NativePlan,
+    path: &str,
+    method: &str,
+    query: &str,
+    content_type: &str,
+) -> bool {
+    if plan.domain.has_content_type_rules {
+        let policy = resolve_response_policy(plan, path, method, query, content_type);
+        policy.rule_matched
+    } else {
+        plan.policy.rule_matched
+    }
 }
 
 #[async_trait]
@@ -905,6 +940,12 @@ impl ProxyHttp for DataPlaneProxy {
             if let Some(resp) = preflight {
                 let is_head = ctx.method == Method::HEAD;
                 write_axum_response(session, resp, is_head, Some(&self.compression)).await;
+                // The preflight wrote its own access-log row (WAF, CC,
+                // HTTPS_REDIRECT, ...). A blocked or redirected request never
+                // reached the cache: count it, but never as a MISS, and do not
+                // log it a second time.
+                ctx.cache_label = "BYPASS";
+                ctx.access_logged = true;
                 return Ok(true);
             }
             // Mark it so the in-process fallback does not run CC / rate limits
@@ -1124,6 +1165,9 @@ impl ProxyHttp for DataPlaneProxy {
                 }
             }
             if plan.is_head && self.serve_head_cache(session, &plan, ctx).await {
+                // `serve_head_cache` writes its own access-log row and counts
+                // the request; `logging` must not record it again.
+                ctx.skip_logging = true;
                 return Ok(true);
             }
             if plan.cacheable || plan.is_head {
@@ -1133,6 +1177,10 @@ impl ProxyHttp for DataPlaneProxy {
                 session.req_header_mut().remove_header("cache-control");
                 session.req_header_mut().remove_header("pragma");
             }
+            // `response_filter` refines this once a response arrives; until
+            // then a request that ends early (client abort) keeps the plan's
+            // own class instead of being counted as a MISS.
+            ctx.cache_label = plan.label;
             ctx.cache_reason = plan.cache_reason;
             ctx.plan = Some(plan);
             return Ok(false);
@@ -1681,9 +1729,15 @@ impl ProxyHttp for DataPlaneProxy {
             && response.status == 304
             && session.req_header().headers.contains_key("if-none-match")
         {
+            // On a hit (fresh or stale) Pingora answers the client's
+            // If-None-Match from the cached object; the origin is never
+            // asked. On a miss or an origin revalidation it strips the
+            // client's validators, fetches upstream, then answers 304.
+            ctx.not_modified_from_cache = matches!(label, "HIT" | "STALE");
             label = "REVALIDATED";
         }
         ctx.cache_label = label;
+        ctx.rule_matched = Some(response_policy.rule_matched);
         ctx.status = response.status.as_u16();
         // Shared-cache hits must expose the object's age, not the origin's
         // stored Age header (commonly `Age: 0` on every cached response).
@@ -2236,24 +2290,61 @@ impl ProxyHttp for DataPlaneProxy {
                 }
             }
         }
-        log_access(
-            &self.state.access_log,
-            &ctx.method,
-            &ctx.host,
-            &ctx.path,
-            status,
-            ctx.start,
-            &ctx.client_ip,
-            &ctx.user_agent,
-            &ctx.referer,
-            bytes,
-            label,
-            &ctx.request_id,
-        )
-        .await;
+        if !ctx.access_logged {
+            log_access(
+                &self.state.access_log,
+                &ctx.method,
+                &ctx.host,
+                &ctx.path,
+                status,
+                ctx.start,
+                &ctx.client_ip,
+                &ctx.user_agent,
+                &ctx.referer,
+                bytes,
+                label,
+                &ctx.request_id,
+            )
+            .await;
+        }
+        // Only requests governed by a cache rule enter the hit ratio. Range
+        // slices answered in `request_filter` never pass `response_filter`,
+        // so decide from the Content-Type that was actually written.
+        let rule_matched = matches!(label, "HIT" | "STALE" | "MISS" | "REVALIDATED")
+            && ctx.rule_matched.unwrap_or_else(|| {
+                ctx.plan.as_ref().is_some_and(|plan| {
+                    let content_type = session
+                        .response_written()
+                        .and_then(|r| r.headers.get("content-type"))
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    response_rule_matched(
+                        plan,
+                        &ctx.path,
+                        ctx.method.as_str(),
+                        session.req_header().uri.query().unwrap_or(""),
+                        content_type,
+                    )
+                })
+            });
         match label {
-            "HIT" | "STALE" => self.state.metrics.record_hit(&ctx.host, bytes),
-            "MISS" | "REVALIDATED" => self.state.metrics.record_miss(&ctx.host, bytes),
+            "HIT" | "STALE" => {
+                self.state
+                    .metrics
+                    .record_rule_hit(&ctx.host, bytes, rule_matched)
+            }
+            // A browser revalidation answered from the cached object is a
+            // hit, as in the in-process engine.
+            "REVALIDATED" if ctx.not_modified_from_cache => {
+                self.state
+                    .metrics
+                    .record_rule_hit(&ctx.host, bytes, rule_matched)
+            }
+            "MISS" | "REVALIDATED" => {
+                self.state
+                    .metrics
+                    .record_rule_miss(&ctx.host, bytes, rule_matched)
+            }
             _ => self.state.metrics.record_bypass(&ctx.host, bytes),
         }
     }
@@ -4453,11 +4544,18 @@ impl DataPlaneProxy {
             &ctx.request_id,
         )
         .await;
-        if cache_label == "HIT" {
-            self.state.metrics.record_hit(&ctx.host, 0);
-        } else {
-            self.state.metrics.record_miss(&ctx.host, 0);
-        }
+        let rule_matched = response_rule_matched(
+            plan,
+            &ctx.path,
+            ctx.method.as_str(),
+            session.req_header().uri.query().unwrap_or(""),
+            entry.header("content-type").unwrap_or(""),
+        );
+        // Every answer here comes from the cached object, the 304 to the
+        // client's own If-None-Match included: all of them are hits.
+        self.state
+            .metrics
+            .record_rule_hit(&ctx.host, 0, rule_matched);
         true
     }
 

@@ -197,6 +197,10 @@ pub struct ResolvedPolicy {
     pub key_ignore_origin: Option<bool>,
     /// Rule tri-state for Accept-Language.
     pub key_ignore_language: Option<bool>,
+    /// A cache rule produced this policy. The default policy (no rule
+    /// matched) still caches by origin headers, but only rule-matched
+    /// requests count toward the cache hit ratio.
+    pub rule_matched: bool,
 }
 
 impl Default for ResolvedPolicy {
@@ -211,6 +215,7 @@ impl Default for ResolvedPolicy {
             key_ignore: 0,
             key_ignore_origin: None,
             key_ignore_language: None,
+            rule_matched: false,
         }
     }
 }
@@ -388,6 +393,7 @@ pub fn rule_policy(rule: &CacheRule) -> ResolvedPolicy {
         key_ignore: 0,
         key_ignore_origin: header_modes.origin,
         key_ignore_language: header_modes.language,
+        rule_matched: true,
     }
 }
 
@@ -1456,6 +1462,18 @@ mod tests {
     }
 
     #[test]
+    fn only_rule_policies_count_as_rule_matched() {
+        let rules = vec![CacheRule::simple("/img/*".into(), 60, 1)];
+        let matched = resolve_rule_policy(&rules, "/img/a.jpg", "GET", "");
+        assert!(matched.rule_matched);
+        // No rule matched: the default policy may still cache, but it is
+        // not a rule match and stays out of the hit ratio.
+        let unmatched = resolve_rule_policy(&rules, "/index.html", "GET", "");
+        assert_eq!(unmatched.action, RuleAction::Cache);
+        assert!(!unmatched.rule_matched);
+    }
+
+    #[test]
     fn conditions_filter_and_disable_rules() {
         let rules = vec![
             rule_with("/api/*", 0, true, "", "", 0, None),
@@ -1602,6 +1620,7 @@ mod tests {
             key_ignore: 0,
             key_ignore_origin: None,
             key_ignore_language: None,
+            rule_matched: true,
         };
         let d =
             decide_storage(200, &hdrs(&[("cache-control", "max-age=600")]), policy, 60).unwrap();

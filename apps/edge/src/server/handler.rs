@@ -151,6 +151,8 @@ struct Effective {
     policy: ResolvedPolicy,
     rules: Vec<CacheRule>,
     path: String,
+    /// Raw query string, for re-matching rules against a stored Content-Type.
+    query: String,
     method: Method,
     ignore_query: bool,
     key_ignore: u8,
@@ -501,6 +503,7 @@ async fn proxy_handler_inner(State(state): State<Arc<AppState>>, req: Request<Bo
                 policy,
                 rules: e.rules.clone(),
                 path: path_only.clone(),
+                query: req.uri().query().unwrap_or("").to_string(),
                 method: method.clone(),
                 ignore_query: policy.ignore_query.unwrap_or(e.ignore_query_string),
                 key_ignore: policy.key_ignore,
@@ -535,6 +538,7 @@ async fn proxy_handler_inner(State(state): State<Arc<AppState>>, req: Request<Bo
                 policy,
                 rules: Vec::new(),
                 path: path_only.clone(),
+                query: req.uri().query().unwrap_or("").to_string(),
                 method: method.clone(),
                 response_headers: ResponseHeaderOverrides::empty_arc(),
                 origin_auth_header: String::new(),
@@ -987,7 +991,16 @@ async fn proxy_handler_inner(State(state): State<Arc<AppState>>, req: Request<Bo
                     let status = resp.status;
                     let body_len = resp.body.len() as u64;
                     let etag = entry_etag(&resp);
-                    state.metrics.record_hit(&host, body_len);
+                    let content_type = resp
+                        .headers
+                        .get("content-type")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    state.metrics.record_rule_hit(
+                        &host,
+                        body_len,
+                        entry_rule_matched(&eff, content_type),
+                    );
                     log_access(
                         &state.access_log,
                         &method,
@@ -1034,7 +1047,11 @@ async fn proxy_handler_inner(State(state): State<Arc<AppState>>, req: Request<Bo
                         // as a shared cache entry by this path.
                         || method == Method::HEAD;
                     if !response_bypass {
-                        state.metrics.record_miss(&host, body_len);
+                        state.metrics.record_rule_miss(
+                            &host,
+                            body_len,
+                            response_policy.rule_matched,
+                        );
                     } else {
                         state.metrics.record_bypass(&host, body_len);
                     }
@@ -1644,6 +1661,7 @@ fn spawn_revalidation(
             policy,
             rules,
             path,
+            query: url_query(&path_and_query).to_string(),
             method: Method::GET,
             ignore_query: false,
             key_ignore: 0,
@@ -1839,7 +1857,8 @@ async fn serve_range_entry(
     ));
     entry.headers.push(("accept-ranges".into(), "bytes".into()));
 
-    state.metrics.record_hit(host, body_len);
+    let rule_matched = entry_rule_matched(eff, entry.header("content-type").unwrap_or(""));
+    state.metrics.record_rule_hit(host, body_len, rule_matched);
     log_access(
         &state.access_log,
         method,
@@ -1878,10 +1897,11 @@ async fn serve_cached(
         .header("etag")
         .map(str::to_string)
         .unwrap_or_else(|| compute_etag(&entry));
+    let rule_matched = entry_rule_matched(eff, entry.header("content-type").unwrap_or(""));
 
     if let Some(inm) = if_none_match {
         if etag_matches(inm, &etag) {
-            state.metrics.record_hit(host, 0);
+            state.metrics.record_rule_hit(host, 0, rule_matched);
             log_access(
                 &state.access_log,
                 method,
@@ -1902,7 +1922,7 @@ async fn serve_cached(
     }
 
     let bytes = entry.body.len() as u64;
-    state.metrics.record_hit(host, bytes);
+    state.metrics.record_rule_hit(host, bytes, rule_matched);
     log_access(
         &state.access_log,
         method,
@@ -1985,6 +2005,28 @@ fn entry_response_bypass(eff: &Effective, entry: &CacheEntry) -> bool {
     )
     .action
         != RuleAction::Cache
+}
+
+/// Whether a cache rule (not the default policy) governs a cached response
+/// with `content_type`, mirroring `response_rule_matched` on the Pingora
+/// path. Only rule-matched requests count toward the hit ratio.
+fn entry_rule_matched(eff: &Effective, content_type: &str) -> bool {
+    if !eff
+        .rules
+        .iter()
+        .any(|rule| !rule.match_content_type.trim().is_empty())
+    {
+        return eff.policy.rule_matched;
+    }
+    resolve_rule_policy_for_response_with_domain(
+        &eff.rules,
+        &eff.path,
+        eff.method.as_str(),
+        &eff.query,
+        content_type,
+        &eff.key_ignore_headers,
+    )
+    .rule_matched
 }
 
 fn clone_as_entry(resp: &OriginResponse) -> CacheEntry {

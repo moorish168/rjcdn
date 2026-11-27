@@ -29,6 +29,7 @@ fn policy(ttl: Option<u64>, swr: u64) -> ResolvedPolicy {
         key_ignore: 0,
         key_ignore_origin: None,
         key_ignore_language: None,
+        rule_matched: true,
     }
 }
 

@@ -196,21 +196,25 @@ pub async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> Respo
     out.push_str("# HELP lagran_alert_channels_enabled Enabled notification channels\n# TYPE lagran_alert_channels_enabled gauge\n");
     out.push_str(&format!("lagran_alert_channels_enabled {channels}\n"));
 
-    let (requests, hits): (i64, i64) = sqlx::query_as(
-        "SELECT COALESCE(SUM(requests),0)::BIGINT, COALESCE(SUM(cache_hits),0)::BIGINT \
+    let (requests, hits, misses): (i64, i64, i64) = sqlx::query_as(
+        "SELECT COALESCE(SUM(requests),0)::BIGINT, COALESCE(SUM(cache_hits),0)::BIGINT, \
+         COALESCE(SUM(cache_misses),0)::BIGINT \
          FROM edge_metrics WHERE reported_at > NOW() - INTERVAL '24 hours'",
     )
     .fetch_one(&state.pool)
     .await
-    .unwrap_or((0, 0));
-    let ratio = if requests > 0 {
-        hits as f64 * 100.0 / requests as f64
+    .unwrap_or((0, 0, 0));
+    // Same definition as the console: hits / (hits + misses). Bypassed,
+    // dynamic and blocked requests are not part of the ratio.
+    let cacheable = hits + misses;
+    let ratio = if cacheable > 0 {
+        hits as f64 * 100.0 / cacheable as f64
     } else {
         0.0
     };
     out.push_str("# HELP lagran_edge_requests_24h Requests reported in the last 24 hours\n# TYPE lagran_edge_requests_24h gauge\n");
     out.push_str(&format!("lagran_edge_requests_24h {requests}\n"));
-    out.push_str("# HELP lagran_edge_cache_hit_ratio_24h Cache hit ratio percent in the last 24 hours\n# TYPE lagran_edge_cache_hit_ratio_24h gauge\n");
+    out.push_str("# HELP lagran_edge_cache_hit_ratio_24h Cache hit ratio percent (hits / (hits + misses)) in the last 24 hours\n# TYPE lagran_edge_cache_hit_ratio_24h gauge\n");
     out.push_str(&format!("lagran_edge_cache_hit_ratio_24h {ratio:.4}\n"));
 
     let waf: i64 = sqlx::query_scalar(

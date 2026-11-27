@@ -137,6 +137,26 @@ impl EdgeMetrics {
         c.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
     }
 
+    /// A cache hit enters the hit ratio only when a cache rule matched the
+    /// request. A hit on an object cached by the default policy (no rule)
+    /// counts toward requests and bytes alone.
+    pub fn record_rule_hit(&self, domain: &str, bytes: u64, rule_matched: bool) {
+        if rule_matched {
+            self.record_hit(domain, bytes);
+        } else {
+            self.record_bypass(domain, bytes);
+        }
+    }
+
+    /// Miss counterpart of [`Self::record_rule_hit`].
+    pub fn record_rule_miss(&self, domain: &str, bytes: u64, rule_matched: bool) {
+        if rule_matched {
+            self.record_miss(domain, bytes);
+        } else {
+            self.record_bypass(domain, bytes);
+        }
+    }
+
     /// Count a request that ran without the cross-node flight lock.
     pub fn record_flight_degraded(&self) {
         self.flight_degraded.fetch_add(1, Ordering::Relaxed);
@@ -375,6 +395,23 @@ mod tests {
     }
 
     #[test]
+    fn only_rule_matched_results_enter_hit_ratio() {
+        let metrics = EdgeMetrics::default();
+        metrics.record_rule_hit("a.test", 10, true);
+        metrics.record_rule_miss("a.test", 20, true);
+        // Cached by the default policy, not by a rule.
+        metrics.record_rule_hit("a.test", 30, false);
+        metrics.record_rule_miss("a.test", 40, false);
+
+        let snaps = metrics.take_snapshots();
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].requests, 4);
+        assert_eq!(snaps[0].cache_hits, 1);
+        assert_eq!(snaps[0].cache_misses, 1);
+        assert_eq!(snaps[0].bytes_sent, 100);
+    }
+
+    #[test]
     fn domain_lookup_is_case_insensitive() {
         let metrics = EdgeMetrics::default();
         metrics.record_hit("Example.COM", 1);
@@ -389,8 +426,8 @@ mod tests {
     ///
     /// `take_snapshots` cleared them before the report was attempted, so a control
     /// plane outage dropped whole batches: the hit-ratio charts showed gaps and the
-    /// `cache_hit_ratio` alert, which returns early when `requests <= 0`, could hide
-    /// a real problem behind "no data".
+    /// `cache_hit_ratio` alert, which returns early with no hits or misses, could
+    /// hide a real problem behind "no data".
     #[test]
     fn peek_leaves_counters_intact() {
         let m = EdgeMetrics::default();

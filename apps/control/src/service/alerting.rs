@@ -347,10 +347,12 @@ async fn node_findings(pool: &PgPool, threshold: f64) -> Result<Vec<Finding>, sq
 
 async fn cache_findings(pool: &PgPool, rule: &AlertRuleRow) -> Result<Vec<Finding>, sqlx::Error> {
     let window = rule.window_minutes.clamp(1, 1440);
-    let (requests, hits): (i64, i64) = sqlx::query_as(
+    // Same definition as the console: hits / (hits + misses). Bypassed,
+    // dynamic and blocked requests must not drag the ratio down.
+    let (hits, misses): (i64, i64) = sqlx::query_as(
         r#"
-        SELECT COALESCE(SUM(m.requests), 0)::BIGINT,
-               COALESCE(SUM(m.cache_hits), 0)::BIGINT
+        SELECT COALESCE(SUM(m.cache_hits), 0)::BIGINT,
+               COALESCE(SUM(m.cache_misses), 0)::BIGINT
         FROM edge_metrics m
         WHERE m.reported_at > NOW() - make_interval(mins => $1)
           AND (
@@ -364,10 +366,11 @@ async fn cache_findings(pool: &PgPool, rule: &AlertRuleRow) -> Result<Vec<Findin
     .bind(rule.project_id)
     .fetch_one(pool)
     .await?;
-    if requests <= 0 {
+    let cacheable = hits + misses;
+    if cacheable <= 0 {
         return Ok(Vec::new());
     }
-    let ratio = hits as f64 * 100.0 / requests as f64;
+    let ratio = hits as f64 * 100.0 / cacheable as f64;
     if ratio >= rule.threshold {
         return Ok(Vec::new());
     }
@@ -380,7 +383,7 @@ async fn cache_findings(pool: &PgPool, rule: &AlertRuleRow) -> Result<Vec<Findin
         severity: "warning",
         value: ratio,
         message: format!(
-            "缓存命中率低于阈值。\n最近 {window} 分钟命中率：{ratio:.1}%\n阈值：{:.1}%\n请求数：{requests}",
+            "缓存命中率低于阈值。\n最近 {window} 分钟命中率：{ratio:.1}%\n阈值：{:.1}%\n命中 {hits} 次，未命中 {misses} 次",
             rule.threshold
         ),
     }])
